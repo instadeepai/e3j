@@ -29,7 +29,7 @@ def clebsch_gordan(
         basis = _eigvecs(l1, l2, L)
         idx = np.concatenate([kij for kij, _ in basis], axis=-1)
         val = np.concatenate([ckij for _, ckij in basis])
-        out.append((L, (idx, val)))
+        out.append((L, BCOO(idx, val)))
     return out
 
 
@@ -38,11 +38,13 @@ def clebsch_gordan(
 
 def _c_minus(l, m):
     """Ladder coefficient for J-."""
+    assert (abs(m) <= l).all()
     return np.sqrt((l + m) * (l - m + 1))
 
 
 def _c_plus(l, m):
     """Ladder coefficient for J+."""
+    assert (abs(m) <= l).all()
     return np.sqrt((l - m) * (l + m + 1))
 
 
@@ -79,7 +81,7 @@ def _max_spin_eigvec(l1: int, l2: int, L: int) -> BCOO:
                     + c-(m+1)c'+(m'-1) V[m+1]
                     + c+(m-1)c'-(m'+1) V[m-1]
     """
-    if L == l1 + l2:
+    if L == l1 + l2 or l1 == 0:
         return BCOO(np.array([[l1], [l2]]), np.ones(1))
 
     if l1 > l2:
@@ -119,6 +121,19 @@ def _ladder_down(l1: int, l2: int, vec: BCOO) -> BCOO:
     m1, m2 = idx
     M = (m1 + m2)[0]
 
+    if l1 == 0:
+        m1_down = m1
+        m2_down = m2 - 1
+        idx_down = np.stack((m1_down, m2_down))
+        val = _c_minus(l2, m2)
+        return BCOO(idx_down, val)
+    if l2 == 0:
+        m1_down = m1 - 1
+        m2_down = m2
+        idx_down = np.stack((m1_down, m2_down))
+        val = _c_minus(l1, m1)
+        return BCOO(idx_down, val)
+
     if M > 0:
         # support increases
         m1_down = np.append(m1 - 1, m1[-1])
@@ -143,7 +158,6 @@ def _eigvecs(l1: int, l2: int, L: int, normalize: bool = True) -> list[BCOO]:
         """Return a 3D coef in BCOO format with output spin M."""
         (m1, m2), val = vec
         m0 = np.full(m1.size, M)
-        print(f"L: {L}\t", m0.shape, m1.shape, m2.shape)
         return BCOO(np.stack((m0, m1, m2), axis=0), val)
 
     def normalize_bcoo(vec: BCOO) -> BCOO:
