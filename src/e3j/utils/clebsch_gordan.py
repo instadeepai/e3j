@@ -38,13 +38,11 @@ def clebsch_gordan(
 
 def _c_minus(l, m):
     """Ladder coefficient for J-."""
-    assert (abs(m) <= l).all()
     return np.sqrt((l + m) * (l - m + 1))
 
 
 def _c_plus(l, m):
     """Ladder coefficient for J+."""
-    assert (abs(m) <= l).all()
     return np.sqrt((l - m) * (l + m + 1))
 
 
@@ -86,7 +84,7 @@ def _max_spin_eigvec(l1: int, l2: int, L: int) -> BCOO:
 
     if l1 > l2:
         (m2, m1), val = _max_spin_eigvec(l2, l1, L)
-        return BCOO(np.stack((m1, m2)), val)
+        return BCOO(np.stack((m1[::-1], m2[::-1])), val[::-1])
 
     assert l2 - l1 <= L <= l1 + l2
 
@@ -121,30 +119,29 @@ def _ladder_down(l1: int, l2: int, vec: BCOO) -> BCOO:
     m1, m2 = idx
     M = (m1 + m2)[0]
 
-    if l1 == 0:
-        m1_down = m1
-        m2_down = m2 - 1
-        idx_down = np.stack((m1_down, m2_down))
-        val = _c_minus(l2, m2)
-        return BCOO(idx_down, val)
-    if l2 == 0:
-        m1_down = m1 - 1
-        m2_down = m2
-        idx_down = np.stack((m1_down, m2_down))
-        val = _c_minus(l1, m1)
-        return BCOO(idx_down, val)
-
-    if M > 0:
+    if m1[0] > -l1 and m2[-1] > -l2:
         # support increases
         m1_down = np.append(m1 - 1, m1[-1])
         m2_down = np.append(m2, m2[-1] - 1)
         v1 = np.append(_c_minus(l1, m1), 0)
         v2 = np.append(0, _c_minus(l2, m2))
+    elif m1[0] == -l1 and m2[-1] > -l2:
+        # support is constant
+        m1_down = m1
+        m2_down = m2 - 1
+        v1 = np.append(_c_minus(l1, m1[1:]), 0)
+        v2 = _c_minus(l2, m2)
+    elif m1[0] > -l1 and m2[-1] == -l2:
+        # support is constant
+        m1_down = m1 - 1
+        m2_down = m2
+        v1 = _c_minus(l1, m1)
+        v2 = np.append(0, _c_minus(l2, m2[:-1]))
     else:
         # support decreases
         m1_down, m2_down = m1[:-1], m2[:-1] - 1
         v1 = _c_minus(l1, m1[1:])
-        v2 = _c_plus(l2, m2[:-1])
+        v2 = _c_minus(l2, m2[:-1])
 
     idx_down = np.stack((m1_down, m2_down))
     val_down = v1 + v2
