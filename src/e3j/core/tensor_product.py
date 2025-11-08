@@ -35,6 +35,7 @@ from e3j.pallas_ops.tensor_product import (
 from e3j.spaces import O3Space
 from e3j.utils import cache, options
 from e3j.utils.options import Layout
+from e3j.utils.clebsch_gordan import clebsch_gordan
 from e3j.utils.sparse import SparseMixin, sparse_bcoo
 
 from .permutation import Permutation
@@ -212,6 +213,7 @@ class TensorProduct(SparseMixin):
         source_1: O3Space,
         source_2: O3Space,
         normalization: options.TensorProductNormalization = options.TensorProductNormalization.NONE,
+        use_e3nn: bool = False,
     ) -> sparse.BCOO:
         """
         Stack Clebsch-Gordan coefficients.
@@ -241,11 +243,18 @@ class TensorProduct(SparseMixin):
                 if (l0, p0) not in keep_ir_out:
                     continue
 
-                # 3D Clebsch-Gordan tensor on irreducible block (convert from JAX)
-                cg_dense = numpy.array(e3nn.clebsch_gordan(l0, l1, l2))
-                nz = numpy.nonzero(cg_dense)
-                cg_data = cg_dense[nz]
-                cg_indices = numpy.stack(nz, axis=-1)  # shape (nnz, 3)
+                # 3D Clebsch-Gordan tensor on irreducible block
+                if use_e3nn:
+                    # 3D Clebsch-Gordan tensor on irreducible block (convert from JAX)
+                    cg_dense = numpy.array(e3nn.clebsch_gordan(l0, l1, l2))
+                    nz = numpy.nonzero(cg_dense)
+                    cg_data = cg_dense[nz]
+                    cg_indices = numpy.stack(nz, axis=-1)  # shape (nnz, 3)
+                else:
+                    coefs = clebsch_gordan(l1, l2, [l0])
+                    _, (idx, val) = coefs[0]
+                    cg_data = val
+                    cg_indices = idx.T + np.array([l0, l1, l2])
 
                 # optionally, rescale coefficients
                 if normalization == options.TensorProductNormalization.SQRT_DIM_OUT:
