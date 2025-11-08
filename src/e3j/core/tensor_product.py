@@ -213,7 +213,7 @@ class TensorProduct(SparseMixin):
         source_1: O3Space,
         source_2: O3Space,
         normalization: options.TensorProductNormalization = options.TensorProductNormalization.NONE,
-        use_e3nn: bool = False,
+        use_e3nn: bool = True,
     ) -> sparse.BCOO:
         """
         Stack Clebsch-Gordan coefficients.

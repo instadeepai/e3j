@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Iterable, NamedTuple, TypeAlias
 
 import numpy as np
@@ -8,30 +9,59 @@ class BCOO(NamedTuple):
     values: np.ndarray
 
 
-def clebsch_gordan(
-    l1: int, l2: int, Ls: Iterable[int] | None = None
-) -> list[tuple[int], BCOO]:
+class Convention(Enum):
+    E3NN = "E3NN"
+    EIGVEC = "EIGVEC"
+
+
+def clebsch_gordan(L: int, l1: int, l2: int, convention: Convention = "E3NN") -> BCOO:
     """Return all eigenvectors |LM⟩ f J² and Jz, i.e. Clebsch-Gordan coefficients.
 
     Args:
+        L: target degree, which must satisfy |l1-l2| <= L <= l1+l2.
         l1: l.h.s. degree,
         l2: r.h.s. degree,
-        Ls: sequence of output degrees, which must in the interval [|l1-l2|, l1+l2].
 
     Returns:
-        A list of pairs (L, coef) where L is the output degree (azimutal quantum
-        number) and coef is a 3D BCOO array, with output spin M as first index.
+        a 3D sparse BCOO array of Clebsch-Gordan coefficients.
+
+    If convention='EIGVEC', returns a sparse decomposition of the generating
+    eigenvectors |LM⟩ in the basis of pure tensors |lm,l'm'⟩, i.e. such that
+
+        J²|LM⟩ = L(L+1) |LM⟩    and     Jz |LM⟩ = M |LM⟩
+
+    If convention='E3NN', returns a sparse BCOO representation of the Clebsch-
+    Gordan coefficients agreeing with `e3nn.clebsch_gordan(L, l1, l2)` and
+    corresponding to decompositions in *real* spherical harmonics, which
+    are not eigenvalues of the spin operator Jz.
     """
-    out = []
-    if Ls is None:
-        Ls = range(abs(l1 - l2), l1 + l2 + 1)
-    for L in Ls:
+    if convention == Convention.EIGVEC:
         basis = _eigvecs(l1, l2, L)
         idx = np.concatenate([kij for kij, _ in basis], axis=-1)
         val = np.concatenate([ckij for _, ckij in basis])
-        out.append((L, BCOO(idx, val)))
-    return out
+        return BCOO(idx, val)
 
+    # FIXME: need to change basis. Up to a phase and √2 factors,
+    #        the relationship with e3nn generators should be:
+    #
+    #     Ylm = { |lm⟩ + |l(-m)⟩ if m > 0
+    #           { |lm⟩           if m == 0
+    #           { |lm⟩ - |l(-m)⟩ if m < 0
+    #
+    #     |lm⟩ = { Ylm + Yl(-m)  if m > 0
+    #            { Ylm           if m == 0
+    #            { Ylm - Yl(-m)  if m < 0
+    #
+    if convention == Convention.E3NN:
+        idx, val = clebsch_gordan(L, l1, l2, convention=Convention.EIGVEC)
+        idx += np.array([L, l1, l2])[:, None]
+        val /= np.sqrt(2 * L + 1)
+        return BCOO(idx, val)
+
+    return clebsch_gordan(L, l1, l2, Convention(convention))
+
+
+clebsch_gordan.Convention = Convention
 
 # Private
 
