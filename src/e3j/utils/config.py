@@ -63,6 +63,7 @@ class Config(YamlConfig):
     tensor_product: TensorProduct = (
         TensorProduct.FUSED if E3J_OPS_AVAILABLE else TensorProduct.SPARSE
     )
+    tensor_product_bwd: bool = False
     aggregation: Aggregation = Aggregation.SCATTER
     debug_level: int = 0
 

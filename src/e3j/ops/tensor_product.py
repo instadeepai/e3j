@@ -38,6 +38,9 @@ class TensorProductParams:
     unroll: int | tuple[int, int, int] = (1, 1, 1)
 
 
+# XLA-FFI Primitives
+
+
 @partial(custom_vjp, nondiff_argnums=(3,))
 def tensor_product(
     coef: Array,
@@ -187,6 +190,78 @@ def tensor_product(
     return _tensor_product_impl(coef, x, y)
 
 
+# @partial(custom_vjp, nondiff_argnums=(5,))
+def tensor_product_bwd(
+    coef: Array,
+    x: Array,
+    y: Array,
+    ct_z: Array,
+    params: TensorProductParams,
+) -> tuple[Array, Array]:
+    """Backward tensor product kernel handler.
+
+    This kernel loads output cotangents `ct_z` once
+    to compute both input cotangents `ct_x, ct_y`.
+    """
+
+    # Parse forward mode and layout: backward modes parsed on C++ side
+    mode = TPMode.parse(params.mode)
+    layout = Layout.parse(params.layout)
+
+    # Prepare transposed indices and concatenate two backward arrays
+    #
+    # TODO: lexsorting indices should reduce bank conflicts.
+    with jax.ensure_compile_time_eval():
+        c = Coef.unpack(coef, val_dtype="float32")
+        val, idx = c.val, c.idx.T
+        sigma_xzy = jnp.argsort(idx[1])
+        val_xzy = val[sigma_xzy]
+        idx_xzy = jnp.stack(
+            [
+                idx[1][sigma_xzy],
+                idx[0][sigma_xzy],
+                idx[2][sigma_xzy],
+            ]
+        )
+        sigma_yzx = jnp.argsort(idx[2])
+        val_yzx = val[sigma_yzx]
+        idx_yzx = jnp.stack(
+            [
+                idx[2][sigma_yzx],
+                idx[0][sigma_yzx],
+                idx[1][sigma_yzx],
+            ]
+        )
+        coef_bwd = jnp.stack(
+            [
+                Coef(val_xzy, idx_xzy.T).pack_jax(),
+                Coef(val_yzx, idx_yzx.T).pack_jax(),
+            ]
+        )
+
+    args = (coef_bwd, x, y, ct_z)
+    shapes_out = (
+        jax.ShapeDtypeStruct(x.shape, x.dtype),
+        jax.ShapeDtypeStruct(y.shape, y.dtype),
+    )
+
+    return ffi_call(
+        "tensor_product_bwd",
+        shapes_out,
+    )(
+        *args,
+        mode=int32(mode.value),
+        layout=int32(layout.value),
+        unroll_x=int32(1),
+        unroll_y=int32(1),
+        unroll_z=int32(1),
+        debug=int32(config().debug_level),
+    )
+
+
+# AD Rules
+
+
 def _tensor_product_fwd(coef, x, y, params):
     z = tensor_product(coef, x, y, params)
     return z, (coef, x, y)
@@ -198,6 +273,21 @@ def _tensor_product_bwd(params, res, ct_z):
     Backpropagate gradients following the Leibniz rule,
     with circular references to the `tensor_product` op.
     """
+    coef, x, y = res
+    # ct_coef: non-differentiable right now, as it would break equivariance.
+    ct_coef = jnp.zeros_like(coef)
+
+    layout = Layout.parse(params.layout)
+
+    # Opt-in to `tensor_product_bwd` kernel handler for force inference
+    if config().tensor_product_bwd and layout == Layout.TRAILING_CHANNELS:
+        dx, dy = tensor_product_bwd(coef, x, y, ct_z, params)
+        return (ct_coef, dx, dy)
+
+    # TODO: move/remove once double backward rule has been implemented in
+    #       terms of tensor_product and/or tensor_product_bwd.
+    #
+    # Fallback to 2 `tensor_product` kernel calls
     coef, x, y = res
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
@@ -269,12 +359,10 @@ def _tensor_product_bwd(params, res, ct_z):
     ct_x = tensor_product(coef_x, ct_z, y, params_x)
     ct_y = tensor_product(coef_y, ct_z, x, params_y)
 
-    # ct_coef: non-differentiable right now, as it would break equivariance.
-    ct_coef = jnp.zeros_like(coef)
-
     return (ct_coef, ct_x, ct_y)
 
 
 tensor_product.defvjp(_tensor_product_fwd, _tensor_product_bwd)
+
 
 tensor_product.Params = TensorProductParams

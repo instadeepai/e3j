@@ -40,6 +40,7 @@
 #include "cuda/fill.cuh"
 #include "cuda/scatter_add.cuh"
 #include "cuda/tensor_product.cuh"
+#include "cuda/tensor_product_bwd.cuh"
 
 /* Boilerplate DTYPE macros are now in dispatch_macros.h:
  *
@@ -248,6 +249,128 @@ XLA_FFI_DEFINE_HANDLER(
         .Attr<int32_t>("debug")
 );
 
+
+//===----------------------------------------------------------===//
+//  tensor_product_bwd
+//===----------------------------------------------------------===//
+xla::Error TensorProductBwdHandler(
+    cudaStream_t stream,
+    xla::AnyBuffer coef,
+    xla::AnyBuffer x,
+    xla::AnyBuffer y,
+    xla::AnyBuffer dz,
+    xla::Result<xla::AnyBuffer> dx,
+    xla::Result<xla::AnyBuffer> dy,
+    int32_t _mode_fwd,
+    int32_t _layout,
+    int32_t unroll_x = 1,
+    int32_t unroll_y = 1,
+    int32_t unroll_z = 1,
+    int debug = 0
+) {
+
+    // Parse mode and layout from int: see `e3j.utils.options`
+    // for the python Enums that must match those of
+    // `tensor_product.cuh`.
+    using e3j::tensor_product::Mode;
+    using e3j::tensor_product::Layout;
+    Mode mode_fwd = Mode(_mode_fwd);
+    Layout layout = Layout(_layout);
+
+    // Coefficients for dx + dy should be concatenated from Python.
+    // We rely on `element_count()` instead of Dimensions
+    // for robustness, in case stack/concat of coef changes.
+    int32_t numel = coef.dimensions().back();
+    int32_t num_idx = coef.element_count() / (2 * numel);
+
+    xla::AnyBuffer::Dimensions dims_x = x.dimensions();
+    xla::AnyBuffer::Dimensions dims_y = y.dimensions();
+    xla::AnyBuffer::Dimensions dims_z = dz.dimensions();
+
+    int32_t num_x, num_y, num_z, channels_x, channels_y;
+    switch (layout) {
+        case Layout::LEADING_CHANNELS:
+            num_x = dims_x.back();
+            num_y = dims_y.back();
+            num_z = dims_z.back();
+            channels_x = dims_x.size() > 2 ? dims_x[1] : 1;
+            channels_y = dims_y.size() > 2 ? dims_y[1] : 1;
+            break;
+        case Layout::TRAILING_CHANNELS:
+            num_x = dims_x[1];
+            num_y = dims_y[1];
+            num_z = dims_z[1];
+            channels_x = dims_x.size() > 2 ? dims_x.back() : 1;
+            channels_y = dims_y.size() > 2 ? dims_y.back() : 1;
+            break;
+        default: exit(1);
+    }
+
+    int32_t num_rows = x.element_count() / (num_x * channels_x);
+
+    e3j::tensor_product::Params params_fwd = {
+        .num_rows = num_rows,
+        .num_idx = num_idx,
+        .num_x = num_x,
+        .num_y = num_y,
+        .num_out = num_z,
+        .channels_x = channels_x,
+        .channels_y = channels_y,
+        .mode = mode_fwd,
+        .unroll_x = unroll_x,
+        .unroll_y = unroll_y,
+        .unroll_z = unroll_z,
+        .layout = layout
+    };
+
+    using e3j::tensor_product::trailing_channels::launch_bwd;
+
+    #define DISPATCH_DTYPE_PAIR_ERROR(IDX_T, VAL_T)          \
+        return e3j::Error::InvalidArgument(                  \
+            "unsupported (IDX, VAL) dtype pair").to_xla();
+
+    #define DISPATCH_DTYPE_PAIR(Idx, Val)                       \
+        using Coef = e3j::tensor_product::Coef<Idx, Val>;       \
+        const Coef *coef_ptr = reinterpret_cast<const Coef*>(   \
+            coef.typed_data<Idx>()                              \
+        );                                                      \
+                                                                \
+        return launch_bwd<Idx, Val>(                            \
+            coef_ptr,                                           \
+            x.typed_data<Val>(),                                \
+            y.typed_data<Val>(),                                \
+            dz.typed_data<Val>(),                               \
+            dx->typed_data<Val>(),                              \
+            dy->typed_data<Val>(),                              \
+            params_fwd, stream, debug                           \
+        ).to_xla();
+
+    __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
+    #undef DISPATCH_DTYPE_PAIR
+    #undef DISPATCH_DTYPE_PAIR_ERROR
+
+    return xla::Error::Success();
+};
+
+
+XLA_FFI_DEFINE_HANDLER(
+    xla_tensor_product_bwd,
+    TensorProductBwdHandler,
+    xla::Ffi::Bind()
+        .Ctx<xla::PlatformStream<cudaStream_t>>()
+        .Arg<xla::AnyBuffer>()   // coef
+        .Arg<xla::AnyBuffer>()   // x
+        .Arg<xla::AnyBuffer>()   // y
+        .Arg<xla::AnyBuffer>()   // z
+        .Ret<xla::AnyBuffer>()   // dx
+        .Ret<xla::AnyBuffer>()   // dy
+        .Attr<int32_t>("mode")
+        .Attr<int32_t>("layout")
+        .Attr<int32_t>("unroll_x")
+        .Attr<int32_t>("unroll_y")
+        .Attr<int32_t>("unroll_z")
+        .Attr<int32_t>("debug")
+);
 
 
 } // namespace e3j_ops
