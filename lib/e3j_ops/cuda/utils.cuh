@@ -71,15 +71,30 @@ __device__ Vect<N, Val> mul(Vect<N, Val> a, Vect<N, Val> b) {
     }
 }
 
-// Fused multiply-add: acc[i] += a * b[i]  (scalar a, Vect b).
+// Fused multiply-add: acc[i] += a[i] * b[i].
 // Uses __fmaf_rn to emit FFMA instead of FMUL+FADD, eliminating the
 // intermediate prod[] register and halving FP instruction count on the
 // hot accumulation path (N=4: saves 4 FADD per coefficient iteration).
 template<int N, typename Val>
-__device__ void fmadd(Vect<N, Val> &acc, Val a, Vect<N, Val> b) {
+__device__ void fmadd(Vect<N, Val> &acc, Vect<N, Val> a, Vect<N, Val> b) {
     if constexpr (N == 1) {
         acc = __fmaf_rn(a, b, acc);
     } else if constexpr (N == 2) {
+        acc.x = __fmaf_rn(a.x, b.x, acc.x);
+        acc.y = __fmaf_rn(a.y, b.y, acc.y);
+    } else {
+        acc.x = __fmaf_rn(a.x, b.x, acc.x);
+        acc.y = __fmaf_rn(a.y, b.y, acc.y);
+        acc.z = __fmaf_rn(a.z, b.z, acc.z);
+        acc.w = __fmaf_rn(a.w, b.w, acc.w);
+    }
+}
+
+// Fused multiply-add: acc[i] += a * b[i]  (scalar a broadcast).
+// Disabled for N=1 where Vect<1,Val> = Val would conflict with the above.
+template<int N, typename Val, std::enable_if_t<(N > 1), int> = 0>
+__device__ void fmadd(Vect<N, Val> &acc, Val a, Vect<N, Val> b) {
+    if constexpr (N == 2) {
         acc.x = __fmaf_rn(a, b.x, acc.x);
         acc.y = __fmaf_rn(a, b.y, acc.y);
     } else {
