@@ -143,6 +143,21 @@ class Vec {
             return out;
         }
 
+        Vec tile_trailing (int k, int dim_last) {
+            int n = size();
+            int nk = dim_last * k;
+            int rows = n / dim_last;
+            printf("Vec(%d)\n", n * k);
+            Vec out = Vec(n * k);
+            printf("out: %d\n", out.size());
+            for (int r = 0; r < rows; r++) {
+                for (int i = 0; i < nk; i++) {
+                    out[r * nk + i] = _data[r * dim_last + (i % dim_last)];
+                }
+            }
+            return out;
+        }
+
         template <typename B>
         Vec<B> map (std::function<B(T)> f) {
             Vec<B> out (size());

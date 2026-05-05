@@ -83,7 +83,8 @@ FFI_OBJ = bin/e3j_ops.cpp.o
 
 CU_TEST = \
 	test_scatter_add\
-	test_tensor_product
+	test_tensor_product\
+	test_tensor_product_bwd
 
 TENSOR_PRODUCT_OBJ = \
 	bin/tensor_product.cu.o
@@ -115,6 +116,11 @@ bin/%.cu.o: $(SRC_DIR)/cuda/%.cu
 
 bin/test_tensor_product:\
 	$(SRC_DIR)/tests/test_tensor_product.cpp bin/tensor_product.a
+
+	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
+
+bin/test_tensor_product_bwd:\
+	$(SRC_DIR)/tests/test_tensor_product_bwd.cpp bin/tensor_product_bwd.cu.o bin/tensor_product.a
 
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
