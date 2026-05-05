@@ -41,6 +41,7 @@
 #include "cuda/scatter_add.cuh"
 #include "cuda/tensor_product.cuh"
 #include "cuda/tensor_product_bwd.cuh"
+#include "cuda/convolution.cuh"
 
 /* Boilerplate DTYPE macros are now in dispatch_macros.h:
  *
@@ -383,7 +384,7 @@ xla::Error ConvolutionHandler(
     int32_t num_scalars = r.dimensions()[1];
 
     // Assert LHS channels are 32-multiple
-    bool supported = (channels_x % 32 != 0);
+    bool supported = (channels_x % 32 == 0);
     if (not supported) {
         std::string msg =
             "Convolution requires 32 multiple as LHS channels for now. Got "
@@ -411,7 +412,7 @@ xla::Error ConvolutionHandler(
             .channels_x = channels_x,                           \
         };                                                      \
                                                                 \
-        e3j::convolution::AdjacencyCSR<Idx> adj = {             \
+        e3j::convolution::AdjacencyCSR adj = {                  \
             .sender = const_cast<int32_t*>(                     \
                 sender.typed_data<int32_t>()                    \
             ),                                                  \
