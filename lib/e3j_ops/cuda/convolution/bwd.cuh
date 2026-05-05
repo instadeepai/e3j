@@ -1,0 +1,393 @@
+#ifndef _E3J_CONVOLUTION_BWD_H_
+#define _E3J_CONVOLUTION_BWD_H_
+
+#include "cuda/convolution.cuh"
+#include "cuda/tensor_product/details.cuh"
+#include "cuda/tensor_product/trailing_channels.cuh"
+#include "cuda/utils.cuh"
+
+#define BUFFER_CONV_BWD_COEFS_IN_SMEM true
+
+namespace e3j {
+namespace convolution {
+
+using utils::copy;
+using utils::copy_strided;
+using utils::copy_pipe;
+using utils::copy_pipe_strided;
+using utils::wait_pipe;
+using utils::fill;
+using tensor_product::CoefRange;
+using tensor_product::find_coef_bounds;
+
+namespace tp = tensor_product::trailing_channels;
+
+/*****************************************************************
+ *  Buffers for backward convolution:
+ *
+ *      [ dm | x | y | mix | mix_idx | dx | dy_scratch ]
+ *
+ *  - dm:   cotangent receiver messages
+ *  - x:    primal node features
+ *  - y:    primal edge features
+ *  - mix:  edge scalars
+ *  - mix_idx:  indices mapping z = (x ⊗ y) coordinates to scalars.
+ *  - dx:   cotangent sender message accumulator
+ *  - dy_scratch:  cotantent edge features scratch memory (Mode::INNER)
+ *
+ *****************************************************************/
+template <typename Idx, typename Val>
+struct BuffersBwd {
+    CuArray2D<Val> dm;
+    CuArray2D<Val> x;
+    CuArray2D<Val> y;
+    CuArray2D<Val> mix;
+    Idx* mix_idx;
+    CuArray2D<Val> dx;
+    Val* dy_scratch;
+
+    static __device__ BuffersBwd init (
+        CuArray2D<const Val> x,
+        CuArray2D<const Val> y,
+        CuArray2D<const Val> dm,
+        CuArray2D<const Val> mix,
+        dim3 unroll
+    ) {
+        return BuffersBwd {
+            .dm  = { nullptr, dm.shape[0],  unroll.z },
+            .x   = { nullptr, x.shape[0],   unroll.x },
+            .y   = { nullptr, y.shape[0],   1u       },
+            .mix = { nullptr, mix.shape[0], unroll.z },
+            .mix_idx = nullptr,
+            .dx  = { nullptr, x.shape[0],   unroll.x },
+            .dy_scratch = nullptr,
+        };
+    }
+
+    template<int Stages=1>
+    __device__ void to_shared (char *smem_) {
+        constexpr int A = 16 / sizeof(Val);
+        dm.data  = reinterpret_cast<Val*>(smem_);
+        x.data   = dm.data  + (dm.size()  + A-1) / A * A;
+        y.data   = x.data   + (x.size()   + A-1) / A * A;
+        mix.data = y.data   + (y.size()   + A-1) / A * A;
+        mix_idx  = reinterpret_cast<Idx*>(mix.data + mix.size());
+        // Advance past mix_idx, re-align to 16 B for dx.
+        unsigned int idx_vals =
+            (dm.shape[0] * sizeof(Idx) + sizeof(Val) - 1) / sizeof(Val);
+        dx.data = mix.data + (mix.size() + idx_vals + A-1) / A * A;
+        dy_scratch = dx.data + (dx.size() + A-1) / A * A;
+    }
+};
+
+
+/*****************************************************************
+ *  Mix input with scalars in-place.
+ *
+ *      dm[i, c] *= mix[mix_idx[i], c];
+ *
+ *  So that dm contains cotangents dz of z = (x ⊗ y).
+ *****************************************************************/
+template<typename Idx, typename Val, int N>
+__device__ void mix_(
+    CuArray2D<Val> dm,
+    CuArray2D<Val> mix,
+    const Idx *mix_idx
+) {
+    int channel_offset = threadIdx.x * N;
+    if (channel_offset >= dm.shape[1]) return;
+
+    Vect<N,Val> *dm_lane =
+        reinterpret_cast<Vect<N,Val>*>(dm.data) + threadIdx.x;
+    int stride = dm.shape[1] / N;
+
+    mix.data += channel_offset;
+
+    for (unsigned int i = threadIdx.y; i < dm.shape[0]; i += blockDim.y) {
+        Vect<N,Val> dz_val = dm_lane[i * stride];
+        Vect<N,Val> s_val  = load<N,Val>(
+            &mix.data[mix_idx[i] * mix.shape[1]]
+        );
+        dm_lane[i * stride] = mul<N,Val>(dz_val, s_val);
+    }
+}
+
+
+/*****************************************************************
+ *  Cotangent of mixing scalars, fused with tensor product.
+ *
+ *      dmix[s, c] += sum_{i : mix_idx[i] = s} tij[i, c] * dm[i, c]
+ *
+ *  where tij[i] = otimes(lhs, rhs)[i] is computed in registers.
+ *  Cross-warp accumulation via atomicAdd to GMEM — caller must
+ *  zero dmix before the call.
+ *****************************************************************/
+template<typename Idx, typename Val, int N>
+__device__ void otimes_mix_reduce(
+    const Coef<Idx,Val> *coef,
+    const CoefRange range,
+    CuArray2D<Val> lhs,
+    CuArray2D<Val> rhs,
+    CuArray2D<Val> dm,
+    const Idx *mix_idx,
+    CuArray2D<Val> dmix
+) {
+    using Coef = Coef<Idx,Val>;
+    using IdxVal = tp::IdxVal<Idx, Val, N>;
+
+    int col = range.begin;
+    Coef c = coef[col];
+    IdxVal zi,
+           acc = {c.i, broadcast<N,Val>(Val(0))};
+
+    int channel_offset = threadIdx.x * N;
+    lhs.data += channel_offset;
+    dm.data  += channel_offset;
+
+    if (channel_offset >= dm.shape[1]) return;
+
+    while (col <= range.end) {
+        zi = tp::accumulate_products<Idx,Val,Mode::OUTER,N>(
+            acc, coef, col, range.end,
+            lhs.data, rhs.data, lhs.shape[1], rhs.shape[1]
+        );
+        Vect<N,Val> prod = mul<N,Val>(
+            zi.val, load<N,Val>(dm.data + zi.i * dm.shape[1])
+        );
+        Val *dst = dmix.data + mix_idx[zi.i] * dmix.shape[1] + channel_offset;
+        if constexpr (N == 1) {
+            atomicAdd(dst, prod);
+        } else if constexpr (N == 2) {
+            atomicAdd(dst,     prod.x);
+            atomicAdd(dst + 1, prod.y);
+        } else {
+            atomicAdd(dst,     prod.x);
+            atomicAdd(dst + 1, prod.y);
+            atomicAdd(dst + 2, prod.z);
+            atomicAdd(dst + 3, prod.w);
+        }
+    }
+}
+
+
+/*****************************************************************
+ *  Convolution backward kernel.
+ *
+ *  Sender-grouped loop over the transposed CSR adjacency:
+ *    - x[sender] loaded once per sender group
+ *    - dx accumulated in SMEM across edges (OUTER), one GMEM
+ *      store per sender — no atomics
+ *    - dy written per-edge to GMEM (INNER warp reduction)
+ *
+ *  Coefficients are packed as [coef_dx | coef_dy] (2 x num_coef).
+ *    coef_dx = (j, i, k) sorted by j  →  otimes<OUTER>
+ *    coef_dy = (k, i, j) sorted by k  →  otimes<INNER>
+ *****************************************************************/
+template <typename Idx, typename Val, int N=1>
+__global__ void __launch_bounds__(1024) kernel_bwd (
+    const Coef<Idx, Val> *coef,
+    CuArray2D<const Val> x,
+    CuArray2D<const Val> y,
+    CuArray2D<const Val> dm,
+    CuArray2D<const Val> mix,
+    const Idx *irrep_out,
+    const AdjacencyCSR adj,
+    Val *gmem_dx,
+    Val *gmem_dy,
+    Val *gmem_dmix,
+    unsigned int num_nodes,
+    unsigned int num_coef,
+    dim3 unroll
+) {
+
+    using Coef = Coef<Idx,Val>;
+
+    int size_x   = x.size();
+    int size_y   = y.size();
+    int size_dm  = dm.size();
+    int size_mix = mix.size();
+    int num_y    = y.shape[0];
+    int num_warps = blockDim.x / 32;
+
+    // --- Shared memory prolog ----------------------------------------
+
+    extern __shared__ __align__(16) char smem__[];
+    char* smem_ = reinterpret_cast<char*>(smem__);
+    BuffersBwd<Idx, Val> smem = BuffersBwd<Idx, Val>::init(
+        x, y, dm, mix, unroll
+    );
+
+    if (BUFFER_CONV_BWD_COEFS_IN_SMEM) {
+        Coef* smem_coef = reinterpret_cast<Coef*>(smem_);
+        copy_pipe<1>(smem_coef, coef, 3 * num_coef);
+        coef = smem_coef;
+        constexpr size_t align = N * sizeof(Val);
+        size_t coef_bytes = (size_t)(3 * num_coef) * sizeof(Coef);
+        coef_bytes = (coef_bytes + align - 1) & ~(align - 1);
+        smem_ = (char*)smem_coef + coef_bytes;
+        __pipeline_commit();
+        wait_pipe();
+    }
+    smem.to_shared(smem_);
+
+    // TODO: pass 3 coefficients from FFI (instead of 2 currently)
+    //       computing dmix requires the forward pass coefficients
+    const Coef *coef_dx = coef + num_coef;
+    const Coef *coef_dy = coef + 2 * num_coef;
+
+    // Load irrep_out → mix_idx (constant across edges).
+    copy(smem.mix_idx, irrep_out, dm.shape[0]);
+    __syncthreads();
+
+    // Partition coefficients across blockDim.y
+    int *smem_cuts = reinterpret_cast<int*>(smem.dm.data);
+    CoefRange range_fwd = find_coef_bounds<Idx, Val>(
+        smem_cuts, coef, num_coef, dm.shape[0]
+    );
+    CoefRange range_dx = find_coef_bounds<Idx, Val>(
+        smem_cuts, coef_dx, num_coef, x.shape[0]
+    );
+    CoefRange range_dy = find_coef_bounds<Idx, Val>(
+        smem_cuts, coef_dy, num_coef, num_y
+    );
+
+    // Channel mappings for OUTER dx and INNER dy.
+    tp::Channels k_dx = tp::Channels::get<Mode::OUTER, N>(
+        threadIdx.x, smem.dm.shape[1], smem.y.shape[1], smem.dx.shape[1]
+    );
+    tp::Channels k_dy = tp::Channels::get<Mode::INNER, N>(
+        threadIdx.x, smem.dm.shape[1], smem.x.shape[1], smem.dm.shape[1]
+    );
+
+    // Dummy view: only shape[0] = num_y is used (scratch indexing).
+    CuArray2D<Val> dy_view = {
+        nullptr, (unsigned int)num_y, smem.dm.shape[1]
+    };
+
+    int num_strides = 1 + (max((int)x.shape[1], (int)dm.shape[1]) - 1)
+                         / (blockDim.x * N);
+
+    // --- Grid-stride loop over senders -------------------------------
+
+    for (unsigned int sender = blockIdx.x;
+         sender < num_nodes;
+         sender += gridDim.x)
+    {
+        int first_edge = adj.receiver_ptr[sender],
+            last_edge  = adj.receiver_ptr[sender + 1];
+
+        CuArray2D<const Val> x_s   = { x.data,   x.shape[0],   x.shape[1] };
+        CuArray2D<const Val> dm_s  = { dm.data,  dm.shape[0],  dm.shape[1] };
+        CuArray2D<const Val> mix_s = { mix.data, mix.shape[0], mix.shape[1] };
+        Val *dx_out_s = gmem_dx;
+        Val *dmix_s   = gmem_dmix;
+
+        for (int s = 0; s < num_strides; s++) {
+
+        // Zero dx accumulator for this sender.
+        fill(smem.dx.data, Val(0), smem.dx.size());
+
+        // Load x[sender] to smem.x (constant across edges from sender).
+        if (x.shape[1] > unroll.x)
+            copy_pipe_strided(smem.x.data, x_s.data + sender * size_x,
+                              x.shape[0], unroll.x, x.shape[1]);
+        else
+            copy_pipe<N>(smem.x.data, x_s.data + sender * size_x, smem.x.size());
+        __pipeline_commit();
+        wait_pipe();
+
+        for (int edge = first_edge; edge < last_edge; edge++) {
+
+            int recv = adj.sender[edge];
+
+            // Load dm[recv], y[edge], mix[edge]
+            if (dm.shape[1] > unroll.z)
+                copy_pipe_strided(smem.dm.data, dm_s.data + recv * size_dm,
+                                  dm.shape[0], unroll.z, dm.shape[1]);
+            else
+                copy_pipe<N>(smem.dm.data, dm_s.data + recv * size_dm, smem.dm.size());
+            copy_pipe<1>(smem.y.data, y.data + edge * size_y, size_y);
+            if (mix.shape[1] > unroll.z)
+                copy_pipe_strided(smem.mix.data, mix_s.data + edge * size_mix,
+                                  mix.shape[0], unroll.z, mix.shape[1]);
+            else
+                copy_pipe<N>(smem.mix.data, mix_s.data + edge * size_mix, smem.mix.size());
+            __pipeline_commit();
+            wait_pipe();
+
+            // Zero dmix for this edge, then compute in registers.
+            int dmix_edge_size = mix.shape[0] * dm.shape[1];
+            if (s == 0) fill(gmem_dmix + edge * dmix_edge_size, Val(0), dmix_edge_size);
+            __syncthreads();
+
+            // dmix[s,c] = sum_{i : mix_idx[i]=s} otimes(x,y)[i,c] * dm[i,c]
+            CuArray2D<Val> dmix_view = {
+                dmix_s + edge * dmix_edge_size, mix.shape[0], dm.shape[1]
+            };
+            otimes_mix_reduce<Idx, Val, N>(
+                coef, range_fwd,
+                smem.x, smem.y, smem.dm, smem.mix_idx, dmix_view
+            );
+            __syncthreads();
+
+            // Cotangent receiver message: dm = mix * dz (in-place).
+            mix_<Idx, Val, N>(smem.dm, smem.mix, smem.mix_idx);
+            __syncthreads();
+
+            // dx[sender] += sum_c coef_dx.val * dm[i,ch] * y[k]
+            tp::otimes<Idx, Val, Mode::OUTER, N, true>(
+                coef_dx, range_dx,
+                smem.dm, smem.y, smem.dx,
+                k_dx, nullptr
+            );
+
+            // Prepare dy scratch for INNER warp reduction.
+            fill(smem.dy_scratch, Val(0), num_warps * num_y);
+            __syncthreads();
+
+            // dy[edge,k] = sum_ch sum_c coef_dy.val * dm[i,ch] * x[j,ch]
+            tp::otimes<Idx, Val, Mode::INNER, N, true>(
+                coef_dy, range_dy,
+                smem.dm, smem.x, dy_view,
+                k_dy, smem.dy_scratch
+            );
+            __syncthreads();
+
+            // Reduce dy buffer, STG (single y-group to avoid GMEM race on +=)
+            if (threadIdx.y == 0) {
+                for (int i = threadIdx.x; i < num_y; i += blockDim.x) {
+                    Val sum = 0;
+                    for (int w = 0; w < num_warps; w++)
+                        sum += smem.dy_scratch[w * num_y + i];
+                    if (s == 0)
+                        gmem_dy[edge * num_y + i] = sum;
+                    else
+                        gmem_dy[edge * num_y + i] += sum;
+                }
+            }
+
+        }//=== Edge loop ===
+
+        // Store sender cotangent
+        if (x.shape[1] > unroll.x)
+            copy_strided(dx_out_s + sender * size_x, smem.dx.data,
+                         x.shape[0], smem.dx.shape[1], x.shape[1], smem.dx.shape[1]);
+        else
+            copy(dx_out_s + sender * size_x, smem.dx.data, smem.dx.size());
+        __syncthreads();
+
+        // Advance to next channel slice.
+        if (x.shape[1]  > unroll.x) { x_s.data  += unroll.x; dx_out_s += unroll.x; }
+        if (dm.shape[1] > unroll.z) { dm_s.data += unroll.z; mix_s.data += unroll.z; dmix_s += unroll.z; }
+
+        }//=== Channel stride loop ===
+
+    }//=== Grid-stride loop ===
+
+}
+
+} // namespace convolution
+} // namespace e3j
+
+
+#endif // _E3J_CONVOLUTION_BWD_H_

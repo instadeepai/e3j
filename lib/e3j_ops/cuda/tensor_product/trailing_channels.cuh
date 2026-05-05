@@ -313,7 +313,11 @@ namespace trailing_channels {
                         zi = accumulate_products<Idx,Val,kMode,N>(
                             acc, coef, col, range.end, lhs.data, rhs.data, lhs.shape[1], rhs.shape[1]
                         );
-                        out_lane[zi.i * stride_out] = zi.val;
+                        if constexpr (accumulate)
+                            fmadd<N,Val>(out_lane[zi.i * stride_out],
+                                broadcast<N,Val>(Val(1)), zi.val);
+                        else
+                            out_lane[zi.i * stride_out] = zi.val;
                     }
                 }
 
