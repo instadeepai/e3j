@@ -14,7 +14,7 @@
  */
 
 #include <cstdint>
-#include<iostream>
+#include <iostream>
 #include <stdio.h>
 #include <algorithm>
 
@@ -23,7 +23,6 @@
 #include "cuda.h"
 #include "cuda_runtime_api.h"
 
-#include "cuda/dtype.cuh"
 #include "cuda/tensor_product.cuh"
 
 #include "vec.h"
@@ -96,18 +95,9 @@ Args<Idx> prepareHostArgs (Params p, int num_strips=NUM_STRIPS) {
     idx_1 = idx_1 + vec::arange<Idx>(num_strips).repeat(6) * Idx(2);
     idx_2 = idx_2 + vec::arange<Idx>(num_strips).repeat(6) * Idx(3);
 
-    int cx = p.channels_x, cy = p.channels_y, cz;
-    switch (p.mode) {
-        case Mode::OUTER:
-            cz = cx * cy;
-            break;
-        case Mode::INNER:
-            cz = 1;
-            break;
-        case Mode::MAP:
-            cz = cx;
-            break;
-    }
+    int cx = p.channels_x,
+        cy = p.channels_y,
+        cz = p.channels_out();
 
     // Multiply y and result channel axis by vec::arange(NUM_CHANNELS)
     Vec<float> scale_y = (vec::arange<float>(cy) + 1)
@@ -220,10 +210,7 @@ int test_tensor_product (Params p, int num_strips=NUM_STRIPS) {
     CoefT *coef_d;
     float *x_d, *y_d, *out_d;
 
-    int cz;
-    if (p.mode == Mode::INNER) cz = 1;
-    else if (p.mode == Mode::OUTER) cz = p.channels_x * p.channels_y;
-    else if (p.mode == Mode::MAP) cz = p.channels_x;
+    int cz = p.channels_out();
 
     size_t size_coef = sizeof(CoefT) * p.num_idx,
            size_x = sizeof(float) * p.num_rows * p.num_x * p.channels_x,
@@ -270,8 +257,6 @@ int test_tensor_product (Params p, int num_strips=NUM_STRIPS) {
 
 
 int main() {
-
-	printf("Preparing arguments on host...\n");
 
     // Input widths
     int num_idx = 6 * NUM_STRIPS;

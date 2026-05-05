@@ -355,6 +355,107 @@ XLA_FFI_DEFINE_HANDLER(
 );
 
 
+//===----------------------------------------------------------===//
+//  convolution
+//===----------------------------------------------------------===//
+xla::Error ConvolutionHandler(
+    cudaStream_t stream,
+    xla::AnyBuffer coef,
+    xla::AnyBuffer x,
+    xla::AnyBuffer y,
+    xla::AnyBuffer r,
+    xla::AnyBuffer irrep_out,
+    xla::AnyBuffer sender,
+    xla::AnyBuffer receiver_ptr,
+    xla::Result<xla::AnyBuffer> out,
+    int32_t num_nodes,
+    int debug = 0
+) {
+
+    xla::AnyBuffer::Dimensions dims_x = x.dimensions();
+    xla::AnyBuffer::Dimensions dims_y = y.dimensions();
+
+    int32_t num_coef = coef.dimensions().front();
+    int32_t num_x = dims_x[1];
+    int32_t channels_x = dims_x.size() > 2 ? dims_x.back() : 1;
+    int32_t num_y = dims_y[1];
+    int32_t num_out = out->dimensions()[1];
+    int32_t num_scalars = r.dimensions()[1];
+
+    // Assert LHS channels are 32-multiple
+    bool supported = (channels_x % 32 != 0);
+    if (not supported) {
+        std::string msg =
+            "Convolution requires 32 multiple as LHS channels for now. Got "
+            + std::to_string(channels_x) + ".\n";
+        return e3j::Error::Unimplemented(msg).to_xla();
+    }
+
+    #define DISPATCH_DTYPE_PAIR_ERROR(IDX_T, VAL_T)             \
+        return e3j::Error::InvalidArgument(                     \
+            "unsupported (IDX, VAL) dtype pair").to_xla();
+
+    #define DISPATCH_DTYPE_PAIR(Idx, Val)                       \
+        using Coef = e3j::tensor_product::Coef<Idx, Val>;       \
+        const Coef *coef_ptr = reinterpret_cast<const Coef*>(   \
+            coef.typed_data<Idx>()                              \
+        );                                                      \
+                                                                \
+        e3j::convolution::Params params = {                     \
+            .num_nodes = num_nodes,                             \
+            .num_coef = num_coef,                               \
+            .num_x = num_x,                                     \
+            .num_y = num_y,                                     \
+            .num_out = num_out,                                 \
+            .num_scalars = num_scalars,                         \
+            .channels_x = channels_x,                           \
+        };                                                      \
+                                                                \
+        e3j::convolution::AdjacencyCSR<Idx> adj = {             \
+            .sender = const_cast<int32_t*>(                     \
+                sender.typed_data<int32_t>()                    \
+            ),                                                  \
+            .receiver_ptr = const_cast<int32_t*>(               \
+                receiver_ptr.typed_data<int32_t>()              \
+            ),                                                  \
+        };                                                      \
+                                                                \
+        return e3j::convolution::launch<Idx, Val>(              \
+            coef_ptr,                                           \
+            x.typed_data<Val>(),                                \
+            y.typed_data<Val>(),                                \
+            r.typed_data<Val>(),                                \
+            irrep_out.typed_data<Idx>(),                        \
+            adj,                                                \
+            out->typed_data<Val>(),                             \
+            params, stream, debug                               \
+        ).to_xla();
+
+    __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
+    #undef DISPATCH_DTYPE_PAIR
+    #undef DISPATCH_DTYPE_PAIR_ERROR
+
+    return e3j::Error::Success().to_xla();
+}
+
+XLA_FFI_DEFINE_HANDLER(
+    xla_convolution,
+    ConvolutionHandler,
+    xla::Ffi::Bind()
+        .Ctx<xla::PlatformStream<cudaStream_t>>()
+        .Arg<xla::AnyBuffer>()   // coef (packed Coef<Idx,Val> as idx_t vector)
+        .Arg<xla::AnyBuffer>()   // x (node features)
+        .Arg<xla::AnyBuffer>()   // y (edge embeddings)
+        .Arg<xla::AnyBuffer>()   // r (radial scalars)
+        .Arg<xla::AnyBuffer>()   // irrep_out (output irrep index map)
+        .Arg<xla::AnyBuffer>()   // sender (CSR sender indices)
+        .Arg<xla::AnyBuffer>()   // receiver_ptr (CSR receiver pointers)
+        .Ret<xla::AnyBuffer>()   // out (output node features)
+        .Attr<int32_t>("num_nodes")
+        .Attr<int32_t>("debug")
+);
+
+
 } // namespace e3j_ops
 
 #endif // E3J_FFI_E3J_OPS_H_

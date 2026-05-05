@@ -56,7 +56,7 @@ endif
 GENCODE_FLAGS=$(foreach arch,$(GPU_ARCH),\
 	--generate-code=arch=compute_$(arch),code=[compute_$(arch),sm_$(arch)])
 
-NVCC_FLAGS=--threads 4 -Xcompiler -Wall -ldl\
+NVCC_FLAGS=--threads 4 -Xcompiler -w -lineinfo -ldl\
 	--expt-relaxed-constexpr -O3 -DNDEBUG -Xcompiler -O3\
 	$(GENCODE_FLAGS)\
 	-Xcompiler=-fPIC -Xcompiler=-fvisibility=hidden
@@ -93,6 +93,8 @@ EXE = bin/test_scatter_add
 CU_OBJ = \
 	bin/fill.cu.o\
 	bin/scatter_add.cu.o\
+	bin/convolution.cu.o\
+	bin/tensor_product_bwd.cu.o\
 	bin/tensor_product.cu.o\
 
 FFI_OBJ = bin/e3j_ops.cpp.o
@@ -100,7 +102,8 @@ FFI_OBJ = bin/e3j_ops.cpp.o
 CU_TEST = \
 	test_scatter_add\
 	test_tensor_product\
-	test_tensor_product_bwd
+	test_tensor_product_bwd\
+	test_convolution
 
 TENSOR_PRODUCT_OBJ = \
 	bin/tensor_product.cu.o
@@ -109,8 +112,11 @@ TENSOR_PRODUCT_OBJ = \
 #	bin/tensor_product_trailing.cu.o \
 
 TENSOR_PRODUCT_BWD_OBJ = \
-	bin/tensor_product.cu.o
+	bin/tensor_product.cu.o \
+	bin/tensor_product_bwd.cu.o
 
+CONVOLUTION_OBJ = \
+	bin/convolution.cu.o
 
 
 #### RULES ###############################################
@@ -122,17 +128,33 @@ TENSOR_PRODUCT_BWD_OBJ = \
 bin/tensor_product.a: $(TENSOR_PRODUCT_OBJ)
 	nvcc --lib -o $@ $^
 
+bin/tensor_product_bwd.a: $(TENSOR_PRODUCT_BWD_OBJ)
+	nvcc --lib -o $@ $^
+
+bin/convolution.a: $(CONVOLUTION_OBJ)
+	nvcc --lib -o $@ $^
+
 bin/tensor_product_%.cu.o: $(SRC_DIR)/cuda/tensor_product/%_channels.cuh
+	nvcc $(NVCC_FLAGS) -x cu -c $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR)
+
+bin/tensor_product_bwd_%.cu.o: $(SRC_DIR)/cuda/tensor_product_bwd/%_channels.cuh
 	nvcc $(NVCC_FLAGS) -x cu -c $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR)
 
 #=== Objects and test builds ===
 
-bin/%.cu.o: $(SRC_DIR)/cuda/%.cu
+bin/%.cu.o: $(SRC_DIR)/cuda/%.cu $(SRC_DIR)/cuda/%.cuh
 	nvcc $(NVCC_FLAGS) -c $< -o $@ -I $(INC_DIR) $(CUDA_INC_DIR)
 
 bin/test_tensor_product:\
 	$(SRC_DIR)/tests/test_tensor_product.cpp bin/tensor_product.a
+	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
+bin/test_tensor_product_bwd:\
+	$(SRC_DIR)/tests/test_tensor_product_bwd.cpp bin/tensor_product_bwd.a
+	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
+
+bin/test_convolution:\
+	$(SRC_DIR)/tests/test_convolution.cpp bin/convolution.a
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
 bin/test_tensor_product_bwd:\
