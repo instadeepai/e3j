@@ -94,6 +94,7 @@ CU_OBJ = \
 	bin/fill.cu.o\
 	bin/scatter_add.cu.o\
 	bin/convolution.cu.o\
+	bin/convolution_bwd.cu.o\
 	bin/tensor_product_bwd.cu.o\
 	bin/tensor_product.cu.o\
 
@@ -103,7 +104,8 @@ CU_TEST = \
 	test_scatter_add\
 	test_tensor_product\
 	test_tensor_product_bwd\
-	test_convolution
+	test_convolution\
+	test_convolution_bwd
 
 TENSOR_PRODUCT_OBJ = \
 	bin/tensor_product.cu.o
@@ -117,6 +119,10 @@ TENSOR_PRODUCT_BWD_OBJ = \
 
 CONVOLUTION_OBJ = \
 	bin/convolution.cu.o
+
+CONVOLUTION_BWD_OBJ = \
+	bin/convolution.cu.o \
+	bin/convolution_bwd.cu.o
 
 
 #### RULES ###############################################
@@ -132,6 +138,9 @@ bin/tensor_product_bwd.a: $(TENSOR_PRODUCT_BWD_OBJ)
 	nvcc --lib -o $@ $^
 
 bin/convolution.a: $(CONVOLUTION_OBJ)
+	nvcc --lib -o $@ $^
+
+bin/convolution_bwd.a: $(CONVOLUTION_BWD_OBJ)
 	nvcc --lib -o $@ $^
 
 bin/tensor_product_%.cu.o: $(SRC_DIR)/cuda/tensor_product/%_channels.cuh
@@ -150,16 +159,15 @@ bin/test_tensor_product:\
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
 bin/test_tensor_product_bwd:\
-	$(SRC_DIR)/tests/test_tensor_product_bwd.cpp bin/tensor_product_bwd.a
+	$(SRC_DIR)/tests/test_tensor_product_bwd.cpp bin/tensor_product_bwd.cu.o bin/tensor_product.a
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
 bin/test_convolution:\
 	$(SRC_DIR)/tests/test_convolution.cpp bin/convolution.a
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
-bin/test_tensor_product_bwd:\
-	$(SRC_DIR)/tests/test_tensor_product_bwd.cpp bin/tensor_product_bwd.cu.o bin/tensor_product.a
-
+bin/test_convolution_bwd:\
+	$(SRC_DIR)/tests/test_convolution_bwd.cpp bin/convolution_bwd.a
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
 bin/test_%: bin/%.cu.o $(SRC_DIR)/tests/test_%.cpp
