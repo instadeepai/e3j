@@ -35,7 +35,6 @@ class TensorProductParams:
     num_out: int
     mode: str | TPMode = TPMode.OUTER
     layout: str | Layout = Layout.LEADING_CHANNELS
-    unroll: int | tuple[int, int, int] = (1, 1, 1)
 
 
 # XLA-FFI Primitives
@@ -55,7 +54,7 @@ def tensor_product(
             encoding (val, i, j, k) per nonzero CG entry.
         x: l.h.s. operand
         y: r.h.s. operand
-        params: kernel parameters (num_out, mode, layout, unroll).
+        params: kernel parameters (num_out, mode, layout).
 
     Returns:
         The contraction of the sparse 3D coefficient array with x and y.
@@ -73,13 +72,7 @@ def tensor_product(
     else:
         raise ValueError(f"Unsupported layout: {layout}")
 
-    # FFI api: static shape attribute hack to parse unroll
     num_out = params.num_out
-
-    if isinstance(params.unroll, int):
-        kx, ky, kz = [params.unroll] * 3
-    else:
-        kx, ky, kz = params.unroll
 
     # Infer output channels
     mode = TPMode.parse(params.mode)
@@ -127,9 +120,6 @@ def tensor_product(
                 num_out=int32(num_out),
                 mode=int32(mode.value),
                 layout=int32(layout.value),
-                unroll_x=int32(kx),
-                unroll_y=int32(ky),
-                unroll_z=int32(kz),
                 debug=int32(config().debug_level),
             )
 
@@ -252,9 +242,6 @@ def tensor_product_bwd(
         *args,
         mode=int32(mode.value),
         layout=int32(layout.value),
-        unroll_x=int32(1),
-        unroll_y=int32(1),
-        unroll_z=int32(1),
         debug=int32(config().debug_level),
     )
 
@@ -352,8 +339,8 @@ def _tensor_product_bwd(params, res, ct_z):
         num_x, num_y = x.shape[1], y.shape[1]
 
     params_x, params_y = (
-        replace(params, num_out=num_x, mode=mode_x, unroll=1),
-        replace(params, num_out=num_y, mode=mode_y, unroll=1),
+        replace(params, num_out=num_x, mode=mode_x),
+        replace(params, num_out=num_y, mode=mode_y),
     )
 
     ct_x = tensor_product(coef_x, ct_z, y, params_x)

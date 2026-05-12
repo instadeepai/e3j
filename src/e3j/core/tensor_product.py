@@ -69,7 +69,6 @@ class TensorProduct(SparseMixin):
         target: O3Space | str | None,
         coef: Optional[sparse.BCOO] = None,
         sort: bool = True,
-        unroll: int | tuple[int, int, int] = 1,
         config: utils.Config | None = None,
         layout: str | options.Layout = "LEADING_CHANNELS",
         mode: str | options.TPMode = "OUTER",
@@ -137,16 +136,6 @@ class TensorProduct(SparseMixin):
 
         # --- Coefficients ---
 
-        # Unroll coefficients by expanding feature sizes
-        if isinstance(unroll, tuple) and len(unroll) == 3:
-            self.unroll = unroll
-        elif isinstance(unroll, tuple) and len(unroll) == 2:
-            self.unroll = (1, *unroll)
-        elif isinstance(unroll, int):
-            self.unroll = (1, unroll, unroll)
-        else:
-            raise ValueError("unroll: should be int or tuple[int, int, int]")
-
         # Fill cache from pre-computed coefficients
         if coef is not None:
             self.coef = coef
@@ -202,7 +191,6 @@ class TensorProduct(SparseMixin):
             perm.target,
             coef=coef,
             sort=False,
-            unroll=self.unroll,
         )
 
     @staticmethod
@@ -329,14 +317,12 @@ class TensorProduct(SparseMixin):
         x: Array,
         y: Array,
         coef: Array,
-        unroll: int | tuple[int, int] = 1,
     ) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         idx = coef.indices
         val = coef.data
         params = Params(
             num_out=self.target.dim,
-            unroll=self.unroll,
             layout=self.layout,
             mode=self.mode,
         )
@@ -354,8 +340,6 @@ class TensorProduct(SparseMixin):
         if self.is_dense:
             return self.dense_eval(x, y, coef)
         if self.is_fused:
-            with jax.ensure_compile_time_eval():
-                unroll = tuple(numpy.int32(k) for k in self.unroll)
-            return self.fused_eval(x, y, coef, unroll=unroll)
+            return self.fused_eval(x, y, coef)
         else:
             return self.sparse_eval(x, y, coef)

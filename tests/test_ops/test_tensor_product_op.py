@@ -33,8 +33,6 @@ e3j.config(
     tensor_product_bwd=True,
 )
 
-UNROLL = (1, 1, 1)
-
 NUM_STRIPS = 10
 LEN_STRIPS = 6
 NUM_ROWS = 128
@@ -163,7 +161,7 @@ def tensor_product_reference(
 def test_forward_tensor_product():
     """Check forward pass."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     expect = tensor_product_reference(idx, val, x, y, num_out)
     result = tensor_product(pack_coef(val, idx), x, y, params)
     assert np.allclose(expect, result, atol=1e-5)
@@ -172,7 +170,7 @@ def test_forward_tensor_product():
 def test_forward_tensor_product_inner():
     """Check forward pass."""
     num_out, idx, val, x, y = generate_tp_data(channels=[NUM_CHANNELS] * 2)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="INNER")
+    params = Params(num_out=num_out, mode="INNER")
     expect = tensor_product_reference(idx, val, x, y, num_out, mode="INNER")
     result = tensor_product(pack_coef(val, idx), x, y, params)
     assert np.allclose(expect, result, atol=1e-5)
@@ -181,7 +179,7 @@ def test_forward_tensor_product_inner():
 def test_jit_tensor_product():
     """Check that e3j.ops.tensor_product can be compiled."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
 
     @jax.jit
@@ -194,7 +192,7 @@ def test_jit_tensor_product():
 def test_jit_tensor_product_vmap():
     """Check that e3j.ops.tensor_product can be compiled."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
     xs = np.stack([x, x])
     ys = np.stack([y, y])
@@ -259,7 +257,7 @@ def test_vmap_tensor_product_multi_devices():
     """
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
 
     topology = get_topology_desc(
         "name",
@@ -347,7 +345,7 @@ _VMAP_ASSERT = "Only batching over x and y is supported"
 def test_vmap_raises_on_batched_coef():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef_batch = np.stack([coef, coef, coef])
     with pytest.raises(AssertionError, match=_VMAP_ASSERT):
         jax.vmap(lambda c: tensor_product(c, x, y, params))(coef_batch)
@@ -356,7 +354,7 @@ def test_vmap_raises_on_batched_coef():
 def test_vmap_raises_on_x_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     xs = np.stack([x, x, x])
     with pytest.raises(AssertionError, match=_VMAP_ASSERT):
         jax.vmap(lambda xi: tensor_product(coef, xi, y, params))(xs)
@@ -365,7 +363,7 @@ def test_vmap_raises_on_x_only():
 def test_vmap_raises_on_y_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     ys = np.stack([y, y, y])
     with pytest.raises(AssertionError, match=_VMAP_ASSERT):
         jax.vmap(lambda yi: tensor_product(coef, x, yi, params))(ys)
@@ -374,7 +372,7 @@ def test_vmap_raises_on_y_only():
 def test_backward_tensor_product():
     """Check backward pass on x and y gradients."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
 
     def f_custom(x, y):
@@ -396,7 +394,7 @@ def test_backward_tensor_product():
 def test_backward2_tensor_product():
     """Check two TP backward passes on x and y."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
 
     def prod_custom(x, y):
@@ -425,7 +423,6 @@ class _TestTensorProductOp:
     channels_x: int | None = None
     channels_y: int | None = None
     num_rows = 16
-    unroll: tuple[int, ...] = (1, 1, 1)
     layout: str = "LEADING_CHANNELS"
 
     def closure(self):
@@ -463,7 +460,6 @@ class _TestTensorProductOp:
 
         kwargs = {
             "num_out": self.num_out,
-            "unroll": self.unroll,
             "mode": self.mode,
             "layout": self.layout,
         }
@@ -473,7 +469,6 @@ class _TestTensorProductOp:
     @property
     def fwd_ref(self):
         idx, val, kwargs = self.closure()
-        kwargs.pop("unroll")
         return lambda x, y: tensor_product_reference(idx, val, x, y, **kwargs)
 
     @property
@@ -543,7 +538,6 @@ class TestTensorProductOuter(_TestTensorProductOp):
     channels_x = 8
     channels_y = None
     num_rows = 6
-    unroll = (1, 1, 1)
 
 
 class TestTensorProductInner(_TestTensorProductOp):
@@ -555,7 +549,6 @@ class TestTensorProductInner(_TestTensorProductOp):
     channels_x = 4
     channels_y = 4
     num_rows = 12
-    unroll = (1, 1, 1)
 
 
 class TestTensorProductOuterTrailing(TestTensorProductOuter):

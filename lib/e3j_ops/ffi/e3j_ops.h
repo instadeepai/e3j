@@ -120,9 +120,6 @@ xla::Error TensorProductHandler(
     int32_t num_out,
     int32_t _mode,
     int32_t _layout,
-    int32_t unroll_x = 1,
-    int32_t unroll_y = 1,
-    int32_t unroll_z = 1,
     int debug = 0
 ) {
 
@@ -206,9 +203,6 @@ xla::Error TensorProductHandler(
             .channels_x = channels_x,                           \
             .channels_y = channels_y,                           \
             .mode = mode,                                       \
-            .unroll_x = unroll_x,                               \
-            .unroll_y = unroll_y,                               \
-            .unroll_z = unroll_z,                               \
             .layout = layout                                    \
         };                                                      \
         return e3j::tensor_product::launch<Idx, Val>(           \
@@ -243,9 +237,6 @@ XLA_FFI_DEFINE_HANDLER(
         .Attr<int32_t>("num_out")
         .Attr<int32_t>("mode")
         .Attr<int32_t>("layout")
-        .Attr<int32_t>("unroll_x")
-        .Attr<int32_t>("unroll_y")
-        .Attr<int32_t>("unroll_z")
         .Attr<int32_t>("debug")
 );
 
@@ -263,9 +254,6 @@ xla::Error TensorProductBwdHandler(
     xla::Result<xla::AnyBuffer> dy,
     int32_t _mode_fwd,
     int32_t _layout,
-    int32_t unroll_x = 1,
-    int32_t unroll_y = 1,
-    int32_t unroll_z = 1,
     int debug = 0
 ) {
 
@@ -317,9 +305,6 @@ xla::Error TensorProductBwdHandler(
         .channels_x = channels_x,
         .channels_y = channels_y,
         .mode = mode_fwd,
-        .unroll_x = unroll_x,
-        .unroll_y = unroll_y,
-        .unroll_z = unroll_z,
         .layout = layout
     };
 
@@ -366,9 +351,6 @@ XLA_FFI_DEFINE_HANDLER(
         .Ret<xla::AnyBuffer>()   // dy
         .Attr<int32_t>("mode")
         .Attr<int32_t>("layout")
-        .Attr<int32_t>("unroll_x")
-        .Attr<int32_t>("unroll_y")
-        .Attr<int32_t>("unroll_z")
         .Attr<int32_t>("debug")
 );
 
