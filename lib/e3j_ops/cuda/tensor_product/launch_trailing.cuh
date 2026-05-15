@@ -18,7 +18,7 @@
 
 #include "cuda/tensor_product/trailing_channels.cuh"
 
-#define MAX_BLOCK_SIZE 512
+#define MAX_BLOCK_SIZE 256
 
 namespace e3j {
 namespace tensor_product {
