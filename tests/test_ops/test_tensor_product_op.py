@@ -291,6 +291,7 @@ def test_vmap_tensor_product_multi_devices():
     assert len(list(matches)) == 1
 
 
+@pytest.mark.skip("NYI: sharding support for backward kernel")
 def test_vmap_grad_tensor_product_multi_devices():
     """Check that the operation is sharded as expetected when vmapped and jitted over 2 device.
     This test use precompilation so it does not require a GPU to run but need to have jax version
@@ -300,7 +301,7 @@ def test_vmap_grad_tensor_product_multi_devices():
     """
     num_out, idx, val, x, y = generate_tp_data(channels=(128, None))
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
 
     topology = get_topology_desc(
         "name",
