@@ -167,7 +167,7 @@ __global__ void kernel_bwd(
             if (cz > unroll.z)
                 copy_pipe_strided(smem.dz.data, dz_s.data, dz.shape[0], unroll.z, cz);
             else
-                copy_pipe<1>(smem.dz.data, dz_s.data, smem.dz.size());
+                copy_pipe<N>(smem.dz.data, dz_s.data, smem.dz.size());
 
             if (cy > unroll.y)
                 copy_pipe_strided(smem.y.data, y_s.data, y.shape[0], unroll.y, cy);
@@ -179,7 +179,7 @@ __global__ void kernel_bwd(
             if (cx > unroll.x)
                 copy_pipe_strided(smem.x.data, x_s.data, x.shape[0], unroll.x, cx);
             else
-                copy_pipe<1>(smem.x.data, x_s.data, smem.x.size());
+                copy_pipe<N>(smem.x.data, x_s.data, smem.x.size());
             __pipeline_commit();
 
             // Drain dz + y (pipeline group 0).
