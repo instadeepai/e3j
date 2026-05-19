@@ -32,6 +32,7 @@ Python_add_library(e3j_ops MODULE WITH_SOABI
     cuda/tensor_product.cu
     cuda/tensor_product_bwd.cu
     cuda/convolution.cu
+    cuda/convolution_bwd.cu
     cuda/fill.cu)
 
 target_link_libraries(e3j_ops PRIVATE
