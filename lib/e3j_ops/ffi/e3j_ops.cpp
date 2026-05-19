@@ -29,6 +29,7 @@ py::dict GetRegistrations () {
     ops["tensor_product"] = e3j_ops::pyEncapsulateFunction(e3j_ops::xla_tensor_product);
     ops["tensor_product_bwd"] = e3j_ops::pyEncapsulateFunction(e3j_ops::xla_tensor_product_bwd);
     ops["convolution"] = e3j_ops::pyEncapsulateFunction(e3j_ops::xla_convolution);
+    ops["convolution_bwd"] = e3j_ops::pyEncapsulateFunction(e3j_ops::xla_convolution_bwd);
     return ops;
 }
 
