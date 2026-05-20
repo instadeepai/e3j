@@ -60,7 +60,9 @@ class Config(YamlConfig):
     """
 
     layout: Layout = Layout.TRAILING_CHANNELS
-    tensor_product: TensorProduct = TensorProduct.SPARSE
+    tensor_product: TensorProduct = (
+        TensorProduct.FUSED if E3J_OPS_AVAILABLE else TensorProduct.SPARSE
+    )
     aggregation: Aggregation = Aggregation.SCATTER
     debug_level: int = 0
 
