@@ -25,6 +25,12 @@ from e3j.utils.options import Aggregation, Layout, TensorProduct
 
 E3J_CONFIG = Path(os.environ.get("E3J_CONFIG") or "e3j.yaml")
 
+E3J_OPS_AVAILABLE = True
+try:
+    import e3j_ops  # noqa
+except ModuleNotFoundError:
+    E3J_OPS_AVAILABLE = False
+
 
 @dataclass
 class Config(YamlConfig):
@@ -39,12 +45,13 @@ class Config(YamlConfig):
     :class:`config` (lower case).
 
     Attributes:
+        layout: Default array layout for equivariant features.
+            See :class:`~e3j.utils.options.Layout`.
         tensor_product: Evaluation strategy for tensor products.
             See :class:`~e3j.utils.options.TensorProduct`.
         aggregation: Aggregation method for sparse reduction steps.
+            Only used if `tensor_product` option is "SPARSE".
             See :class:`~e3j.utils.options.Aggregation`.
-        layout: Array layout for equivariant features.
-            See :class:`~e3j.utils.options.Layout`.
         debug_level: Verbosity level (0 = silent).
 
     Example::
@@ -52,9 +59,9 @@ class Config(YamlConfig):
         >>> cfg: Config = config.state()
     """
 
+    layout: Layout = Layout.TRAILING_CHANNELS
     tensor_product: TensorProduct = TensorProduct.SPARSE
     aggregation: Aggregation = Aggregation.SCATTER
-    layout: Layout = Layout.LEADING_CHANNELS
     debug_level: int = 0
 
 
