@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
+
 import e3j.core as core
 import e3j.linen as linen
 import e3j.utils as utils
@@ -19,3 +21,5 @@ from e3j.arrays.array import O3Array
 from e3j.arrays.array_utils import as_array
 from e3j.spaces import O3Space
 from e3j.utils import config
+
+__version__ = importlib.metadata.version("e3j")

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -872,7 +872,7 @@ wheels = [
 
 [[package]]
 name = "e3j"
-version = "0.1.0a12"
+version = "0.1.0b0"
 source = { editable = "." }
 dependencies = [
     { name = "e3nn-jax" },
@@ -1040,7 +1040,7 @@ tensorboard = [
 
 [[package]]
 name = "e3j-ops"
-version = "0.1.0a12"
+version = "0.1.0b0"
 source = { editable = "lib/e3j_ops" }
 
 [[package]]
