@@ -1,0 +1,134 @@
+# Copyright (c) 2026 InstaDeep Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import jax
+import jax.numpy as jnp
+import pytest
+
+from e3j.arrays import O3Array
+from e3j.spaces import O3Space
+
+
+class _TestO3Array:
+    _space: str = "0e+1o"
+    dim: int = 4
+    batch_size: int = 128
+    num_channels: int = 32
+    layout = "LEADING_CHANNELS"
+
+    @property
+    def space(self):
+        return O3Space(self._space)
+
+    @property
+    def shape(self):
+        n, nd, nc = (self.batch_size, self.dim, self.num_channels)
+        if self.layout == "LEADING_CHANNELS":
+            return (n, nc, nd)
+        elif self.layout == "TRAILING_CHANNELS":
+            return (n, nd, nc)
+
+    @pytest.fixture(scope="class")
+    def inputs(self) -> tuple[jax.Array, jax.Array]:
+        x = jnp.ones(self.shape)
+        y = jnp.zeros(self.shape) + jnp.arange(self.shape[-1])[None, None, :]
+        return x, y
+
+    @pytest.fixture(scope="class")
+    def o3_inputs(self, inputs) -> tuple[O3Array, O3Array]:
+        x, y = inputs
+        return (
+            O3Array(self.space, x, self.layout),
+            O3Array(self.space, y, self.layout),
+        )
+
+    def test_add(self, o3_inputs):
+        x, y = o3_inputs
+        z = x + y
+        assert isinstance(z, O3Array) and z.space == self.space
+        assert jnp.all(z.array == x.array + y.array)
+
+    def test_sub(self, o3_inputs):
+        x, y = o3_inputs
+        z = x - y
+        assert isinstance(z, O3Array) and z.space == self.space
+        assert jnp.all(z.array == x.array - y.array)
+
+    @pytest.mark.xfail
+    def test_radd(self, o3_inputs):
+        x, _ = o3_inputs
+        z = 2 + x
+        assert isinstance(z, O3Array) and z.space == self.space
+        assert jnp.all(z.array == 2 + x.array)
+
+    @pytest.mark.xfail
+    def test_illegal_mul(self, o3_inputs):
+        x, y = o3_inputs
+        z = x * y
+        assert isinstance(z, O3Array) and z.space == self.space
+        assert jnp.all(z.array == x.array * y.array)
+
+    def test_rmul(self, o3_inputs):
+        x, _ = o3_inputs
+        z = 2 * x
+        assert isinstance(z, O3Array) and z.space == self.space
+        assert jnp.all(z.array == 2 * x.array)
+
+    def test_batched_rmul(self, o3_inputs):
+        x, _ = o3_inputs
+        shape = list(self.shape)
+        shape[x.feature_axis] = 1
+        scalars = jnp.ones(tuple(shape))
+        scalars *= jnp.arange(scalars.size).reshape(*shape)
+        result = (scalars * x).array
+        expect = scalars * x.array
+        assert jnp.all(expect == result)
+
+    @pytest.mark.xfail
+    def test_illegal_rmul(self, o3_inputs):
+        x, y = o3_inputs
+        z = x * y
+
+    @pytest.mark.xfail
+    def test_shorter_feature_axis(self, inputs):
+        x, y = inputs
+        z = O3Array(self.space, x[:, :-2])
+        assert not z
+
+    def test_getitem(self, o3_inputs):
+        _, y = o3_inputs
+        idx = jnp.array([0, 1, 2])
+        yi = y[idx]
+        assert isinstance(yi, O3Array) and yi.space == self.space
+        assert jnp.all(yi.array == y.array[idx])
+
+    def test_jit_return(self, o3_inputs):
+        x, y = o3_inputs
+
+        @jax.jit
+        def fn(a, b):
+            return a + b
+
+        z = fn(x, y)
+        assert isinstance(z, O3Array) and z.space == self.space
+        assert z.layout == x.layout
+        assert jnp.all(z.array == x.array + y.array)
+
+
+class TestO3ArrayLeading(_TestO3Array):
+    layout = "LEADING_CHANNELS"
+
+
+class TestO3ArrayTrailing(_TestO3Array):
+    layout = "TRAILING_CHANNELS"

@@ -1,0 +1,25 @@
+# This is the configuration file for the Google App Engine instance.
+# GAE is capable of hosting any sort of web app,
+# however, here we focus on the static website hosting capabilities.
+# https://cloud.google.com/appengine/docs/standard/hosting-a-static-website
+runtime: python311
+service: e3j
+
+handlers:
+  # static files with a URL ending with a file extension
+  # (e.g. favicon.ico, manifest.json, jylade.png)
+  - url: /(.*\..+)$
+    static_files: site/\1
+    upload: site/(.*\..+)$
+  # index page
+  - url: /
+    static_files: site/index.html
+    upload: site/index.html
+  # anything that ends with a slash (e.g. /docs/)
+  - url: /(.*)/$
+    static_files: site/\1/index.html
+    upload: site/(.*)
+  # anything else (e.g. /docs)
+  - url: /(.*)
+    static_files: site/\1/index.html
+    upload: site/(.*)

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+
+[project]
+name = "e3j_ops"
+version = "0.1.0a12"
+description = "Fast Euclid equivariant operations for JAX"
+authors = [
+    { name="Olivier Peltre", email="o.peltre@instadeep.com" }
+]
+license = {text="MIT"}
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+
+[tool.scikit-build]
+sdist.include = ["CMakeLists.txt"]
+wheel.exclude = ["cuda", "ffi", "tests", "README.md"]

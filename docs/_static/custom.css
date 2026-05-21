@@ -1,0 +1,77 @@
+@import 'theme.css';
+
+/* Newlines (\a) and spaces (\20) before each parameter */
+.sig-param::before {
+    content: "\a\20\20\20\20";
+    white-space: pre;
+}
+
+a, a:visited {
+    color: #49c;
+}
+a:hover, a:visited:hover {
+    color: #fa8;
+}
+
+/* Newline after the last parameter (so the closing bracket is on a new line) */
+dt em.sig-param:last-of-type::after {
+    content: "\a";
+    white-space: pre;
+}
+
+/* To have blue background of width of the block (instead of width of content) */
+dl.class > dt:first-of-type {
+    display: block !important;
+}
+
+h2 {
+    font-size: 1.3rem;
+}
+h3 {
+    font-size: 1.1rem;
+}
+h4 {
+    font-size: 1rem;
+}
+
+@media not print {
+@media (prefers-color-scheme: dark) {
+body:not([data-theme="light"]) .highlight .go {
+    color: #8cf;
+    font-style: normal;
+}
+}
+
+/*
+.sig-param .pre {
+    font: normal .9rem mono;
+}
+
+
+.property .pre {
+    font: normal 17px mono;
+    color: #ca4;
+}
+
+.sig-name .pre {
+    font: normal bold 1.1em mono;
+    color: #3E4349;
+}
+
+
+div.note {
+    background-color: #f9f6f0;
+    border: solid 1px #fbfbf8;
+}
+
+.toctree-wrapper ul li.toctree-l1 {
+    list-style-type: "⋅ ";
+}
+.toctree-wrapper ul li li a {
+    color: #9ac;
+}
+.toctree-wrapper ul li li.toctree-l2 {
+    list-style-type: "→ ";
+    list-style-type: "- ";
+}
+*/

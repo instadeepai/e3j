@@ -1,0 +1,76 @@
+default_stages: [ "pre-commit", "commit-msg", "pre-push" ]
+default_language_version:
+  python: python3.11
+
+repos:
+  - repo: https://github.com/timothycrosley/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+        exclude: analysis/anarci/BioBlocks/
+
+  - repo: https://github.com/psf/black
+    rev: 24.2.0
+    hooks:
+      - id: black
+        name: "Code formatter"
+        exclude: notebooks/ analysis/anarci/BioBlocks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.1.0
+    hooks:
+      - id: end-of-file-fixer
+        name: "End of file fixer"
+        exclude: docker/template.env *.fasta
+      - id: debug-statements
+        name: "Debug imports and breakpoints checker"
+      - id: requirements-txt-fixer
+        name: "Requirements txt fixer"
+      - id: mixed-line-ending
+        name: "Mixed line ending fixer"
+      - id: check-yaml
+        name: "Yaml checker"
+        args: [ '--unsafe' ]
+      - id: trailing-whitespace
+        name: "Trailing whitespace fixer"
+
+  - repo: https://github.com/PyCQA/flake8
+    rev: 4.0.1
+    hooks:
+      - id: flake8
+        # E203 - ":" with whitespace before it
+        # E501 - line length (black will handle most of the issues, and what it can't - should be ingored)
+        # W503 - line break before binary operator (conflicts with other pre-commit hooks).
+        # CCR001 - Cognitive complexity (it's too annoying - write the functions you want ;)).
+        # N803 - argument name should be lowercase
+        # N806 - variable in function should be lowercase
+        ### added
+        # C401 - unnecessary generator -> set comprehension
+        # (within any/all, that's what we want! also compains with dicts)
+        # N801 - accept l as variable
+        name: "Linter"
+        args:
+          - --exit-zero
+          - --statistics
+          - --config=setup.cfg
+          - --ignore=E203,E501,E741,W503,CCR001,C401,C408,N801,N803,N806
+          - --exclude=docs/*.py
+          - --max-line-length=127
+        additional_dependencies:
+          - pep8-naming
+          - flake8-builtins
+          - flake8-comprehensions
+          - flake8-bugbear
+          - flake8-pytest-style
+          - flake8-cognitive-complexity
+        exclude: analysis/anarci/BioBlocks/
+
+
+  - repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
+    rev: v4.1.0
+    hooks:
+      - id: commitlint
+        name: "Commit linter"
+        stages: [ commit-msg ]
+        additional_dependencies: [ '@commitlint/config-conventional' ]
