@@ -95,15 +95,17 @@ class TensorProductBenchmark(E3Benchmark):
     def e3j(self):
         with config.use(tensor_product="SPARSE", aggregation="SCATTER"):
             source = self.mul * self.source[0], self.source[1]
-            return TensorProduct(source, self.target)
+            return TensorProduct(
+                source,
+                self.target,
+                layout="E3NN",
+            )
 
     @functools.cached_property
     def e3j_ops_leading(self):
         with config.use(tensor_product="FUSED"):
             return TensorProduct(
-                self.source,
-                self.target,
-                unroll=UNROLL,
+                self.source, self.target, unroll=UNROLL, layout="LEADING_CHANNELS"
             )
 
     @functools.cached_property
