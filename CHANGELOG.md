@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [0.1.0b0] — 2026-05-21
+
+### Fixed
+
+- Tensor product broadcasting behaviour when only one operand has an additional batch axis.
+  The bug occured for instance when computing Hessians with `jax.jacrev`, batched cotangents
+  then require broadcast.
+
+### Changed
+
+- The default layout is now `TRAILING_CHANNELS`.
+- The default config selects CUDA kernels for tensor product, unless `ModuleNotFoundError` is caught
+  when trying to import `e3j_ops` binaries.
+
 ## [0.1.0a12] — 2026-05-12
 
 ### Fixed
