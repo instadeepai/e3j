@@ -39,9 +39,9 @@ build from source by running run one of:
 
 ```sh
 # Existing CUDA 13 install with `e3j_ops` kernels:
-uv sync --group cuda_local --extra ops
+uv sync --group cuda13_local --extra ops
 # Install CUDA 13 via pip and the `exp` group for benchmarks:
-uv sync --group cuda --extra ops
+uv sync --group cuda13 --extra ops
 ```
 
 The Python build internally relies on CMake, scikit-build and pybind11. You can also look at the [Makefile](Makefile) for alternate recipes to build kernels,
