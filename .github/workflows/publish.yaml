@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Publish to PyPI 📦
+name: Build wheels 📦
 
 on:
   push:
@@ -25,14 +25,11 @@ permissions:
 
 jobs:
   publish-e3j:
-    name: Build & publish e3j (pure Python)
+    name: Build e3j (pure Python)
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/e3j
-    permissions:
-      id-token: write
-      contents: read
+    # environment:
+    #   name: pypi
+    #   url: https://pypi.org/p/e3j
     steps:
       - name: checkout 📂
         uses: actions/checkout@v5
@@ -46,18 +43,21 @@ jobs:
       - name: show artifacts
         run: ls -lah dist
 
+      - name: upload artifact 📤
+        uses: actions/upload-artifact@v4
+        with:
+          name: e3j
+          path: dist/
+
       # - name: publish to PyPI 🚀
       #   uses: pypa/gh-action-pypi-publish@release/v1
 
   publish-e3j-ops:
-    name: Build & publish e3j_ops (CUDA wheels)
+    name: Build e3j_ops (CUDA wheels)
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/e3j-ops
-    permissions:
-      id-token: write
-      contents: read
+    # environment:
+    #   name: pypi
+    #   url: https://pypi.org/p/e3j-ops
     steps:
       - name: checkout 📂
         uses: actions/checkout@v5
@@ -88,6 +88,12 @@ jobs:
 
       - name: show artifacts
         run: ls -lah dist
+
+      - name: upload artifact 📤
+        uses: actions/upload-artifact@v4
+        with:
+          name: e3j-ops
+          path: dist/
 
       # - name: publish to PyPI 🚀
       #   uses: pypa/gh-action-pypi-publish@release/v1
