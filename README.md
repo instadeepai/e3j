@@ -2,17 +2,54 @@
 
 Euclid-equivariant operations and harmonic polynomials for JAX.
 
-This library is intended as a faster and reliable substitute for the [e3nn] and [e3x] Euclid-equivariant
-backends.
-Our longer term goal is to replace slow components in equivariant MLIPs, as shipped with the [mlip-jax] repo.
+This library is intended as a faster and full-featured substitute for the [e3nn] and [e3x] Euclidean equivariance backends, replacing slow components
+in Machine Learned Interatomic Potentials (MLIPs) with carefully optimized
+and open-source CUDA kernels.
 
-For now, e3j is meant to operate alongside `e3nn`,
-on which it depends for a few non-critical operations (e.g. Irreps manipulations and Clebsch-Gordan coefficients).
-This dependency may be dropped in the future.
+The equivariance backend of our MLIP library is `e3j` as of [mlip] 0.2.0.
+
+> **Note:** `e3j` is currently in pre-release,
+> with version 0.1.0 planned for early June 2026.
+> Additional CUDA kernels and dedicated Pallas kernels for TPU
+> will be rolled out progressively.
 
 [e3nn]: https://github.com/e3nn/e3nn-jax
 [e3x]: https://github.com/google-research/e3x
-[mlip-jax]: https://github.com/instadeepai/mlip-jax
+[mlip]: https://github.com/instadeepai/mlip
+
+## Installation
+
+### Requirements
+
+The `e3j` package consists of a thin JAX-based Python API which can run on CPU, GPU and TPU, and currently supports Python versions from 3.11 to 3.14 included.
+
+For efficiency on GPU, our CUDA binaries need to be pulled via the `"e3j[ops]"` extra:
+
+```sh
+# requirements.txt
+jax[cuda13_local] ~= 0.8.0
+e3j[ops] == 0.1.0b0
+```
+See [JAX installation](https://docs.jax.dev/en/latest/installation.html) instructions for more information.
+
+### Building from source
+
+Our dependencies are managed with uv. After cloning the repository, you can
+build from source by running run one of:
+
+```sh
+# Existing CUDA 13 install with `e3j_ops` kernels:
+uv sync --group cuda13_local --extra ops
+# Install CUDA 13 via pip and the `exp` group for benchmarks:
+uv sync --group cuda13 --extra ops
+```
+
+The Python build internally relies on CMake, scikit-build and pybind11. You can also look at the [Makefile](Makefile) for alternate recipes to build kernels,
+C++ tests and the Python bindings.
+The `e3j_ops` Python package only contains our CUDA binaries and bindings
+to their associated XLA handlers, and is not meant to be used as standalone.
+
+The JAX primitives wrapping our custom XLA handlers are defined in the `e3j.ops` subpackage of `e3j`, provided the `e3j_ops` binaries can be found in the environment.
 
 ### Project structure:
 - [src/](src/e3j) : python source
@@ -24,107 +61,3 @@ This dependency may be dropped in the future.
     + [ffi](lib/e3j_ops/ffi) : XLA and Python binding boilerplate
 
 [flax.linen.Module]: https://flax-linen.readthedocs.io/en/latest/api_reference/flax.linen/module.html
-
-## Installation
-
-### As a dependency
-
-In the MLIP dependencies, managed with `uv`, we have the following set up:
-
-```toml
-[dependency-groups]
-e3j = ["e3j"]
-e3j_ops = ["e3j_ops"]
-
-[tool.uv.sources]
-e3j = {git="https://github.com/instadeepai/e3j", branch="main"}
-#e3j = {git = "https://github.com/instadeepai/e3j", rev="fea221c4191204c87a960153738da38cc1923a6b"}
-```
-
-### For development
-
-Dependencies are managed with uv, after cloning the repository you can run one of:
-
-```sh
-# CPU install
-uv sync --group cpu
-# Existing CUDA 12 install with `e3j_ops` kernels:
-uv sync --group cuda_local --extra ops
-# Install CUDA 12 via pip and the `exp` group for benchmarks:
-uv sync --group cuda --group exp --extra ops
-```
-
-You should now be able to run the tests with:
-
-```sh
-uv run pytest
-```
-
-__Note:__ if you make a change to the `lib/` code and would like to rebuild CUDA for the `uv` environment, you can run:
-```sh
-make uv # forces `uv cache clean` of the e3j_ops shared object
-make pytest # pytest -m "e3j_ops" tests/test_ops
-```
-
-### Building `e3j_ops`
-
-The `e3j.ops` subpackage optionally provides JAX bindings to our
-sparse kernels via the XLA FFI.
-
-There are currently two ways to build or test the `e3j_ops` shared object:
-
-1. Installing `e3j` with the `ops` extra, which internally relies on `cmake`
-and `scikit-build`.
-
-   ```sh
-   # Editable dev install
-   uv sync --group cuda|cuda_local --extra ops
-   # Dependency install
-   pip install e3j[ops] # (once uploaded to PyPI, add git url/token for now)
-   ```
-2. Building any of the recipes from the [Makefile](Makefile) e.g.
-
-   ```sh
-   # Build the Pybind11 shared object
-   make e3j_ops && export PYTHONPATH=$PWD/bin:$PYTHONPATH
-   # Run a specific test
-   make test_tensor_product
-   # Build tests and run all e3j_ops dependent tests (C++ and Python)
-   make test
-   ```
-
-Both (1) and (2) require that you have `nvcc`, `g++` and eventually `pybind11`
-installed. You should then be able to import `e3j_ops` from Python, exposing
-the raw XLA custom calls. Kernels should however be called from Python
-using the `e3j.ops` namespace API.
-
-
-## Documentation
-
-Build the docs locally with:
-```sh
-cd docs && uv run make html
-#=> file:///<path-to-e3j>/docs/_build/html/index.html`.
-```
-
-## Running benchmarks
-
-See the [scripts](scripts) directory for benchmarks of [e3x], [e3nn] and e3j.
-
-```sh
-# run a collection of benchmarks
-uv run python scripts/benchmark_main.py
-# run individual benchmarks
-uv run python -m scripts.benchmarks.benchmark_tensor_product
-uv run python -m scripts.benchmarks.benchmark_harmonics
-...
-```
-
-The main benchmarking script can be configured by the
-[scripts/config.yaml](scripts/config.yaml) file.
-For each of the `E3Benchmark` subclasses listed within,
-- the `skip` field control whether the benchmark case will be executed,
-- the `grid` field will be expanded into a cartesian product of hyper-parameters,
-- Hyper-parameters are converted by `BENCHMARK_PARSERS[name]` into a tuple of constructor arguments (e.g. `l_max` determines source and target representations, etc.)
-
-TODO: cleanup benchmarks, to automate the definition of backward cases and get rid of the hacky `BENCHMARK_PARSERS`, that should be implemented in the class.
