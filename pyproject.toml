@@ -50,46 +50,13 @@ cpu = [
     "jaxlib >= 0.6.2"
 ]
 
-cuet = [
-    "torch >= 2.4.0",
-    "e3nn >= 0.5.5",
-    "cuequivariance >= 0.10.0",
-    "cuequivariance-torch >= 0.10.0",
-    "cuequivariance-ops-torch-cu13 >= 0.10.0",
-    "opt-einsum-fx == 0.1.4"
-]
-
-cuex = [
-    "cuequivariance >= 0.10.0",
-    "cuequivariance-jax >= 0.10.0",
-    "cuequivariance-ops-jax-cu13 >= 0.10.0",
-]
-
-openeq = [
-    "torch >= 2.4.0",
-    "e3nn >= 0.5.5",
-    "openequivariance"
-]
-
-tensorboard = [
-    "tensorflow >= 2.16.1",
-    "tensorboard-plugin-profile >= 2.15.1"
-]
-
 dev = [
     "pytest == 8.3.2",
     "pytest-cov == 5.0.0",
     "seaborn == 0.13.2",
-    "pyqt5 == 5.15.11",
     "pre-commit == 3.7.1",
     "pybind11 >= 2.13.6",
     "wheel ~= 0.45.1"
-]
-exp = [
-    "pydantic >= 2.12.3, < 3",
-    "typing_extensions ~= 4.15.0",
-    "e3x ~= 1.0.2",
-    {include-group = "cuex"},
 ]
 
 docs = [
@@ -103,7 +70,6 @@ default-groups = ["dev"]
 
 [tool.uv.sources]
 e3j_ops = {workspace = true}
-# openequivariance = {git = "https://github.com/vbharadwaj-bk/OpenEquivariance.git"}
 
 [tool.uv.workspace]
 members = ["lib/*"]
