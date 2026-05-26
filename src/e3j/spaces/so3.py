@@ -178,7 +178,7 @@ class SO3Space(IrrepSum[SO3Irrep]):
         target_filter: Self | str,
         sort: bool = False,
     ) -> "SO3Space":
-        """Tensor product representation, decomposed in irreducibles by CG rules.
+        r"""Tensor product representation, decomposed in irreducibles by CG rules.
 
         Clebsch-Gordan (CG) rules yield an explicit isomorphism between the
         tensor product of two irreducible blocks of degrees l1 and l2, as
