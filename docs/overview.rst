@@ -12,7 +12,7 @@ building blocks:
 
 Most `e3j`_ modules expose a `source` and `target` property,
 describing the input and output representations, which are typically
-of type :class:`e3j.spaces.o3.O3Array`_
+of type :class:`e3j.spaces.o3.O3Array`
 
 Currently, parameterized operations are only integrated within the `flax.linen`_
 framework for JAX neural networks, within the `e3j.linen <api/linen.html>`_ submodule.
