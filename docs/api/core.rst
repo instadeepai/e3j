@@ -13,7 +13,8 @@ core
     :toctree: _core
 
     TensorProduct
-    Bigotimes
+    ScalarMixing
     Monomial
     Polynomial
     Harmonics
+    Bigotimes
