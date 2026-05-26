@@ -151,7 +151,9 @@ docs:
 # Force re-build of cuda bindings with uv and CMake
 
 uv:
-	uv sync --reinstall
+	uv sync --group cuda13_local --extra ops --group exp\
+		--reinstall-package e3j_ops\
+		--reinstall-package e3j
 
 # Build the python bindings `e3j_ops.xxx.so` [2]
 
