@@ -84,28 +84,18 @@ def generate_tp_data(
     idx_0 = np.tile(np.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
     idx_1 = np.tile(np.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
     idx_2 = np.tile(np.array([0, 1, 2, 0, 1, 2]), NUM_STRIPS)
-    #   num_out, num_x, num_y = 4, 3, 5
-    #   idx_0 = np.array([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 3])
-    #   idx_1 = np.array([0, 0, 1, 2, 0, 1, 2, 2, 0, 1, 2, 1, 2])
-    #   idx_2 = np.array([0, 1, 2, 3, 0, 0, 2, 4, 0, 2, 3, 0, 4])
     offsets = np.array([num_out, num_x, num_y])[:, None]
     offsets *= np.arange(NUM_STRIPS).repeat(LEN_STRIPS)
     idx = np.stack([idx_0, idx_1, idx_2]) + offsets
 
     x = np.stack([np.tile(np.array([1.0, 2.0]), NUM_STRIPS)] * num_rows)
     y = np.stack([np.tile(np.array([3.0, 4.0, 5.0]), NUM_STRIPS)] * num_rows)
-    #   x = np.stack([np.linspace(1, num_x, num_x)] * num_rows)
-    #   y = np.stack([np.linspace(1, num_y, num_y)] * num_rows)
 
     if channels[0] is not None:
         x = np.tile(x[:, None, :], (1, channels[0], 1))
     if channels[1] is not None:
         y = np.tile(y[:, None, :], (1, channels[1], 1))
 
-    #   key = random.key(789)
-    #   coef = random.normal(key, (idx.shape[-1],))
-    #   x = random.normal(key, (num_rows, num_x))
-    #   y = random.normal(key, (num_rows, num_y))
     coef = np.ones(idx.shape[-1])
     return num_out * NUM_STRIPS, idx, coef, x, y
 
@@ -340,34 +330,33 @@ def test_vmap_grad_tensor_product_multi_devices():
     assert len(list(matches)) == 1
 
 
-_VMAP_ASSERT = "Only batching over x and y is supported"
-
-
 def test_vmap_raises_on_batched_coef():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
     params = Params(num_out=num_out, mode="OUTER")
     coef_batch = np.stack([coef, coef, coef])
-    with pytest.raises(AssertionError, match=_VMAP_ASSERT):
+    with pytest.raises(ValueError, match=""):
         jax.vmap(lambda c: tensor_product(c, x, y, params))(coef_batch)
 
 
-def test_vmap_raises_on_x_only():
+def test_vmap_batches_on_x_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
     params = Params(num_out=num_out, mode="OUTER")
     xs = np.stack([x, x, x])
-    with pytest.raises(AssertionError, match=_VMAP_ASSERT):
-        jax.vmap(lambda xi: tensor_product(coef, xi, y, params))(xs)
+    zs = jax.vmap(lambda xi: tensor_product(coef, xi, y, params))(xs)
+    assert zs.shape[0] == xs.shape[0]
+    testing.assert_allclose(zs[0], zs[-1])
 
 
-def test_vmap_raises_on_y_only():
+def test_vmap_batches_on_y_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
     params = Params(num_out=num_out, mode="OUTER")
     ys = np.stack([y, y, y])
-    with pytest.raises(AssertionError, match=_VMAP_ASSERT):
-        jax.vmap(lambda yi: tensor_product(coef, x, yi, params))(ys)
+    zs = jax.vmap(lambda yi: tensor_product(coef, x, yi, params))(ys)
+    assert zs.shape[0] == ys.shape[0]
+    testing.assert_allclose(zs[0], zs[-1])
 
 
 def test_backward_tensor_product():
