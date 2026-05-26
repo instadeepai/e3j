@@ -3,8 +3,8 @@
    :width: 100
    :alt: atomic orbitals
 
-e3j.core
-========
+core
+====
 
 .. currentmodule:: e3j.core
 

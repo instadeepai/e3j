@@ -1,32 +1,23 @@
 Overview
 ========
 
-The `e3j`_ package belongs to the growing family of Euclid-equivariant numerical
-backends, targeting JAX.
-
-There are important design choices by which `e3j`_ stands out from alternatives,
-`detailed below <#differences>`_.
-
-.. _handbook: handbook.html
-
-Building blocks
----------------
-
-An equivariant tensor network library is composed of the following basic
+The `e3j`_ package implements Euclid-equivariant operations for JAX,
+it may be used as a replacement for `e3nn_jax`_.
+As an equivariant tensor network library, it is composed of the following basic
 building blocks:
 
 * `Spherical harmonics <api/_core/e3j.core.Harmonics.html>`_
 * `Linear transforms <api/_linen/e3j.linen.Linear.html>`_
 * `Tensor products <api/_core/e3j.core.TensorProduct.html>`_
 
-Note that most of the `e3j`_ modules expose a `source` and `target` property,
-describing the input and output representations.
-This part of the API will always remain stable.
+Most `e3j`_ modules expose a `source` and `target` property,
+describing the input and output representations, which are typically
+of type :class:`e3j.spaces.o3.O3Array`_
 
-Currently, we only provide integration with the `flax.linen`_
+Currently, parameterized operations are only integrated within the `flax.linen`_
 framework for JAX neural networks, within the `e3j.linen <api/linen.html>`_ submodule.
-We however wish to support other frameworks (such as `flax.nnx`) in the future,
-to escape some of the cumbersome lazy design choices of `flax.linen`.
+
+.. _handbook: handbook.html
 
 .. _flax.linen: https://flax-linen.readthedocs.io/en/latest/api_reference/flax.linen/index.html
 
@@ -70,15 +61,11 @@ Example
     >>> r = np.linspace(0, 1, 30).reshape((10, 3))
     >>> Ylm(r).shape
     (10,)
+
     ### Each degree l spans a (2l+1)-dimensional subspace
     >>> monomials = Ylm.polynomial.monomials
     >>> np.sum(monomials.exp, axis=-1)
     Array([0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3], dtype=int32)
-
-    ### flax.linen wrapper
-    >>> from jax import random
-    >>> harmonics = e3j.linen.Harmonics(3)
-    >>> params = harmonics.init(random.key(123), r)
 
 
 Linear Transforms
@@ -172,8 +159,8 @@ this means `e3j`_ basically computes the tensor product of
     The default `jax.lax.scatter_add` scales quite bad to
     large batch sizes (> 10k).
 
-    You can build and use the `e3j_ops` CUDA kernels
-    for performance critical operations.
+    Use the `e3j_ops` CUDA kernels on GPU instead for critical operations.
+    See :class:`e3j.utils.config.Config` for implementation options.
 
 Example
 *******
@@ -182,7 +169,7 @@ Example
 
     >>> otimes = e3j.core.TensorProduct(
     ...     source=("0e+1o+2e", "1o"),
-    ...     target=None, # no ouotimesut filter
+    ...     target=None, # no output filter
     ... )
     ### Output dimension comes first
     >>> otimes.coef.shape
@@ -198,42 +185,10 @@ Example
     (10, 27)
 
 
-.. _differences:
-
-Differences with other backends
--------------------------------
-
-There are already quite a few Euclid-equivariant libraries out there:
-
-* `e3nn`_ and `e3nn_jax`_
-* `cuequivariance`_
-* `openequivariance`_
-* `e3x`_
+.. _e3j: https://github.com/instadeepai/e3j
 
 .. _e3nn: https://e3nn.org/
 .. _e3nn_jax: https://e3nn-jax.readthedocs.io/en/latest
 .. _cuequivariance: https://github.com/NVIDIA/cuEquivariance
 .. _openequivariance: https://github.com/vbharadwaj-bk/OpenEquivariance
 .. _e3x: https://e3x.readthedocs.io/stable/
-
-.. _e3j: https://github.com/instadeepai/e3j
-
-The last of our list, `e3x`_, describes tensor products as a single dense `einsum`
-against a single, dense 3D tensor (contracting against two dimensions).
-However it imposes strong constraints on the kind of admissible E3-representations,
-which makes it unsuitable for many usecases.
-
-The first three (`e3nn`_, `cuequivariance`_ and `openequivariance`_) all behave as
-drop-in replacements for `e3nn`_ modules.
-They describe equivariant tensor products as contraction with a block-sparse, 3D Clebsch-Gordan
-tensor, via their so-called *segmented tensor product* abstraction. This leads to the complicated
-problem of pipelining many different `einsum` operations on the GPU, each acting on different shapes.
-This approach is hardly scalable to large degrees, and brings in a lot of technical and
-cognitive complexity.
-
-In contrast, `e3j`_ accounts for the fine-grained sparsity pattern of Clebsch-Gordan tensors, allowing for
-
-* a lower FLOP count : opens the door to faster runtimes,
-* a lower memory footprint : better scaling ahead,
-* a generic programming model : agnostic polynomials and sparse multilinear maps,
-* a simpler implementation : fewer LOCs implies better maintainability!
