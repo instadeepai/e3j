@@ -2,8 +2,8 @@
    :width: 100
    :alt: atomic orbitals
 
-e3j.utils
-=========
+utils
+=====
 
 .. currentmodule:: e3j.utils
 

@@ -18,13 +18,17 @@ from .harmonics import Harmonics
 from .permutation import Permutation
 from .polynomials import Monomial, Polynomial
 from .power_expansion import PowerExpansion
+from .scalar_mixing import ScalarMixing
 from .tensor_product import TensorProduct
 
 __all__ = [
-    "Harmonics",
-    "Permutation",
-    "Filter",
-    "TensorProduct",
     "Bigotimes",
+    "Filter",
+    "Harmonics",
+    "Monomial",
+    "Permutation",
+    "Polynomial",
     "PowerExpansion",
+    "ScalarMixing",
+    "TensorProduct",
 ]

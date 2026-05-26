@@ -1,6 +1,6 @@
 [project]
 name = "e3j"
-version = "0.1.0b0"
+version = "0.1.0b1"
 description = "Fast Euclid equivariant operations for JAX"
 authors = [
     { name="Olivier Peltre", email="o.peltre@instadeep.com" },
@@ -19,12 +19,12 @@ dependencies = [
     "flax ~= 0.12.0",
     "pandas ~= 2.2.2",
     "matplotlib >= 3.9.0",
-    "setuptools ~= 75.8.0"
+    "setuptools>=75.8,<78.2"
 ]
 
 [project.optional-dependencies]
 ops = [
-    "e3j_ops == 0.1.0b0",
+    "e3j_ops == 0.1.0b1",
     "pybind11 >= 2.13.6"
 ]
 
@@ -51,12 +51,12 @@ cpu = [
 ]
 
 dev = [
-    "pytest == 8.3.2",
+    "pytest==9.0.3",
     "pytest-cov == 5.0.0",
     "seaborn == 0.13.2",
     "pre-commit == 3.7.1",
     "pybind11 >= 2.13.6",
-    "wheel ~= 0.45.1"
+    "wheel>=0.45.1,<0.47.0"
 ]
 
 docs = [

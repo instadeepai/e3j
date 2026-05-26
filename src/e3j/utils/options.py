@@ -58,8 +58,9 @@ class Layout(EnumOption):
     """Array layouts.
 
     Values:
-        LEADING_CHANNELS: "(k, lm)"
-        TRAILING_CHANNELS: "(lm, k)"
+        * LEADING_CHANNELS
+        * TRAILING_CHANNELS
+        * E3NN
     """
 
     LEADING_CHANNELS = 0
@@ -71,9 +72,9 @@ class TPMode(EnumOption):
     """Tensor product modes.
 
     Values:
-        OUTER:  "u -> v -> (u,v)"
-        INNER:  "v -> v -> 1"
-        MAP:    "v -> v -> v"
+        * OUTER:  "u -> v -> (u,v)"
+        * INNER:  "v -> v -> 1"
+        * MAP:    "v -> v -> v"
 
     The 'MAP' mode is only useful with trailing channels,
     since a map over leading axes is performed in any case.
@@ -88,8 +89,8 @@ class TPNormalization(EnumOption):
     """Tensor product normalization options of Clebsch-Gordan coefficients.
 
     Values:
-        NONE: orthonormal Clebsch-Gordan coefficients (default).
-        SQRT_DIM_OUT: coefficients scaled by sqrt(2L+1).
+        * NONE: orthonormal Clebsch-Gordan coefficients (default).
+        * SQRT_DIM_OUT: coefficients scaled by sqrt(2L+1).
     """
 
     NONE = "NONE"
@@ -100,8 +101,8 @@ class LinearInitialization(EnumOption):
     """Linear weight initialization options.
 
     Values:
-        FAN_IN: stddev is 1/sqrt(m_in) per block (e3nn: "path").
-        FAN_OUT: stddev is 1/sqrt(m_out) per block (e3nn: "irrep").
+        * FAN_IN: stddev is 1/sqrt(m_in) per block (e3nn: "path").
+        * FAN_OUT: stddev is 1/sqrt(m_out) per block (e3nn: "irrep").
     """
 
     FAN_IN = "FAN_IN"

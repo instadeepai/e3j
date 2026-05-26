@@ -3,8 +3,8 @@
    :width: 100
    :alt: atomic orbitals
 
-e3j.core
-========
+core
+====
 
 .. currentmodule:: e3j.core
 
@@ -13,7 +13,8 @@ e3j.core
     :toctree: _core
 
     TensorProduct
-    Bigotimes
+    ScalarMixing
     Monomial
     Polynomial
     Harmonics
+    Bigotimes

@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [0.1.0b1] — 2026-05-21
+
+### Added
+
+- Python 3.14 `e3j_ops` build on PyPI.
+
+### Changed
+
+- Scalar mixing now exported as `e3j.core.ScalarMixing`.
+- READMEs of `e3j` and `e3j_ops` on PyPI.
+
 ## [0.1.0b0] — 2026-05-21
 
 ### Fixed

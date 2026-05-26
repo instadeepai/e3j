@@ -2,7 +2,7 @@
 
 /* Newlines (\a) and spaces (\20) before each parameter */
 .sig-param::before {
-    content: "\a\20\20\20\20";
+    content: "\a";
     white-space: pre;
 }
 
@@ -40,6 +40,11 @@ body:not([data-theme="light"]) .highlight .go {
     color: #8cf;
     font-style: normal;
 }
+}
+
+/* Syntax highlighting: Python comments and outputs */
+pre span.go {
+  color: #4bc;
 }
 
 /*

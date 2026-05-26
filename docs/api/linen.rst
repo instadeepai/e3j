@@ -3,8 +3,8 @@
    :width: 100
    :alt: atomic orbitals
 
-e3j.linen
-=========
+linen
+=====
 
 .. currentmodule:: e3j.linen
 

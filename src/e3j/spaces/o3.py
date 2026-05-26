@@ -192,11 +192,12 @@ class O3Space(IrrepSum[O3Irrep]):
         target_filter: Self | str,
         sort: bool = False,
     ) -> "O3Space":
-        """Tensor product representation, decomposed in irreducibles by CG rules.
+        r"""Tensor product representation, decomposed in irreducibles by CG rules.
 
         Clebsch-Gordan (CG) rules yield an explicit isomorphism between the
         tensor product of two irreducible blocks of degrees l1 and l2, as
-        a direct sum of irreducible blocks of degrees L in {|l1-l2|, ..., l1+l2}.
+        a direct sum of irreducible blocks of degrees L in
+        :math:`\{ |l1-l2|, \ldots, l1+l2 \}`.
 
         The product of two O3-spaces can be decomposed by developing the tensor
         product space in products of irreducibles. The isomorphism of course depends

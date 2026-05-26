@@ -1,0 +1,104 @@
+# Copyright (c) 2026 InstaDeep Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Build wheels 📦
+
+on:
+  push:
+    branches: ['publish-pkg']
+    # tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-e3j:
+    name: Build e3j (pure Python)
+    runs-on: ubuntu-latest
+    # environment:
+    #   name: pypi
+    #   url: https://pypi.org/p/e3j
+    steps:
+      - name: checkout 📂
+        uses: actions/checkout@v5
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: build sdist + wheel
+        run: uv build --out-dir dist
+
+      - name: show artifacts
+        run: ls -lah dist
+
+      - name: upload artifact 📤
+        uses: actions/upload-artifact@v4
+        with:
+          name: e3j
+          path: dist/
+
+      # - name: publish to PyPI 🚀
+      #   uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-e3j-ops:
+    name: Build e3j_ops (CUDA wheels)
+    runs-on: ubuntu-latest
+    # environment:
+    #   name: pypi
+    #   url: https://pypi.org/p/e3j-ops
+    steps:
+      - name: checkout 📂
+        uses: actions/checkout@v5
+
+      - name: build CUDA wheels with cibuildwheel
+        uses: pypa/cibuildwheel@v3.4.1
+        env:
+          CIBW_BUILD: |
+            cp311-manylinux_x86_64
+            cp312-manylinux_x86_64
+            cp313-manylinux_x86_64
+            cp314-manylinux_x86_64
+
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+          CIBW_BEFORE_ALL_LINUX: |
+            dnf install -y dnf-plugins-core cmake
+            dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+            dnf install -y cuda-nvcc-13-1 cuda-cudart-devel-13-1 cuda-driver-devel-13-1
+          CIBW_ENVIRONMENT_LINUX: >
+            PATH=/usr/local/cuda/bin:$PATH
+            CUDACXX=/usr/local/cuda/bin/nvcc
+            CUDA_HOME=/usr/local/cuda
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair -w {dest_dir}
+            --exclude libcuda.so.1
+            --exclude libcudart.so.13
+            --exclude libnvrtc.so.13
+            {wheel}
+        with:
+          package-dir: lib/e3j_ops
+          output-dir: dist
+
+      - name: show artifacts
+        run: ls -lah dist
+
+      - name: upload artifact 📤
+        uses: actions/upload-artifact@v4
+        with:
+          name: e3j-ops
+          path: dist/
+
+      # - name: publish to PyPI 🚀
+      #   uses: pypa/gh-action-pypi-publish@release/v1
