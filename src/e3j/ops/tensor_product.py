@@ -181,7 +181,7 @@ def tensor_product(
     return _tensor_product_impl(coef, x, y)
 
 
-# @partial(custom_vjp, nondiff_argnums=(5,))
+@partial(custom_vjp, nondiff_argnums=(5,))
 def tensor_product_bwd(
     coef: Array,
     x: Array,
@@ -200,35 +200,11 @@ def tensor_product_bwd(
     layout = Layout.parse(params.layout)
 
     # Prepare transposed indices and concatenate two backward arrays
-    #
-    # TODO: lexsorting indices should reduce bank conflicts.
     with jax.ensure_compile_time_eval():
         c = Coef.unpack(coef, val_dtype="float32")
-        val, idx = c.val, c.idx.T
-        sigma_xzy = jnp.argsort(idx[1])
-        val_xzy = val[sigma_xzy]
-        idx_xzy = jnp.stack(
-            [
-                idx[1][sigma_xzy],
-                idx[0][sigma_xzy],
-                idx[2][sigma_xzy],
-            ]
-        )
-        sigma_yzx = jnp.argsort(idx[2])
-        val_yzx = val[sigma_yzx]
-        idx_yzx = jnp.stack(
-            [
-                idx[2][sigma_yzx],
-                idx[0][sigma_yzx],
-                idx[1][sigma_yzx],
-            ]
-        )
-        coef_bwd = jnp.stack(
-            [
-                Coef(val_xzy, idx_xzy.T).pack_jax(),
-                Coef(val_yzx, idx_yzx.T).pack_jax(),
-            ]
-        )
+        coef_xzy = c.transpose((1, 0, 2))
+        coef_yzx = c.transpose((2, 0, 1))
+        coef_bwd = jnp.stack([coef_xzy.pack_jax(), coef_yzx.pack_jax()])
 
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
@@ -321,8 +297,7 @@ def tensor_product_bwd(
     return _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
 
 
-# AD Rules
-
+# --- AD Rules for TP forward ---
 
 def _tensor_product_fwd(coef, x, y, params):
     z = tensor_product(coef, x, y, params)
@@ -422,6 +397,21 @@ def _tensor_product_bwd(params, res, ct_z):
     ct_y = tensor_product(coef_y, ct_z, x, params_y)
 
     return (ct_coef, ct_x, ct_y)
+
+
+# --- AD Rules for TP bacward ---
+
+def _tensor_product_bwd_fwd(coef, x, y, dz, params):
+    dx, dy = tensor_product_bwd(coef, x, y, dz, params)
+    return (dx, dy), (coef, x, y, dz)
+
+
+def _tensor_product_bwd_bwd(params, res, ct_xy):
+    dx, dy = ct_xy
+    ddx =
+
+
+
 
 
 tensor_product.defvjp(_tensor_product_fwd, _tensor_product_bwd)
