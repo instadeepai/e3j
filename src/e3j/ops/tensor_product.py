@@ -321,11 +321,15 @@ def _tensor_product_bwd(params, res, ct_z):
         dx, dy = tensor_product_bwd(coef, x, y, ct_z, params)
         return (ct_coef, dx, dy)
 
-    # TODO: move/remove once double backward rule has been implemented in
-    #       terms of tensor_product and/or tensor_product_bwd.
-    #
-    # Fallback to 2 `tensor_product` kernel calls
+    # Two separate TP forward calls: z-cotangents loaded twice.
+    return _tensor_product_bwd_fallback(params, res, ct_z)
+
+
+def _tensor_product_bwd_fallback(params, res, ct_z):
+    """Backward fallback as two forward tensor product kernel calls."""
     coef, x, y = res
+    ct_coef = jnp.zeros_like(coef)
+
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
     mode = TPMode.parse(params.mode)
@@ -366,21 +370,8 @@ def _tensor_product_bwd(params, res, ct_z):
     with jax.ensure_compile_time_eval():
         # Unpack to permute indices for transposed tensor products
         c = Coef.unpack(coef, val_dtype="float32")
-        val, idx = c.val, c.idx
-
-        # ct_x: transpose placing idx_x first, (dz, y) as operands
-        sigma_x = jnp.argsort(idx[:, 1])
-        idx_x = jnp.stack([idx[:, 1], idx[:, 0], idx[:, 2]], axis=-1)[sigma_x]
-        val_x = val[sigma_x]
-
-        # ct_y: transpose placing idx_y first, (dz, x) as operands
-        sigma_y = jnp.argsort(idx[:, 2])
-        idx_y = jnp.stack([idx[:, 2], idx[:, 0], idx[:, 1]], axis=-1)[sigma_y]
-        val_y = val[sigma_y]
-
-        # Repack transposed coefficients
-        coef_x = Coef(val_x, idx_x).pack_jax()
-        coef_y = Coef(val_y, idx_y).pack_jax()
+        coef_x = c.transpose((1, 0, 2)).pack_jax()
+        coef_y = c.transpose((2, 0, 1)).pack_jax()
 
     layout = Layout.parse(params.layout)
     if layout is Layout.LEADING_CHANNELS:
