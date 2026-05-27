@@ -181,7 +181,7 @@ def tensor_product(
     return _tensor_product_impl(coef, x, y)
 
 
-@partial(custom_vjp, nondiff_argnums=(5,))
+@partial(custom_vjp, nondiff_argnums=(4,))
 def tensor_product_bwd(
     coef: Array,
     x: Array,
@@ -299,6 +299,7 @@ def tensor_product_bwd(
 
 # --- AD Rules for TP forward ---
 
+
 def _tensor_product_fwd(coef, x, y, params):
     z = tensor_product(coef, x, y, params)
     return z, (coef, x, y)
@@ -316,8 +317,7 @@ def _tensor_product_bwd(params, res, ct_z):
 
     layout = Layout.parse(params.layout)
 
-    # Opt-in to `tensor_product_bwd` kernel handler for force inference
-    if config().tensor_product_bwd and layout == Layout.TRAILING_CHANNELS:
+    if layout == Layout.TRAILING_CHANNELS:
         dx, dy = tensor_product_bwd(coef, x, y, ct_z, params)
         return (ct_coef, dx, dy)
 
@@ -401,20 +401,29 @@ def _tensor_product_bwd(params, res, ct_z):
 
 # --- AD Rules for TP bacward ---
 
+
 def _tensor_product_bwd_fwd(coef, x, y, dz, params):
     dx, dy = tensor_product_bwd(coef, x, y, dz, params)
     return (dx, dy), (coef, x, y, dz)
 
 
 def _tensor_product_bwd_bwd(params, res, ct_xy):
-    dx, dy = ct_xy
-    ddx =
+    """Double backward rule as 1 backward + 2 forward tensor products."""
+    # Output cotangents are second order variations on x, y
+    Ddx, Ddy = ct_xy
+    coef, x, y, dz = res
+    # Input cotangents on x, y
+    (Dx, Dy) = tensor_product_bwd(coef, Ddx, Ddy, dz, params)
+    # Second-order cotangents on z
+    Ddz = tensor_product(coef, x, Ddy, params) + tensor_product(coef, Ddx, y, params)
+    # Inputs of tensor_product_bwd were (x, y, dz) -> now prefixed with D
+    ct_coef = jnp.zeros_like(coef)
+    return (ct_coef, Ddz, Dx, Dy)
 
 
-
-
-
+# Assign VJP rules
 tensor_product.defvjp(_tensor_product_fwd, _tensor_product_bwd)
+tensor_product_bwd.defvjp(_tensor_product_bwd_fwd, _tensor_product_bwd_bwd)
 
 
 tensor_product.Params = TensorProductParams
