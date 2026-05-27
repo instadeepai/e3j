@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [0.1.0b2] — 2026-05-28
+
+### Added
+
+- CUDA kernel for tensor product backward (trailing channels). This kernel loads output
+  cotangents only once to compute both input cotangents via two tensor product operations.
+- JAX primitive `e3j.ops.tensor_product_bwd()` with AD rules, vmap and sharding support.
+  The double backward rule is expressed in terms of one `tensor_product_bwd()` call and
+  two `tensor_product()` calls, providing infinite differentiability.
+
+### Changed
+
+- Dropped leftover `unroll` parameters that could be passed from the Python side. They
+  are now private to the CUDA side and inferred alongside kernel launch configuration.
+
 ## [0.1.0b1] — 2026-05-21
 
 ### Added
