@@ -122,6 +122,16 @@ class Coef:
         coef_cast = coef_np.view(idx_t).reshape(-1, numel)
         return jnp.asarray(coef_cast)
 
+    def transpose(self, argnums: tuple[int, int, int]) -> "Coef":
+        """Transposed COO coefficients with sorted indices and values."""
+        # Note: Lexsorting indices *might* reduce bank conflicts.
+        val, idx = self.val, self.idx.T
+        a, b, c = argnums
+        sigma = jnp.argsort(idx[a])
+        val_abc = val[sigma]
+        idx_abc = jnp.stack([idx[a][sigma], idx[b][sigma], idx[c][sigma]])
+        return Coef(val_abc, idx_abc.T)
+
     @classmethod
     def unpack(
         cls,
