@@ -303,7 +303,7 @@ def test_vmap_fwd_tensor_product_multi_devices():
 
 
 def test_vmap_grad_tensor_product_multi_devices():
-    """Check that the operation is sharded as expetected when vmapped and jitted over 2 device.
+    """Check that the operation is sharded as expected when vmapped and jitted over 2 device.
     This test use precompilation so it does not require a GPU to run but need to have jax version
     with gpu support.
 
@@ -335,19 +335,23 @@ def test_vmap_grad_tensor_product_multi_devices():
     def tp(x, y):
         return tensor_product(coef, x, y, params)
 
-    def l(x, y):
+    def sum_vmap_tp(x, y):
         return np.sum(jax.vmap(tp)(x, y))
 
-    tp_jitted = jax.jit(
-        jax.grad(l, argnums=(0, 1)),
+    # A function with forward + backward tensor product passes
+    fn = jax.grad(sum_vmap_tp, argnums=(0, 1))
+
+    jitted_fn = jax.jit(
+        fn,
         in_shardings=(sharding, y_sharding),
         out_shardings=(sharding, y_sharding),
     )
-    tp_compiled = tp_jitted.lower(
+    compiled_fn = jitted_fn.lower(
         jax.core.ShapedArray((128, *x_shape), x.dtype),
         jax.core.ShapedArray((128, *y.shape), y.dtype),
     ).compile()  # Check that it compiles without error
-    tp_compiled_string = tp_compiled.as_text()
+
+    compiled_fn_string = compiled_fn.as_text()
 
     # Same shard / batch reasoning as the forward test
     # (`test_vmap_fwd_tensor_product_multi_devices`); see the dimension
@@ -369,10 +373,10 @@ def test_vmap_grad_tensor_product_multi_devices():
         r"f32\[8192,20,128\]\{2,1,0\}\}",  # ct_z
         flags=re.MULTILINE,
     )
-    assert len(list(regex.finditer(tp_compiled_string))) == 1, (
+    assert len(list(regex.finditer(compiled_fn_string))) == 1, (
         f"Expected exactly one tensor_product_bwd custom call, found "
-        f"{len(list(regex.finditer(tp_compiled_string)))}.\n\n"
-        f"HLO:\n{tp_compiled_string}"
+        f"{len(list(regex.finditer(compiled_fn_string)))}.\n\n"
+        f"HLO:\n{compiled_fn_string}"
     )
 
 
@@ -381,7 +385,7 @@ def test_vmap_raises_on_batched_coef():
     coef = pack_coef(val, idx)
     params = Params(num_out=num_out, mode="OUTER")
     coef_batch = np.stack([coef, coef, coef])
-    with pytest.raises(ValueError, match=""):
+    with pytest.raises(jax.errors.UnexpectedTracerError):
         jax.vmap(lambda c: tensor_product(c, x, y, params))(coef_batch)
 
 
@@ -426,7 +430,6 @@ def test_backward_tensor_product():
     assert np.allclose(ct_y, ct_y_ref)
 
 
-@pytest.mark.skip("NYI: backward tensor_product_bwd")
 def test_backward2_tensor_product():
     """Check two TP backward passes on x and y."""
     num_out, idx, val, x, y = generate_tp_data()
@@ -528,6 +531,34 @@ class _TestTensorProductOp:
             argnums=(0, 1),
         )
 
+    @property
+    def bwd_bwd_op(self):
+        def sum_bwd(x, y, dz):
+            """A backward operation consuming dz cotangents."""
+            df = jax.grad(
+                lambda x, y, dz: np.sum(self.fwd_op(x, y) * dz),
+                argnums=(0, 1),
+            )
+            dx, dy = df(x, y, dz)
+            return np.sum(dx) + np.sum(dy)
+
+        # Differentiate once more, yield 3 cotangents
+        return jax.grad(sum_bwd, argnums=(0, 1, 2))
+
+    @property
+    def bwd_bwd_ref(self):
+        def sum_bwd(x, y, dz):
+            """A backward operation consuming dz cotangents."""
+            df = jax.grad(
+                lambda x, y, dz: np.sum(self.fwd_ref(x, y) * dz),
+                argnums=(0, 1),
+            )
+            dx, dy = df(x, y, dz)
+            return np.sum(dx) + np.sum(dy)
+
+        # Differentiate once more, yield 3 cotangents
+        return jax.grad(sum_bwd, argnums=(0, 1, 2))
+
     def inputs(self) -> tuple[Array, Array]:
         n = self.num_rows
         nx, ny = self.num_x, self.num_y
@@ -563,6 +594,15 @@ class _TestTensorProductOp:
         result_dx, result_dy = self.bwd_op(x, y)
         assert_allclose(expect_dx, result_dx, atol=5e-5, rtol=5e-5)
         assert_allclose(expect_dy, result_dy, atol=5e-5, rtol=5e-5)
+
+    def test_backward_backward(self):
+        x, y = self.inputs()
+        dz = self.fwd_ref(x, y)
+        expect_Dx, expect_Dy, expect_Ddz = self.bwd_bwd_ref(x, y, dz)
+        result_Dx, result_Dy, result_Ddz = self.bwd_bwd_op(x, y, dz)
+        assert_allclose(expect_Dx, result_Dx, atol=5e-5, rtol=5e-5)
+        assert_allclose(expect_Dy, result_Dy, atol=5e-5, rtol=5e-5)
+        assert_allclose(expect_Ddz, result_Ddz, atol=5e-5, rtol=5e-5)
 
 
 class TestTensorProductOuter(_TestTensorProductOp):
