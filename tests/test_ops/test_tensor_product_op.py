@@ -237,13 +237,10 @@ device_description_str: "NVIDIA H100 80GB HBM3"
 """
 
 
-@pytest.mark.skip("TODO: fix vmap support with kernel_bwd")
-def test_vmap_tensor_product_multi_devices():
-    """Check that the operation is sharded as expetected when vmapped and jitted over 2 device.
-    This test use precompilation so it does not require a GPU to run but need to have jax version
-    with gpu support.
-
-    TODO: generalize this setup so we can use it for other tests and run them in the CI.
+def test_vmap_fwd_tensor_product_multi_devices():
+    """Real jax.vmap + sharding: leading vmap axis is split across 2 devices,
+    and the custom_vmap rule flattens (axis_size, num_rows) into a single
+    batch dim seen by the ffi.
     """
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
@@ -264,24 +261,47 @@ def test_vmap_tensor_product_multi_devices():
     def tp(x, y):
         return tensor_product(coef, x, y, params)
 
-    tp_jitted = jax.jit(tp, in_shardings=(sharding, sharding), out_shardings=sharding)
+    tp_jitted = jax.jit(
+        jax.vmap(tp),
+        in_shardings=(sharding, sharding),
+        out_shardings=sharding,
+    )
     tp_compiled = tp_jitted.lower(
         jax.core.ShapedArray((128, *x.shape), x.dtype),
         jax.core.ShapedArray((128, *y.shape), y.dtype),
-        # xs, ys,
-    ).compile()  # Check that it compiles without error
+    ).compile()
     tp_compiled_string = tp_compiled.as_text()
 
-    # We expect a single custom call with batch of 64.
+    # What we expect to see in the HLO on each shard:
+    #   - The vmapped batch dimension (size 128) is sharded over 2 devices,
+    #     so each shard handles 64 samples. vmap then folds those into the
+    #     kernel's own row axis (NUM_ROWS=128), giving 64 * 128 = 8192 rows
+    #     fed into the forward kernel.
+    #   - Exactly one `tensor_product` custom call per shard, with inputs
+    #     (coef, x, y) and output z; coef is replicated across shards.
+    #
+    # Dimension legend (also referenced by the backward test below):
+    #   8192  = rows_per_shard = 64 (sharded vmap) * NUM_ROWS (128)
+    #   20    = x.shape[-1] = out.shape[-1] (from generate_tp_data)
+    #   30    = y.shape[-1] (from generate_tp_data)
+    #   60    = #non-zeros in coef = NUM_STRIPS (10) * LEN_STRIPS (6)
+    #   4     = packed Coef entry (1 value + 3 index components)
     regex = re.compile(
-        r"= f32\[64,2,2,4\].+custom_call_target=\"tensor_product\".+operand_layout_constraints={s32\[12,4\]\{1,0\}, f32\[64,2,4\]{2,1,0}, f32\[64,2,6\]\{2,1,0\}\}",
+        r"= f32\[8192,20\]\{1,0\}.+"  # output: z
+        r'custom_call_target="tensor_product".+'
+        r"operand_layout_constraints=\{"
+        r"s32\[60,4\]\{1,0\}, "  # coef
+        r"f32\[8192,20\]\{1,0\}, "  # x
+        r"f32\[8192,30\]\{1,0\}\}",  # y
         flags=re.MULTILINE,
     )
-    matches = regex.finditer(tp_compiled_string)
-    assert len(list(matches)) == 1
+    assert len(list(regex.finditer(tp_compiled_string))) == 1, (
+        f"Expected exactly one tensor_product custom call, found "
+        f"{len(list(regex.finditer(tp_compiled_string)))}.\n\n"
+        f"HLO:\n{tp_compiled_string}"
+    )
 
 
-@pytest.mark.skip("NYI: sharding support for backward kernel")
 def test_vmap_grad_tensor_product_multi_devices():
     """Check that the operation is sharded as expetected when vmapped and jitted over 2 device.
     This test use precompilation so it does not require a GPU to run but need to have jax version
@@ -291,7 +311,10 @@ def test_vmap_grad_tensor_product_multi_devices():
     """
     num_out, idx, val, x, y = generate_tp_data(channels=(128, None))
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, mode="OUTER")
+
+    # Use TRAILING_CHANNELS so the VJP routes through the tensor_product_bwd
+    params = Params(num_out=num_out, mode="OUTER", layout="TRAILING_CHANNELS")
+    x_shape = (x.shape[0], x.shape[2], x.shape[1])
 
     topology = get_topology_desc(
         "name",
@@ -304,6 +327,10 @@ def test_vmap_grad_tensor_product_multi_devices():
         mesh=mesh,
         spec=jax.sharding.PartitionSpec("batch", None, None),
     )
+    y_sharding = jax.sharding.NamedSharding(
+        mesh=mesh,
+        spec=jax.sharding.PartitionSpec("batch", None),
+    )
 
     def tp(x, y):
         return tensor_product(coef, x, y, params)
@@ -312,22 +339,41 @@ def test_vmap_grad_tensor_product_multi_devices():
         return np.sum(jax.vmap(tp)(x, y))
 
     tp_jitted = jax.jit(
-        jax.grad(l), in_shardings=(sharding, sharding), out_shardings=sharding
+        jax.grad(l, argnums=(0, 1)),
+        in_shardings=(sharding, y_sharding),
+        out_shardings=(sharding, y_sharding),
     )
     tp_compiled = tp_jitted.lower(
-        jax.core.ShapedArray((128, *x.shape), x.dtype),
+        jax.core.ShapedArray((128, *x_shape), x.dtype),
         jax.core.ShapedArray((128, *y.shape), y.dtype),
-        # xs, ys,
     ).compile()  # Check that it compiles without error
     tp_compiled_string = tp_compiled.as_text()
 
-    # We expect a single custom call with batch of 64.
+    # Same shard / batch reasoning as the forward test
+    # (`test_vmap_fwd_tensor_product_multi_devices`); see the dimension
+    # legend there for 8192, 20, 30, 60, 4. Extras that only appear in the
+    # backward HLO:
+    #   128 = x channels (TRAILING_CHANNELS layout); y has no channel dim
+    #   2   = the two transposed COO orderings stacked in coef_bwd (xzy, yzx)
+    #
+    # Exactly one `tensor_product_bwd` custom call per shard, with inputs
+    # (coef_bwd, x, y, ct_z) and outputs (ct_x, ct_y).
     regex = re.compile(
-        r"= f32\[128,128,4\].+custom_call_target=\"tensor_product\".+operand_layout_constraints={s32\[12,4\]\{1,0\}, f32\[128,128,4\]\{2,1,0\}, f32\[128,6\]\{1,0\}\}",
+        # outputs: (ct_x, ct_y)
+        r"\(f32\[8192,20,128\]\{2,1,0\}, f32\[8192,30\]\{1,0\}\) custom-call.+"
+        r'custom_call_target="tensor_product_bwd".+'
+        r"operand_layout_constraints=\{"
+        r"s32\[2,60,4\]\{2,1,0\}, "  # coef_bwd
+        r"f32\[8192,20,128\]\{2,1,0\}, "  # x
+        r"f32\[8192,30\]\{1,0\}, "  # y
+        r"f32\[8192,20,128\]\{2,1,0\}\}",  # ct_z
         flags=re.MULTILINE,
     )
-    matches = regex.finditer(tp_compiled_string)
-    assert len(list(matches)) == 1
+    assert len(list(regex.finditer(tp_compiled_string))) == 1, (
+        f"Expected exactly one tensor_product_bwd custom call, found "
+        f"{len(list(regex.finditer(tp_compiled_string)))}.\n\n"
+        f"HLO:\n{tp_compiled_string}"
+    )
 
 
 def test_vmap_raises_on_batched_coef():

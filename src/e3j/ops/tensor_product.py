@@ -27,6 +27,7 @@ from numpy import int32
 
 from e3j.ops.coef import Coef
 from e3j.utils import config
+from e3j.utils.exceptions import ShardingError
 from e3j.utils.options import Layout, TPMode
 
 
@@ -229,21 +230,95 @@ def tensor_product_bwd(
             ]
         )
 
-    args = (coef_bwd, x, y, ct_z)
-    shapes_out = (
-        jax.ShapeDtypeStruct(x.shape, x.dtype),
-        jax.ShapeDtypeStruct(y.shape, y.dtype),
-    )
+    has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
-    return ffi_call(
-        "tensor_product_bwd",
-        shapes_out,
-    )(
-        *args,
-        mode=int32(mode.value),
-        layout=int32(layout.value),
-        debug=int32(config().debug_level),
-    )
+    @jax.custom_batching.custom_vmap
+    def _tensor_product_bwd_impl(coef_bwd, x, y, ct_z):
+        @jax.experimental.custom_partitioning.custom_partitioning
+        def __tensor_product_bwd_impl(coef_bwd, x, y, ct_z):
+            shapes_out = (
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
+                jax.ShapeDtypeStruct(y.shape, y.dtype),
+            )
+            return ffi_call(
+                "tensor_product_bwd",
+                shapes_out,
+            )(
+                coef_bwd,
+                x,
+                y,
+                ct_z,
+                mode=int32(mode.value),
+                layout=int32(layout.value),
+                debug=int32(config().debug_level),
+            )
+
+        def partition(mesh, arg_shapes, result_shape):
+            assert len(arg_shapes) == 4, "Expected four arguments: coef_bwd, x, y, ct_z"
+            if len(arg_shapes[1].shape) not in (2, 3):
+                raise ShardingError(
+                    f"Expected x rank 2 or 3, got {arg_shapes[1].shape}"
+                )
+            if len(arg_shapes[2].shape) not in (2, 3):
+                raise ShardingError(
+                    f"Expected y rank 2 or 3, got {arg_shapes[2].shape}"
+                )
+            coef_shape, x_shape, y_shape, ct_z_shape = arg_shapes
+            ct_x_shape, ct_y_shape = result_shape
+
+            return (
+                mesh,
+                __tensor_product_bwd_impl,
+                (ct_x_shape.sharding, ct_y_shape.sharding),
+                (
+                    coef_shape.sharding,
+                    x_shape.sharding,
+                    y_shape.sharding,
+                    ct_z_shape.sharding,
+                ),
+            )
+
+        x_rule = "a b" if has_cx else "a"
+        y_rule = "c d" if has_cy else "c"
+        z_rule = " ".join(["e", "f", "g"][: ct_z.ndim - 1])
+
+        # coef_bwd is (2, K, numel): replicate all axes.
+        sharding_rule = (
+            f"o p q, ... {x_rule}, ... {y_rule}, ... {z_rule} "
+            f"-> ... {x_rule}, ... {y_rule}"
+        )
+
+        __tensor_product_bwd_impl.def_partition(
+            partition=partition,
+            sharding_rule=sharding_rule,
+            need_replication_factors=("o", "p", "q"),
+        )
+
+        return __tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+
+    @_tensor_product_bwd_impl.def_vmap
+    def _tensor_product_bwd_vmap_rule(axis_size, in_batched, coef_bwd, x, y, ct_z):
+        coef_b, x_b, y_b, ct_z_b = in_batched
+        if coef_b:
+            raise NotImplementedError(
+                "Batching over the coef_bwd argument is not supported."
+            )
+        if not x_b:
+            x = jnp.broadcast_to(x[None], (axis_size,) + x.shape)
+        if not y_b:
+            y = jnp.broadcast_to(y[None], (axis_size,) + y.shape)
+        if not ct_z_b:
+            ct_z = jnp.broadcast_to(ct_z[None], (axis_size,) + ct_z.shape)
+        num_rows = x.shape[1]
+        x = x.reshape((axis_size * num_rows,) + x.shape[2:])
+        y = y.reshape((axis_size * num_rows,) + y.shape[2:])
+        ct_z = ct_z.reshape((axis_size * num_rows,) + ct_z.shape[2:])
+        ct_x, ct_y = _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+        ct_x = ct_x.reshape((axis_size, num_rows) + ct_x.shape[1:])
+        ct_y = ct_y.reshape((axis_size, num_rows) + ct_y.shape[1:])
+        return (ct_x, ct_y), (True, True)
+
+    return _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
 
 
 # AD Rules
