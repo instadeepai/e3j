@@ -30,7 +30,6 @@ from e3j.utils.sparse import narrow_index_dtype
 
 e3j.config(
     debug_level=0,
-    tensor_product_bwd=True,
 )
 
 NUM_STRIPS = 10
