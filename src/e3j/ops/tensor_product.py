@@ -41,7 +41,7 @@ class TensorProductParams:
 # XLA-FFI Primitives
 
 
-@partial(custom_vjp, nondiff_argnums=(3,))
+@partial(custom_vjp, nondiff_argnums=(0, 3))
 def tensor_product(
     coef: Array,
     x: Array,
@@ -181,7 +181,7 @@ def tensor_product(
     return _tensor_product_impl(coef, x, y)
 
 
-@partial(custom_vjp, nondiff_argnums=(4,))
+@partial(custom_vjp, nondiff_argnums=(0, 4))
 def tensor_product_bwd(
     coef: Array,
     x: Array,
@@ -302,34 +302,29 @@ def tensor_product_bwd(
 
 def _tensor_product_fwd(coef, x, y, params):
     z = tensor_product(coef, x, y, params)
-    return z, (coef, x, y)
+    return z, (x, y)
 
 
-def _tensor_product_bwd(params, res, ct_z):
+def _tensor_product_bwd(coef, params, res, ct_z):
     """Backward tensor product rule.
 
     Backpropagate gradients following the Leibniz rule,
     with circular references to the `tensor_product` op.
     """
-    coef, x, y = res
-    # ct_coef: non-differentiable right now, as it would break equivariance.
-    ct_coef = jnp.zeros_like(coef)
-
+    x, y = res
     layout = Layout.parse(params.layout)
 
     if layout == Layout.TRAILING_CHANNELS:
         dx, dy = tensor_product_bwd(coef, x, y, ct_z, params)
-        return (ct_coef, dx, dy)
+        return (dx, dy)
 
     # Two separate TP forward calls: z-cotangents loaded twice.
-    return _tensor_product_bwd_fallback(params, res, ct_z)
+    return _tensor_product_bwd_fallback(coef, params, res, ct_z)
 
 
-def _tensor_product_bwd_fallback(params, res, ct_z):
+def _tensor_product_bwd_fallback(coef, params, res, ct_z):
     """Backward fallback as two forward tensor product kernel calls."""
-    coef, x, y = res
-    ct_coef = jnp.zeros_like(coef)
-
+    x, y = res
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
     mode = TPMode.parse(params.mode)
@@ -387,29 +382,30 @@ def _tensor_product_bwd_fallback(params, res, ct_z):
     ct_x = tensor_product(coef_x, ct_z, y, params_x)
     ct_y = tensor_product(coef_y, ct_z, x, params_y)
 
-    return (ct_coef, ct_x, ct_y)
+    return (ct_x, ct_y)
 
 
-# --- AD Rules for TP bacward ---
+# --- AD Rules for TP backward ---
 
 
 def _tensor_product_bwd_fwd(coef, x, y, dz, params):
     dx, dy = tensor_product_bwd(coef, x, y, dz, params)
-    return (dx, dy), (coef, x, y, dz)
+    return (dx, dy), (x, y, dz)
 
 
-def _tensor_product_bwd_bwd(params, res, ct_xy):
+def _tensor_product_bwd_bwd(coef, params, res, ct_xy):
     """Double backward rule as 1 backward + 2 forward tensor products."""
-    # Output cotangents are second order variations on x, y
+    # Outputs of tensor_product_bwd() were (dx, dy):
+    # => Output cotangents are 2nd order variations Ddx, Ddy
     Ddx, Ddy = ct_xy
-    coef, x, y, dz = res
+    x, y, dz = res
     # Input cotangents on x, y
     (Dx, Dy) = tensor_product_bwd(coef, Ddx, Ddy, dz, params)
     # Second-order cotangents on z
     Ddz = tensor_product(coef, x, Ddy, params) + tensor_product(coef, Ddx, y, params)
-    # Inputs of tensor_product_bwd were (x, y, dz) -> now prefixed with D
-    ct_coef = jnp.zeros_like(coef)
-    return (ct_coef, Ddz, Dx, Dy)
+    # Inputs of tensor_product_bwd() were (x, y, dz):
+    # => Input cotangents prefixed with D
+    return (Dx, Dy, Ddz)
 
 
 # Assign VJP rules
