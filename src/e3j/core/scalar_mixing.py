@@ -16,10 +16,12 @@ from dataclasses import dataclass, field
 
 import jax.numpy as np
 from jax import Array
+from jax.experimental import sparse
 
 from e3j.spaces.o3 import O3Space
 from e3j.utils.config import config
 from e3j.utils.options import Layout
+from e3j.utils.sparse import sparse_bcoo
 
 
 @dataclass
@@ -29,44 +31,58 @@ class ScalarMixing:
     This performs the same operation as `scalar * irreps_array` in e3nn.
     """
 
-    source: str | O3Space
+    source: O3Space
     layout: Layout = field(default_factory=lambda: config().layout)
 
     def __post_init__(self):
         self.source = O3Space(self.source)
 
     @property
-    def num_irreps(self):
+    def num_irreps(self) -> int:
         return sum(m for m, ir in self.source)
 
-    def __call__(self, scalars: Array, features: Array) -> Array:
+    @property
+    def mix_idx(self) -> Array:
+        """Return index map from equivariant coordinates to scalars."""
         repeats = []
         for mul, ir in self.source:
             repeats.extend([ir.dim] * mul)
+        return np.repeat(
+            np.arange(self.num_irreps),
+            np.array(repeats),
+            total_repeat_length=self.source.dim,
+        )
 
+    @property
+    def coef(self) -> sparse.BCOO:
+        """Return coefficients for an equivalent tensor product operation."""
+        n_feats, n_scalars = self.source.dim, self.num_irreps
+        values = np.ones(n_feats)
+        idx_feats = np.arange(n_feats)
+        idx_scalars = self.mix_idx[idx_feats]
+        indices = np.stack((idx_feats, idx_scalars, idx_feats), axis=-1)
+        shape = (n_feats, n_scalars, n_feats)
+        return sparse_bcoo(values, indices, shape)
+
+    def __call__(self, scalars: Array, features: Array) -> Array:
         layout = Layout.parse(self.layout)
+        scalar_shape: tuple[int, ...] = ()
 
         if layout == Layout.TRAILING_CHANNELS:
-            axis_lm, axis_k = -2, -1
+            axis_k = -1
             scalar_shape = (self.num_irreps, features.shape[axis_k])
 
         elif layout == Layout.LEADING_CHANNELS:
-            axis_lm, axis_k = -1, -2
+            axis_k = -2
             scalar_shape = (features.shape[axis_k], self.num_irreps)
 
         elif layout == Layout.E3NN:
-            axis_lm = -1
             scalar_shape = (self.num_irreps,)
-
-        num_irrep = np.repeat(
-            np.arange(self.num_irreps),
-            np.array(repeats),
-            total_repeat_length=features.shape[axis_lm],
-        )
 
         if scalars.shape[1:] != scalar_shape:
             scalars = scalars.reshape((-1, *scalar_shape))
 
+        mix_idx = self.mix_idx
         if layout == Layout.LEADING_CHANNELS:
-            return scalars[..., num_irrep] * features
-        return scalars[:, num_irrep] * features
+            return scalars[..., mix_idx] * features
+        return scalars[:, mix_idx] * features
