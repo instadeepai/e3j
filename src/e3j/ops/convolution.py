@@ -18,7 +18,35 @@ class ConvolutionParams:
     num_scalars: int
 
 
-@partial(custom_vjp, nondiff_argnums=(7,))
+@dataclass
+class GraphCSR:
+    """Compressed Sparse Row (CSR) graph representation."""
+
+    def __init__(self, num_nodes: int, sender: Array, receiver: Array):
+        self.num_nodes = num_nodes
+        self.sender = sender
+        self.receiver = receiver
+        num_neighbors = jnp.bincount(receiver, length=num_nodes)
+        self.receiver_ptr = jnp.append(0, jnp.cumsum(num_neighbors))
+
+    @classmethod
+    def sort(
+        cls, num_nodes: int, sender: Array, receiver: Array
+    ) -> tuple[Array, "GraphCSR", Array]:
+        """Return (sigma, graph', sigma_1) sorting edges by receivers."""
+        perm = jnp.argsort(receiver)
+        graph_sorted = cls(num_nodes, sender[perm], receiver[perm])
+        return perm, graph_sorted, jnp.argsort(perm)
+
+    def transpose(self) -> tuple[Array, "GraphCSR", Array]:
+        """Return (sigma, graph_t, sigma_1) sorting edges by senders instead."""
+        return GraphCSR.sort(
+            self.num_nodes,
+            self.receiver,
+            self.sender,
+        )
+
+
 def convolution(
     coef: Array,
     x: Array,
@@ -26,7 +54,7 @@ def convolution(
     s: Array,
     s_index: Array,
     sender: Array,
-    receiver_ptr: Array,
+    receiver: Array,
     params: ConvolutionParams,
 ) -> Array:
     """Equivariant convolution: fused tensor product + scalar mixing + aggregation.
@@ -49,6 +77,8 @@ def convolution(
         Output node features, shape (num_nodes, num_out, channels_x).
     """
     num_nodes = x.shape[0]
+    receiver_ptr = GraphCSR(num_nodes, sender, receiver).receiver_ptr
+
     channels_x = x.shape[-1] if x.ndim > 2 else 1
     num_out = params.num_out
     shape_out = (num_nodes, num_out, channels_x)
@@ -58,23 +88,37 @@ def convolution(
     if s_index.size != num_out:
         raise ValueError("Scalar indices `s_index` should be of length `num_out`.")
 
-    return ffi_call(
-        "convolution",
-        jax.ShapeDtypeStruct(shape_out, x.dtype),
-    )(
-        coef,
-        x,
-        y,
-        s,
-        s_index,
-        sender,
-        receiver_ptr,
-        num_nodes=int32(num_nodes),
-        debug=int32(config().debug_level),
-    )
+    @custom_vjp
+    def convolution_op(x, y, s):
+        return ffi_call(
+            "convolution",
+            jax.ShapeDtypeStruct(shape_out, x.dtype),
+        )(
+            coef,
+            x,
+            y,
+            s,
+            s_index,
+            sender,
+            receiver_ptr,
+            num_nodes=int32(num_nodes),
+            debug=int32(config().debug_level),
+        )
+
+    def _fwd(x, y, s):
+        z = convolution_op(x, y, s)
+        return z, (x, y, s)
+
+    def _bwd(res, dz):
+        x, y, s = res
+        return convolution_bwd(coef, x, y, s, s_index, sender, receiver, dz, params)
+
+    convolution_op.defvjp(_fwd, _bwd)
+
+    return convolution_op(x, y, s)
 
 
-def convolution_bwd(coef, x, y, s, s_index, sender, receiver_ptr, ct_z, params):
+def convolution_bwd(coef, x, y, s, s_index, sender, receiver, dm, params):
     """Backward pass for equivariant convolution.
 
     Computes cotangents `dx`, `dy`, `dmix` from output cotangent `ct_z`
@@ -82,6 +126,9 @@ def convolution_bwd(coef, x, y, s, s_index, sender, receiver_ptr, ct_z, params):
     and transposed CSR adjacency.
     """
     num_nodes = x.shape[0]
+    # Transpose CSR adjacency: group by sender instead of receiver.
+    graph = GraphCSR(num_nodes, sender, receiver)
+    perm, graph_t, inv_perm = graph.transpose()
 
     with jax.ensure_compile_time_eval():
         # Transpose and pack 3x coefs: [coef_fwd, coef_dx, coef_dy]
@@ -100,82 +147,70 @@ def convolution_bwd(coef, x, y, s, s_index, sender, receiver_ptr, ct_z, params):
 
         coef_3x = jnp.stack([coef, coef_dx, coef_dy])
 
-        # Transpose CSR adjacency: group by sender instead of receiver.
-        # Although the graph is symmetric, the edge features may not be.
-        num_edges = sender.shape[0]
+    @custom_vjp
+    def convolution_bwd_op(x, y, s, dm):
+        y_t = y[perm]
+        s_t = s[perm]
 
-        # Expand receiver_ptr -> per-edge receiver
-        receiver = jnp.zeros(num_edges, dtype=jnp.int32)
-        for r in range(num_nodes):
-            receiver = receiver.at[receiver_ptr[r] : receiver_ptr[r + 1]].set(r)
-
-        # Argsort edges by sender
-        perm = jnp.argsort(sender)
-        sorted_sender = sender[perm]
-
-        # Build sender_ptr from sorted sender via bincount + cumsum
-        counts = jnp.bincount(sorted_sender, length=num_nodes)
-        sender_ptr_t = jnp.concatenate(
-            [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(counts)]
+        dx, dy_t, dmix_t = ffi_call(
+            "convolution_bwd",
+            (
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
+                jax.ShapeDtypeStruct(y.shape, y.dtype),
+                jax.ShapeDtypeStruct(s.shape, s.dtype),
+            ),
+        )(
+            coef_3x,
+            x,
+            y_t,
+            dm,
+            s_t,
+            s_index,
+            graph_t.sender,
+            graph_t.receiver_ptr,
+            num_nodes=int32(num_nodes),
+            debug=int32(config().debug_level),
         )
-        sender_ptr_t = sender_ptr_t.astype(jnp.int32)
 
-        # Permuted receiver and per-edge inputs
-        receiver_t = receiver[perm]
+        dy = dy_t[inv_perm]
+        dmix = dmix_t[inv_perm]
+        return dx, dy, dmix
 
-        # Inverse permutation for un-permuting edge outputs
-        inv_perm = jnp.argsort(perm)
-
-    y_t = y[perm]
-    s_t = s[perm]
-
-    dx, dy_t, dmix_t = ffi_call(
-        "convolution_bwd",
-        (
-            jax.ShapeDtypeStruct(x.shape, x.dtype),
-            jax.ShapeDtypeStruct(y.shape, y.dtype),
-            jax.ShapeDtypeStruct(s.shape, s.dtype),
-        ),
-    )(
-        coef_3x,
-        x,
-        y_t,
-        ct_z,
-        s_t,
-        s_index,
-        receiver_t,
-        sender_ptr_t,
-        num_nodes=int32(num_nodes),
-        debug=int32(config().debug_level),
+    conv = partial(
+        convolution,
+        coef=coef,
+        s_index=s_index,
+        sender=sender,
+        receiver=receiver,
+        params=params,
     )
 
-    dy = dy_t[inv_perm]
-    dmix = dmix_t[inv_perm]
-    return dx, dy, dmix
+    def _fwd(x, y, s, dm):
+        dx, dy, ds = convolution_bwd_op(x, y, s, dm)
+        return (dx, dy, ds), (x, y, s, dm)
 
+    def _bwd(res, cotangents):
+        """Return (Dx, Dy, Ds, Ddm) cotangents from (Ddx, Ddy, Dds)."""
+        (Ddx, Ddy, Dds) = cotangents
+        (x, y, s, dm) = res
 
-def _convolution_fwd(coef, x, y, s, s_index, sender, receiver_ptr, params):
-    z = convolution(coef, x, y, s, s_index, sender, receiver_ptr, params)
-    return z, (coef, x, y, s, s_index, sender, receiver_ptr)
+        # Double variation of messages: three forward passes
+        Ddm = conv(Ddx, y, s) + conv(x, Ddy, s) + conv(x, y, Dds)
 
+        # Primal cotangents
+        Dx_x, Dx_y, Dx_s = convolution_bwd_op(Ddx, y, s, dm)
+        Dy_x, Dy_y, Dy_s = convolution_bwd_op(x, Ddy, s, dm)
+        Ds_x, Ds_y, Ds_s = convolution_bwd_op(x, y, Dds, dm)
 
-def _convolution_bwd(params, res, ct_z):
-    coef, x, y, s, s_index, sender, receiver_ptr = res
-    dx, dy, dmix = convolution_bwd(
-        coef, x, y, s, s_index, sender, receiver_ptr, ct_z, params
-    )
-    return (
-        jnp.zeros_like(coef),
-        dx,
-        dy,
-        dmix,
-        jnp.zeros_like(s_index),
-        jnp.zeros_like(sender),
-        jnp.zeros_like(receiver_ptr),
-    )
+        Dx = Dy_x + Ds_x
+        Dy = Dx_y + Ds_y
+        Ds = Dx_s + Dy_s
 
+        return (Dx, Dy, Ds, Ddm)
 
-convolution.defvjp(_convolution_fwd, _convolution_bwd)
+    convolution_bwd_op.defvjp(_fwd, _bwd)
+
+    return convolution_bwd_op(x, y, s, dm)
 
 
 convolution.Params = ConvolutionParams
