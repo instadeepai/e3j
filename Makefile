@@ -151,7 +151,7 @@ docs:
 # Force re-build of cuda bindings with uv and CMake
 
 uv:
-	uv sync --group cuda13_local --extra ops --group exp\
+	uv sync --group cuda13_local --extra ops\
 		--reinstall-package e3j_ops\
 		--reinstall-package e3j
 
