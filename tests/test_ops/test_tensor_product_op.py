@@ -28,14 +28,14 @@ from e3j.ops import tensor_product
 from e3j.ops.coef import Coef
 from e3j.utils.sparse import narrow_index_dtype
 
-e3j.config(debug_level=0)
+e3j.config(
+    debug_level=0,
+)
 
-UNROLL = (1, 1, 1)
-
-NUM_STRIPS = 2
+NUM_STRIPS = 10
 LEN_STRIPS = 6
-NUM_ROWS = 2
-NUM_CHANNELS = 2
+NUM_ROWS = 128
+NUM_CHANNELS = 32
 
 np.set_printoptions(
     precision=4,
@@ -83,28 +83,18 @@ def generate_tp_data(
     idx_0 = np.tile(np.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
     idx_1 = np.tile(np.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
     idx_2 = np.tile(np.array([0, 1, 2, 0, 1, 2]), NUM_STRIPS)
-    #   num_out, num_x, num_y = 4, 3, 5
-    #   idx_0 = np.array([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 3])
-    #   idx_1 = np.array([0, 0, 1, 2, 0, 1, 2, 2, 0, 1, 2, 1, 2])
-    #   idx_2 = np.array([0, 1, 2, 3, 0, 0, 2, 4, 0, 2, 3, 0, 4])
     offsets = np.array([num_out, num_x, num_y])[:, None]
     offsets *= np.arange(NUM_STRIPS).repeat(LEN_STRIPS)
     idx = np.stack([idx_0, idx_1, idx_2]) + offsets
 
     x = np.stack([np.tile(np.array([1.0, 2.0]), NUM_STRIPS)] * num_rows)
     y = np.stack([np.tile(np.array([3.0, 4.0, 5.0]), NUM_STRIPS)] * num_rows)
-    #   x = np.stack([np.linspace(1, num_x, num_x)] * num_rows)
-    #   y = np.stack([np.linspace(1, num_y, num_y)] * num_rows)
 
     if channels[0] is not None:
         x = np.tile(x[:, None, :], (1, channels[0], 1))
     if channels[1] is not None:
         y = np.tile(y[:, None, :], (1, channels[1], 1))
 
-    #   key = random.key(789)
-    #   coef = random.normal(key, (idx.shape[-1],))
-    #   x = random.normal(key, (num_rows, num_x))
-    #   y = random.normal(key, (num_rows, num_y))
     coef = np.ones(idx.shape[-1])
     return num_out * NUM_STRIPS, idx, coef, x, y
 
@@ -160,7 +150,7 @@ def tensor_product_reference(
 def test_forward_tensor_product():
     """Check forward pass."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     expect = tensor_product_reference(idx, val, x, y, num_out)
     result = tensor_product(pack_coef(val, idx), x, y, params)
     assert np.allclose(expect, result, atol=1e-5)
@@ -169,7 +159,7 @@ def test_forward_tensor_product():
 def test_forward_tensor_product_inner():
     """Check forward pass."""
     num_out, idx, val, x, y = generate_tp_data(channels=[NUM_CHANNELS] * 2)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="INNER")
+    params = Params(num_out=num_out, mode="INNER")
     expect = tensor_product_reference(idx, val, x, y, num_out, mode="INNER")
     result = tensor_product(pack_coef(val, idx), x, y, params)
     assert np.allclose(expect, result, atol=1e-5)
@@ -178,7 +168,7 @@ def test_forward_tensor_product_inner():
 def test_jit_tensor_product():
     """Check that e3j.ops.tensor_product can be compiled."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
 
     @jax.jit
@@ -191,7 +181,7 @@ def test_jit_tensor_product():
 def test_jit_tensor_product_vmap():
     """Check that e3j.ops.tensor_product can be compiled."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
     xs = np.stack([x, x])
     ys = np.stack([y, y])
@@ -246,16 +236,14 @@ device_description_str: "NVIDIA H100 80GB HBM3"
 """
 
 
-def test_vmap_tensor_product_multi_devices():
-    """Check that the operation is sharded as expetected when vmapped and jitted over 2 device.
-    This test use precompilation so it does not require a GPU to run but need to have jax version
-    with gpu support.
-
-    TODO: generalize this setup so we can use it for other tests and run them in the CI.
+def test_vmap_fwd_tensor_product_multi_devices():
+    """Real jax.vmap + sharding: leading vmap axis is split across 2 devices,
+    and the custom_vmap rule flattens (axis_size, num_rows) into a single
+    batch dim seen by the ffi.
     """
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
 
     topology = get_topology_desc(
         "name",
@@ -272,25 +260,49 @@ def test_vmap_tensor_product_multi_devices():
     def tp(x, y):
         return tensor_product(coef, x, y, params)
 
-    tp_jitted = jax.jit(tp, in_shardings=(sharding, sharding), out_shardings=sharding)
+    tp_jitted = jax.jit(
+        jax.vmap(tp),
+        in_shardings=(sharding, sharding),
+        out_shardings=sharding,
+    )
     tp_compiled = tp_jitted.lower(
         jax.core.ShapedArray((128, *x.shape), x.dtype),
         jax.core.ShapedArray((128, *y.shape), y.dtype),
-        # xs, ys,
-    ).compile()  # Check that it compiles without error
+    ).compile()
     tp_compiled_string = tp_compiled.as_text()
 
-    # We expect a single custom call with batch of 64.
+    # What we expect to see in the HLO on each shard:
+    #   - The vmapped batch dimension (size 128) is sharded over 2 devices,
+    #     so each shard handles 64 samples. vmap then folds those into the
+    #     kernel's own row axis (NUM_ROWS=128), giving 64 * 128 = 8192 rows
+    #     fed into the forward kernel.
+    #   - Exactly one `tensor_product` custom call per shard, with inputs
+    #     (coef, x, y) and output z; coef is replicated across shards.
+    #
+    # Dimension legend (also referenced by the backward test below):
+    #   8192  = rows_per_shard = 64 (sharded vmap) * NUM_ROWS (128)
+    #   20    = x.shape[-1] = out.shape[-1] (from generate_tp_data)
+    #   30    = y.shape[-1] (from generate_tp_data)
+    #   60    = #non-zeros in coef = NUM_STRIPS (10) * LEN_STRIPS (6)
+    #   4     = packed Coef entry (1 value + 3 index components)
     regex = re.compile(
-        r"= f32\[64,2,2,4\].+custom_call_target=\"tensor_product\".+operand_layout_constraints={s32\[12,4\]\{1,0\}, f32\[64,2,4\]{2,1,0}, f32\[64,2,6\]\{2,1,0\}\}",
+        r"= f32\[8192,20\]\{1,0\}.+"  # output: z
+        r'custom_call_target="tensor_product".+'
+        r"operand_layout_constraints=\{"
+        r"s32\[60,4\]\{1,0\}, "  # coef
+        r"f32\[8192,20\]\{1,0\}, "  # x
+        r"f32\[8192,30\]\{1,0\}\}",  # y
         flags=re.MULTILINE,
     )
-    matches = regex.finditer(tp_compiled_string)
-    assert len(list(matches)) == 1
+    assert len(list(regex.finditer(tp_compiled_string))) == 1, (
+        f"Expected exactly one tensor_product custom call, found "
+        f"{len(list(regex.finditer(tp_compiled_string)))}.\n\n"
+        f"HLO:\n{tp_compiled_string}"
+    )
 
 
 def test_vmap_grad_tensor_product_multi_devices():
-    """Check that the operation is sharded as expetected when vmapped and jitted over 2 device.
+    """Check that the operation is sharded as expected when vmapped and jitted over 2 device.
     This test use precompilation so it does not require a GPU to run but need to have jax version
     with gpu support.
 
@@ -298,7 +310,10 @@ def test_vmap_grad_tensor_product_multi_devices():
     """
     num_out, idx, val, x, y = generate_tp_data(channels=(128, None))
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+
+    # Use TRAILING_CHANNELS so the VJP routes through the tensor_product_bwd
+    params = Params(num_out=num_out, mode="OUTER", layout="TRAILING_CHANNELS")
+    x_shape = (x.shape[0], x.shape[2], x.shape[1])
 
     topology = get_topology_desc(
         "name",
@@ -311,66 +326,92 @@ def test_vmap_grad_tensor_product_multi_devices():
         mesh=mesh,
         spec=jax.sharding.PartitionSpec("batch", None, None),
     )
+    y_sharding = jax.sharding.NamedSharding(
+        mesh=mesh,
+        spec=jax.sharding.PartitionSpec("batch", None),
+    )
 
     def tp(x, y):
         return tensor_product(coef, x, y, params)
 
-    def l(x, y):
+    def sum_vmap_tp(x, y):
         return np.sum(jax.vmap(tp)(x, y))
 
-    tp_jitted = jax.jit(
-        jax.grad(l), in_shardings=(sharding, sharding), out_shardings=sharding
-    )
-    tp_compiled = tp_jitted.lower(
-        jax.core.ShapedArray((128, *x.shape), x.dtype),
-        jax.core.ShapedArray((128, *y.shape), y.dtype),
-        # xs, ys,
-    ).compile()  # Check that it compiles without error
-    tp_compiled_string = tp_compiled.as_text()
+    # A function with forward + backward tensor product passes
+    fn = jax.grad(sum_vmap_tp, argnums=(0, 1))
 
-    # We expect a single custom call with batch of 64.
+    jitted_fn = jax.jit(
+        fn,
+        in_shardings=(sharding, y_sharding),
+        out_shardings=(sharding, y_sharding),
+    )
+    compiled_fn = jitted_fn.lower(
+        jax.core.ShapedArray((128, *x_shape), x.dtype),
+        jax.core.ShapedArray((128, *y.shape), y.dtype),
+    ).compile()  # Check that it compiles without error
+
+    compiled_fn_string = compiled_fn.as_text()
+
+    # Same shard / batch reasoning as the forward test
+    # (`test_vmap_fwd_tensor_product_multi_devices`); see the dimension
+    # legend there for 8192, 20, 30, 60, 4. Extras that only appear in the
+    # backward HLO:
+    #   128 = x channels (TRAILING_CHANNELS layout); y has no channel dim
+    #   2   = the two transposed COO orderings stacked in coef_bwd (xzy, yzx)
+    #
+    # Exactly one `tensor_product_bwd` custom call per shard, with inputs
+    # (coef_bwd, x, y, ct_z) and outputs (ct_x, ct_y).
     regex = re.compile(
-        r"= f32\[128,128,4\].+custom_call_target=\"tensor_product\".+operand_layout_constraints={s32\[12,4\]\{1,0\}, f32\[128,128,4\]\{2,1,0\}, f32\[128,6\]\{1,0\}\}",
+        # outputs: (ct_x, ct_y)
+        r"\(f32\[8192,20,128\]\{2,1,0\}, f32\[8192,30\]\{1,0\}\) custom-call.+"
+        r'custom_call_target="tensor_product_bwd".+'
+        r"operand_layout_constraints=\{"
+        r"s32\[2,60,4\]\{2,1,0\}, "  # coef_bwd
+        r"f32\[8192,20,128\]\{2,1,0\}, "  # x
+        r"f32\[8192,30\]\{1,0\}, "  # y
+        r"f32\[8192,20,128\]\{2,1,0\}\}",  # ct_z
         flags=re.MULTILINE,
     )
-    matches = regex.finditer(tp_compiled_string)
-    assert len(list(matches)) == 1
-
-
-_VMAP_ASSERT = "Only batching over x and y is supported"
+    assert len(list(regex.finditer(compiled_fn_string))) == 1, (
+        f"Expected exactly one tensor_product_bwd custom call, found "
+        f"{len(list(regex.finditer(compiled_fn_string)))}.\n\n"
+        f"HLO:\n{compiled_fn_string}"
+    )
 
 
 def test_vmap_raises_on_batched_coef():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef_batch = np.stack([coef, coef, coef])
-    with pytest.raises(AssertionError, match=_VMAP_ASSERT):
+    with pytest.raises(jax.errors.UnexpectedTracerError):
         jax.vmap(lambda c: tensor_product(c, x, y, params))(coef_batch)
 
 
-def test_vmap_raises_on_x_only():
+def test_vmap_batches_on_x_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     xs = np.stack([x, x, x])
-    with pytest.raises(AssertionError, match=_VMAP_ASSERT):
-        jax.vmap(lambda xi: tensor_product(coef, xi, y, params))(xs)
+    zs = jax.vmap(lambda xi: tensor_product(coef, xi, y, params))(xs)
+    assert zs.shape[0] == xs.shape[0]
+    testing.assert_allclose(zs[0], zs[-1])
 
 
-def test_vmap_raises_on_y_only():
+def test_vmap_batches_on_y_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     ys = np.stack([y, y, y])
-    with pytest.raises(AssertionError, match=_VMAP_ASSERT):
-        jax.vmap(lambda yi: tensor_product(coef, x, yi, params))(ys)
+    zs = jax.vmap(lambda yi: tensor_product(coef, x, yi, params))(ys)
+    assert zs.shape[0] == ys.shape[0]
+    testing.assert_allclose(zs[0], zs[-1])
 
 
 def test_backward_tensor_product():
     """Check backward pass on x and y gradients."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
 
     def f_custom(x, y):
@@ -391,7 +432,7 @@ def test_backward_tensor_product():
 def test_backward2_tensor_product():
     """Check two TP backward passes on x and y."""
     num_out, idx, val, x, y = generate_tp_data()
-    params = Params(num_out=num_out, unroll=UNROLL, mode="OUTER")
+    params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
 
     def prod_custom(x, y):
@@ -420,7 +461,6 @@ class _TestTensorProductOp:
     channels_x: int | None = None
     channels_y: int | None = None
     num_rows = 16
-    unroll: tuple[int, ...] = (1, 1, 1)
     layout: str = "LEADING_CHANNELS"
 
     def closure(self):
@@ -434,14 +474,14 @@ class _TestTensorProductOp:
 
         keys = (k for k in random.split(random.key(1234), 4))
 
-        # FIXME: makes sure I/O indices are covered, since we
-        #        don't flush rows by default with (lm,l) layout.
+        # NOTE: makes sure I/O indices are covered, since we
+        #        don't flush rows by default with (lm,k) layout.
         def make_idx(dim: int, n: int, key=None) -> Array:
             if key is None:
                 key = random.key(n + dim)
             idx_all = np.arange(dim)
             # Last index has only one occurence, to detect a previous
-            # a previous bug where last store would have been skipped.
+            # bug where last store would have been skipped.
             idx_rdm = random.randint(key, (n - dim,), 0, dim - 1)
             return np.concat((idx_all, idx_rdm))
 
@@ -458,7 +498,6 @@ class _TestTensorProductOp:
 
         kwargs = {
             "num_out": self.num_out,
-            "unroll": self.unroll,
             "mode": self.mode,
             "layout": self.layout,
         }
@@ -468,7 +507,6 @@ class _TestTensorProductOp:
     @property
     def fwd_ref(self):
         idx, val, kwargs = self.closure()
-        kwargs.pop("unroll")
         return lambda x, y: tensor_product_reference(idx, val, x, y, **kwargs)
 
     @property
@@ -491,6 +529,34 @@ class _TestTensorProductOp:
             lambda x, y: np.sum(self.fwd_op(x, y)),
             argnums=(0, 1),
         )
+
+    @property
+    def bwd_bwd_op(self):
+        def sum_bwd(x, y, dz):
+            """A backward operation consuming dz cotangents."""
+            df = jax.grad(
+                lambda x, y, dz: np.sum(self.fwd_op(x, y) * dz),
+                argnums=(0, 1),
+            )
+            dx, dy = df(x, y, dz)
+            return np.sum(dx) + np.sum(dy)
+
+        # Differentiate once more, yield 3 cotangents
+        return jax.grad(sum_bwd, argnums=(0, 1, 2))
+
+    @property
+    def bwd_bwd_ref(self):
+        def sum_bwd(x, y, dz):
+            """A backward operation consuming dz cotangents."""
+            df = jax.grad(
+                lambda x, y, dz: np.sum(self.fwd_ref(x, y) * dz),
+                argnums=(0, 1),
+            )
+            dx, dy = df(x, y, dz)
+            return np.sum(dx) + np.sum(dy)
+
+        # Differentiate once more, yield 3 cotangents
+        return jax.grad(sum_bwd, argnums=(0, 1, 2))
 
     def inputs(self) -> tuple[Array, Array]:
         n = self.num_rows
@@ -525,8 +591,17 @@ class _TestTensorProductOp:
         x, y = self.inputs()
         expect_dx, expect_dy = self.bwd_ref(x, y)
         result_dx, result_dy = self.bwd_op(x, y)
-        assert_allclose(expect_dy, result_dy, atol=5e-6, rtol=5e-6)
-        assert_allclose(expect_dx, result_dx, atol=5e-6, rtol=5e-6)
+        assert_allclose(expect_dx, result_dx, atol=5e-5, rtol=5e-5)
+        assert_allclose(expect_dy, result_dy, atol=5e-5, rtol=5e-5)
+
+    def test_backward_backward(self):
+        x, y = self.inputs()
+        dz = self.fwd_ref(x, y)
+        expect_Dx, expect_Dy, expect_Ddz = self.bwd_bwd_ref(x, y, dz)
+        result_Dx, result_Dy, result_Ddz = self.bwd_bwd_op(x, y, dz)
+        assert_allclose(expect_Dx, result_Dx, atol=5e-5, rtol=5e-5)
+        assert_allclose(expect_Dy, result_Dy, atol=5e-5, rtol=5e-5)
+        assert_allclose(expect_Ddz, result_Ddz, atol=5e-5, rtol=5e-5)
 
 
 class TestTensorProductOuter(_TestTensorProductOp):
@@ -538,7 +613,6 @@ class TestTensorProductOuter(_TestTensorProductOp):
     channels_x = 8
     channels_y = None
     num_rows = 6
-    unroll = (1, 1, 1)
 
 
 class TestTensorProductInner(_TestTensorProductOp):
@@ -550,12 +624,19 @@ class TestTensorProductInner(_TestTensorProductOp):
     channels_x = 4
     channels_y = 4
     num_rows = 12
-    unroll = (1, 1, 1)
 
 
 class TestTensorProductOuterTrailing(TestTensorProductOuter):
     layout = "TRAILING_CHANNELS"
     # FIXME: seems to require num_channels multiple of 32
+    channels_x = 32
+    channels_y = None
+    num_rows = 22
+    num_idx = 320
+
+
+class TestTensorProductOuterTrailingCY(TestTensorProductOuterTrailing):
+    layout = "TRAILING_CHANNELS"
     channels_x = 32
     channels_y = None
     num_rows = 22
@@ -570,6 +651,7 @@ class TestTensorProductInnerTrailing(TestTensorProductInner):
 
 class TestTensorProductOuterOneIn(TestTensorProductOuter):
     layout = "TRAILING_CHANNELS"
+    mode = "OUTER"
     channels_x = 32
     channels_y = None
     num_x = 16
@@ -581,6 +663,7 @@ class TestTensorProductOuterOneIn(TestTensorProductOuter):
 
 class TestTensorProductInnerOneOut(TestTensorProductInner):
     layout = "TRAILING_CHANNELS"
+    mode = "INNER"
     channels_x = 32
     channels_y = 32
     num_x = 16

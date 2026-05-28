@@ -83,7 +83,8 @@ FFI_OBJ = bin/e3j_ops.cpp.o
 
 CU_TEST = \
 	test_scatter_add\
-	test_tensor_product
+	test_tensor_product\
+	test_tensor_product_bwd
 
 TENSOR_PRODUCT_OBJ = \
 	bin/tensor_product.cu.o
@@ -118,6 +119,11 @@ bin/test_tensor_product:\
 
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
+bin/test_tensor_product_bwd:\
+	$(SRC_DIR)/tests/test_tensor_product_bwd.cpp bin/tensor_product_bwd.cu.o bin/tensor_product.a
+
+	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
+
 bin/test_%: bin/%.cu.o $(SRC_DIR)/tests/test_%.cpp
 	g++ $^ -o $@ -I $(INC_DIR) $(CUDA_INC_DIR) $(CUDA_LIB_DIR) $(CUDA_LINK_LIBS)
 
@@ -145,7 +151,9 @@ docs:
 # Force re-build of cuda bindings with uv and CMake
 
 uv:
-	uv sync --reinstall
+	uv sync --group cuda13_local --extra ops\
+		--reinstall-package e3j_ops\
+		--reinstall-package e3j
 
 # Build the python bindings `e3j_ops.xxx.so` [2]
 

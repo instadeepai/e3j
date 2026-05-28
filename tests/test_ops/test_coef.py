@@ -131,3 +131,39 @@ class TestIdxDtypeRoundTrip:
         numpy.testing.assert_array_equal(
             numpy.asarray(recovered.idx), numpy.asarray(coef.idx)
         )
+
+
+class TestCoefTranspose:
+    """Test Coef.transpose(): column permutation + sort by new first column."""
+
+    @pytest.fixture
+    def coef(self):
+        val = jnp.array([1.0, -0.5, 3.14, 2.0])
+        idx = jnp.array(
+            [[2, 0, 1], [0, 2, 1], [1, 1, 0], [0, 1, 2]],
+            dtype=jnp.int32,
+        )
+        return Coef(val, idx)
+
+    @pytest.mark.parametrize(
+        "argnums",
+        [(0, 1, 2), (1, 0, 2), (2, 0, 1)],
+    )
+    def test_values_follow_indices(self, coef, argnums):
+        """Each (val, i, j, k) tuple is preserved after transpose."""
+        a, b, c = argnums
+        t = coef.transpose(argnums)
+        orig_set = {
+            (float(v), int(i), int(j), int(k))
+            for v, (i, j, k) in zip(coef.val, coef.idx)
+        }
+        trans_set = {
+            (float(v), int(i), int(j), int(k)) for v, (i, j, k) in zip(t.val, t.idx)
+        }
+        # Undo the permutation: original (i,j,k) mapped to (col_a, col_b, col_c)
+        inv = [0, 0, 0]
+        inv[a], inv[b], inv[c] = 0, 1, 2
+        trans_unpermuted = {
+            (v, ijk[inv[0]], ijk[inv[1]], ijk[inv[2]]) for v, *ijk in trans_set
+        }
+        assert orig_set == trans_unpermuted

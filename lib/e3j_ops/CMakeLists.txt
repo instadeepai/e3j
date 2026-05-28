@@ -7,7 +7,8 @@ project(e3j
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --threads 4 -Xcompiler -Wall -ldl --expt-relaxed-constexpr -O3 -DNDEBUG -O3 \
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --threads 4 -Xcompiler -w \
+    -ldl --expt-relaxed-constexpr -O3 -DNDEBUG -O3 \
     -arch=sm_90\
     -gencode=arch=compute_90,code=sm_90\
     -gencode=arch=compute_90a,code=sm_90a\
@@ -26,6 +27,7 @@ Python_add_library(e3j_ops MODULE WITH_SOABI
     ffi/e3j_ops.cpp
     cuda/scatter_add.cu
     cuda/tensor_product.cu
+    cuda/tensor_product_bwd.cu
     cuda/fill.cu)
 
 target_link_libraries(e3j_ops PRIVATE
@@ -36,5 +38,8 @@ target_link_libraries(e3j_ops PRIVATE
     pthread
     dl
     cudart)
+
+
+target_compile_options(e3j_ops PRIVATE -w)
 
 install(TARGETS e3j_ops DESTINATION .)

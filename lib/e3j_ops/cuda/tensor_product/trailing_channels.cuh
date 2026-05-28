@@ -22,7 +22,7 @@
 #include "cuda/array.cuh"
 
 #define WARP_MASK 0xffffffff
-#define BUFFER_COEFS_IN_SMEM true
+#define BUFFER_FWD_COEFS_IN_SMEM true
 
 namespace e3j {
 namespace tensor_product {
@@ -391,7 +391,7 @@ __global__ void kernel(
     Buffers smem = Buffers::init(x, y, z, unroll);
 
     // Optionally store coefficients in shared memory.
-    if (BUFFER_COEFS_IN_SMEM) {
+    if (BUFFER_FWD_COEFS_IN_SMEM) {
         Coef* smem_coef = reinterpret_cast<Coef*>(smem_);
         copy_pipe<1>(smem_coef, coef, num_coef);
         // Overwrite reference to GMEM `coef` with SMEM buffer.

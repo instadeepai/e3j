@@ -18,6 +18,8 @@
 
 #include "cuda/tensor_product/trailing_channels.cuh"
 
+#define MAX_BLOCK_SIZE 256
+
 namespace e3j {
 namespace tensor_product {
 
@@ -59,7 +61,7 @@ struct LaunchConfig {
         // With Mode::INNER, partial warp-wide sums accumulated in SMEM.
         if constexpr (kMode == Mode::INNER)
             sizeSMEM += sizeof(Val) * p.num_out * (1 + (p.channels_x - 1) / (32 * N));
-        if (BUFFER_COEFS_IN_SMEM) {
+        if (BUFFER_FWD_COEFS_IN_SMEM) {
             // Pad coef buffer to N-float boundary (same as kernel pointer logic).
             size_t align = N * sizeof(Val);
             sizeSMEM += (sizeCoef + align - 1) & ~(align - 1);
@@ -129,7 +131,7 @@ struct LaunchConfig {
         unsigned int threadsY = 1;
         while (
             maxBlocks * threadsX * threadsY < 2048
-            and threadsX * threadsY < 1024
+            and threadsX * threadsY < MAX_BLOCK_SIZE
             and threadsY <=  (unsigned int)p.num_out / 2
         ) {
             threadsY *= 2;
@@ -292,8 +294,5 @@ e3j::Error launch(
 
 }// namespace tensor_product
 }// namespace e3j
-
-// Defined in trailing_channels.cuh, used by both kernel and launch code.
-#undef BUFFER_COEFS_IN_SMEM
 
 #endif // _E3J_TENSOR_PRODUCT_LAUNCH_TRAILING_H_
