@@ -130,7 +130,9 @@ class Coef:
         sigma = jnp.argsort(idx[a])
         val_abc = val[sigma]
         idx_abc = jnp.stack([idx[a][sigma], idx[b][sigma], idx[c][sigma]])
-        return Coef(val_abc, idx_abc.T)
+        return Coef(
+            val_abc, idx_abc.T, val_dtype=self.val_dtype, idx_dtype=self.idx_dtype
+        )
 
     @classmethod
     def unpack(
