@@ -467,6 +467,7 @@ xla::Error ConvolutionBwdHandler(
     xla::AnyBuffer irrep_out,
     xla::BufferR1<xla::DataType::S32> sender,
     xla::BufferR1<xla::DataType::S32> receiver_ptr,
+    xla::BufferR1<xla::DataType::S32> edge_perm,
     xla::Result<xla::AnyBuffer> dx,
     xla::Result<xla::AnyBuffer> dy,
     xla::Result<xla::AnyBuffer> dmix,
@@ -528,6 +529,7 @@ xla::Error ConvolutionBwdHandler(
             mix.typed_data<Val>(),                              \
             irrep_out.typed_data<Idx>(),                        \
             adj,                                                \
+            edge_perm.typed_data(),                             \
             dx->typed_data<Val>(),                              \
             dy->typed_data<Val>(),                              \
             dmix->typed_data<Val>(),                            \
@@ -554,6 +556,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // irrep_out (output irrep index map)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (transposed CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (transposed CSR)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // edge_perm (transposed → original)
         .Ret<xla::AnyBuffer>()   // dx (cotangent node features)
         .Ret<xla::AnyBuffer>()   // dy (cotangent edge embeddings)
         .Ret<xla::AnyBuffer>()   // dmix (cotangent radial scalars)

@@ -128,7 +128,7 @@ def convolution_bwd(coef, x, y, s, s_index, sender, receiver, dm, params):
     num_nodes = x.shape[0]
     # Transpose CSR adjacency: group by sender instead of receiver.
     graph = GraphCSR(num_nodes, sender, receiver)
-    perm, graph_t, inv_perm = graph.transpose()
+    perm, graph_t, _ = graph.transpose()
 
     with jax.ensure_compile_time_eval():
         # Transpose and pack 3x coefs: [coef_fwd, coef_dx, coef_dy]
@@ -138,21 +138,22 @@ def convolution_bwd(coef, x, y, s, s_index, sender, receiver, dm, params):
         sigma_dx = jnp.argsort(idx[1])
         val_dx = val[sigma_dx]
         idx_dx = jnp.stack([idx[1][sigma_dx], idx[0][sigma_dx], idx[2][sigma_dx]])
-        coef_dx = Coef(val_dx, idx_dx.T).pack_jax()
+        coef_dx = Coef(
+            val_dx, idx_dx.T, val_dtype=c.val_dtype, idx_dtype=c.idx_dtype
+        ).pack_jax()
 
         sigma_dy = jnp.argsort(idx[2])
         val_dy = val[sigma_dy]
         idx_dy = jnp.stack([idx[2][sigma_dy], idx[0][sigma_dy], idx[1][sigma_dy]])
-        coef_dy = Coef(val_dy, idx_dy.T).pack_jax()
+        coef_dy = Coef(
+            val_dy, idx_dy.T, val_dtype=c.val_dtype, idx_dtype=c.idx_dtype
+        ).pack_jax()
 
         coef_3x = jnp.stack([coef, coef_dx, coef_dy])
 
     @custom_vjp
     def convolution_bwd_op(x, y, s, dm):
-        y_t = y[perm]
-        s_t = s[perm]
-
-        dx, dy_t, dmix_t = ffi_call(
+        dx, dy, dmix = ffi_call(
             "convolution_bwd",
             (
                 jax.ShapeDtypeStruct(x.shape, x.dtype),
@@ -162,18 +163,17 @@ def convolution_bwd(coef, x, y, s, s_index, sender, receiver, dm, params):
         )(
             coef_3x,
             x,
-            y_t,
+            y,
             dm,
-            s_t,
+            s,
             s_index,
             graph_t.sender,
             graph_t.receiver_ptr,
+            perm,
             num_nodes=int32(num_nodes),
             debug=int32(config().debug_level),
         )
 
-        dy = dy_t[inv_perm]
-        dmix = dmix_t[inv_perm]
         return dx, dy, dmix
 
     conv = partial(

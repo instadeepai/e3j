@@ -184,7 +184,7 @@ __device__ void otimes_mix_reduce(
  *    coef_dy = (k, i, j) sorted by k  →  otimes<INNER>
  *****************************************************************/
 template <typename Idx, typename Val, int N=1>
-__global__ void __launch_bounds__(1024) kernel_bwd (
+__global__ void kernel_bwd (
     const Coef<Idx, Val> *coef,
     CuArray2D<const Val> x,
     CuArray2D<const Val> y,
@@ -192,6 +192,7 @@ __global__ void __launch_bounds__(1024) kernel_bwd (
     CuArray2D<const Val> mix,
     const Idx *irrep_out,
     const AdjacencyCSR adj,
+    const int32_t *edge_perm,
     Val *gmem_dx,
     Val *gmem_dy,
     Val *gmem_dmix,
@@ -298,31 +299,33 @@ __global__ void __launch_bounds__(1024) kernel_bwd (
 
         for (int edge = first_edge; edge < last_edge; edge++) {
 
+            int edge_t = edge_perm ? edge_perm[edge] : edge;
             int recv = adj.sender[edge];
 
-            // Load dm[recv], y[edge], mix[edge]
+            // Load dm[recv], y[edge_t], mix[edge_t]
             if (dm.shape[1] > unroll.z)
                 copy_pipe_strided(smem.dm.data, dm_s.data + recv * size_dm,
                                   dm.shape[0], unroll.z, dm.shape[1]);
             else
                 copy_pipe<N>(smem.dm.data, dm_s.data + recv * size_dm, smem.dm.size());
-            copy_pipe<1>(smem.y.data, y.data + edge * size_y, size_y);
+            copy_pipe<1>(smem.y.data, y.data + edge_t * size_y, size_y);
             if (mix.shape[1] > unroll.z)
-                copy_pipe_strided(smem.mix.data, mix_s.data + edge * size_mix,
+                copy_pipe_strided(smem.mix.data, mix_s.data + edge_t * size_mix,
                                   mix.shape[0], unroll.z, mix.shape[1]);
             else
-                copy_pipe<N>(smem.mix.data, mix_s.data + edge * size_mix, smem.mix.size());
+                copy_pipe<N>(smem.mix.data, mix_s.data + edge_t * size_mix, smem.mix.size());
             __pipeline_commit();
             wait_pipe();
 
             // Zero dmix for this edge, then compute in registers.
             int dmix_edge_size = mix.shape[0] * dm.shape[1];
-            if (s == 0) fill(gmem_dmix + edge * dmix_edge_size, Val(0), dmix_edge_size);
+            if (s == 0)
+                fill(gmem_dmix + edge_t * dmix_edge_size, Val(0), dmix_edge_size);
             __syncthreads();
 
             // dmix[s,c] = sum_{i : mix_idx[i]=s} otimes(x,y)[i,c] * dm[i,c]
             CuArray2D<Val> dmix_view = {
-                dmix_s + edge * dmix_edge_size, mix.shape[0], dm.shape[1]
+                dmix_s + edge_t * dmix_edge_size, mix.shape[0], dm.shape[1]
             };
             otimes_mix_reduce<Idx, Val, N>(
                 coef, range_fwd,
@@ -360,9 +363,9 @@ __global__ void __launch_bounds__(1024) kernel_bwd (
                     for (int w = 0; w < num_warps; w++)
                         sum += smem.dy_scratch[w * num_y + i];
                     if (s == 0)
-                        gmem_dy[edge * num_y + i] = sum;
+                        gmem_dy[edge_t * num_y + i] = sum;
                     else
-                        gmem_dy[edge * num_y + i] += sum;
+                        gmem_dy[edge_t * num_y + i] += sum;
                 }
             }
 
@@ -377,8 +380,15 @@ __global__ void __launch_bounds__(1024) kernel_bwd (
         __syncthreads();
 
         // Advance to next channel slice.
-        if (x.shape[1]  > unroll.x) { x_s.data  += unroll.x; dx_out_s += unroll.x; }
-        if (dm.shape[1] > unroll.z) { dm_s.data += unroll.z; mix_s.data += unroll.z; dmix_s += unroll.z; }
+        if (x.shape[1]  > unroll.x) {
+            x_s.data  += unroll.x;
+            dx_out_s += unroll.x;
+        }
+        if (dm.shape[1] > unroll.z) {
+            dm_s.data += unroll.z;
+            mix_s.data += unroll.z;
+            dmix_s += unroll.z;
+        }
 
         }//=== Channel stride loop ===
 

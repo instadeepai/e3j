@@ -191,6 +191,7 @@ e3j::Error launch_bwd(
     const Val *gmem_mix,
     const Idx *irrep_out,
     const AdjacencyCSR adj,
+    const int32_t *edge_perm,
     Val *gmem_dx,
     Val *gmem_dy,
     Val *gmem_dmix,
@@ -218,7 +219,7 @@ e3j::Error launch_bwd(
     #define LAUNCH_BWD(N)                                                    \
     convolution::kernel_bwd<Idx,Val,N>                                       \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>                \
-        (coef, x, y, dz, mix, irrep_out, adj,                               \
+        (coef, x, y, dz, mix, irrep_out, adj, edge_perm,                    \
          gmem_dx, gmem_dy, gmem_dmix, p.num_nodes, p.num_coef, unroll)
 
     switch(cfg.N) {

@@ -18,6 +18,7 @@ e3j::Error launch_bwd(
     const Val *mix,
     const Idx *irrep_out,
     const AdjacencyCSR adj,
+    const int32_t *edge_perm,
     Val *dx,
     Val *dy,
     Val *dmix,
