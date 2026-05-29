@@ -111,19 +111,6 @@ TransposedCSR transpose_csr(
 }
 
 
-// Permute per-edge data by perm.
-Vec<float> permute_edges(Vec<float> data, Vec<int32> perm, int stride) {
-    int num_edges = perm.size();
-    Vec<float> out(num_edges * stride);
-    for (int e = 0; e < num_edges; e++) {
-        int oe = perm[e];
-        for (int i = 0; i < stride; i++)
-            out[e * stride + i] = data[oe * stride + i];
-    }
-    return out;
-}
-
-
 // CPU reference for convolution backward.
 //
 // Iterates over (receiver, edge, sender) in original CSR order.
@@ -206,16 +193,16 @@ template <typename Idx>
 struct ConvBwdArgs {
     std::vector<Coef<Idx, float>> coef_packed;
     Vec<float> x;
-    Vec<float> y_t;
+    Vec<float> y;
     Vec<float> dz;
-    Vec<float> mix_t;
+    Vec<float> mix;
     Vec<Idx> irrep_out;
     Vec<int32> receiver_t;
     Vec<int32> sender_ptr;
     Vec<int32> perm;
     Vec<float> dx_expect;
-    Vec<float> dy_expect_t;   // in transposed edge order
-    Vec<float> dmix_expect_t; // in transposed edge order
+    Vec<float> dy_expect;
+    Vec<float> dmix_expect;
 };
 
 
@@ -297,11 +284,6 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
     // Transpose CSR for backward
     TransposedCSR tcsr = transpose_csr(sender_fwd, receiver_ptr_fwd, p.num_nodes);
 
-    // Permute per-edge data to transposed order
-    Vec<float> y_t   = permute_edges(y,   tcsr.perm, p.num_y);
-    Vec<float> mix_t = permute_edges(mix, tcsr.perm,
-                                     p.num_scalars * p.channels_x);
-
     // CPU reference (in original edge order)
     Vec<float> dx_expect = Vec<float>::zeros(
         p.num_nodes * p.num_x * p.channels_x
@@ -317,25 +299,19 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
         dx_expect, dy_expect, dmix_expect
     );
 
-    // Permute expected dy, dmix to transposed edge order
-    Vec<float> dy_expect_t = permute_edges(dy_expect, tcsr.perm, p.num_y);
-    Vec<float> dmix_expect_t = permute_edges(
-        dmix_expect, tcsr.perm, p.num_scalars * p.channels_x
-    );
-
     return ConvBwdArgs<Idx> {
         .coef_packed = coef_packed,
         .x = x,
-        .y_t = y_t,
+        .y = y,
         .dz = dz,
-        .mix_t = mix_t,
+        .mix = mix,
         .irrep_out = irrep_out,
         .receiver_t = tcsr.receiver,
         .sender_ptr = tcsr.sender_ptr,
         .perm = tcsr.perm,
         .dx_expect = dx_expect,
-        .dy_expect_t = dy_expect_t,
-        .dmix_expect_t = dmix_expect_t,
+        .dy_expect = dy_expect,
+        .dmix_expect = dmix_expect,
     };
 }
 
@@ -373,7 +349,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     CoefT *coef_d;
     float *x_d, *y_d, *dz_d, *mix_d, *dx_d, *dy_d, *dmix_d;
     Idx *irrep_out_d;
-    int32 *receiver_t_d, *sender_ptr_d;
+    int32 *receiver_t_d, *sender_ptr_d, *perm_d;
 
     cudaMalloc((void**)&coef_d, size_coef);
     cudaMalloc((void**)&x_d, size_x);
@@ -383,20 +359,22 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     cudaMalloc((void**)&irrep_out_d, size_irrep);
     cudaMalloc((void**)&receiver_t_d, sizeof(int32) * num_edges);
     cudaMalloc((void**)&sender_ptr_d, sizeof(int32) * (p.num_nodes + 1));
+    cudaMalloc((void**)&perm_d, sizeof(int32) * num_edges);
     cudaMalloc((void**)&dx_d, size_dx);
     cudaMalloc((void**)&dy_d, size_dy);
     cudaMalloc((void**)&dmix_d, size_dmix);
 
     cudaMemcpy(coef_d, args.coef_packed.data(), size_coef, H2D);
     cudaMemcpy(x_d, args.x.data(), size_x, H2D);
-    cudaMemcpy(y_d, args.y_t.data(), size_y, H2D);
+    cudaMemcpy(y_d, args.y.data(), size_y, H2D);
     cudaMemcpy(dz_d, args.dz.data(), size_dz, H2D);
-    cudaMemcpy(mix_d, args.mix_t.data(), size_mix, H2D);
+    cudaMemcpy(mix_d, args.mix.data(), size_mix, H2D);
     cudaMemcpy(irrep_out_d, args.irrep_out.data(), size_irrep, H2D);
     cudaMemcpy(receiver_t_d, args.receiver_t.data(),
                sizeof(int32) * num_edges, H2D);
     cudaMemcpy(sender_ptr_d, args.sender_ptr.data(),
                sizeof(int32) * (p.num_nodes + 1), H2D);
+    cudaMemcpy(perm_d, args.perm.data(), sizeof(int32) * num_edges, H2D);
 
     // Zero outputs
     cudaMemset(dx_d, 0, size_dx);
@@ -411,7 +389,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     AdjacencyCSR adj_t = { receiver_t_d, sender_ptr_d };
 
     e3j::Error err = e3j::convolution::launch_bwd<Idx, float>(
-        coef_d, x_d, y_d, dz_d, mix_d, irrep_out_d, adj_t,
+        coef_d, x_d, y_d, dz_d, mix_d, irrep_out_d, adj_t, perm_d,
         dx_d, dy_d, dmix_d,
         p, cudaStream_t(0), DEBUG
     );
@@ -420,7 +398,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
         printf("Launch error: %s\n", err.message().c_str());
         cudaFree(coef_d); cudaFree(x_d); cudaFree(y_d); cudaFree(dz_d);
         cudaFree(mix_d); cudaFree(irrep_out_d);
-        cudaFree(receiver_t_d); cudaFree(sender_ptr_d);
+        cudaFree(receiver_t_d); cudaFree(sender_ptr_d); cudaFree(perm_d);
         cudaFree(dx_d); cudaFree(dy_d); cudaFree(dmix_d);
         return 1;
     }
@@ -445,19 +423,19 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
         }
     }
 
-    // Compare dy (in transposed edge order)
+    // Compare dy (in original edge order)
     bool dy_match = true;
     for (int i = 0; i < (int)result_dy.size(); i++) {
-        if (std::abs(result_dy[i] - args.dy_expect_t[i]) > tol) {
+        if (std::abs(result_dy[i] - args.dy_expect[i]) > tol) {
             dy_match = false;
             break;
         }
     }
 
-    // Compare dmix (in transposed edge order)
+    // Compare dmix (in original edge order)
     bool dmix_match = true;
     for (int i = 0; i < (int)result_dmix.size(); i++) {
-        if (std::abs(result_dmix[i] - args.dmix_expect_t[i]) > tol) {
+        if (std::abs(result_dmix[i] - args.dmix_expect[i]) > tol) {
             dmix_match = false;
             break;
         }
@@ -476,16 +454,16 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
                        p.num_nodes * p.num_x, p.channels_x);
     }
     if (!dy_match) {
-        printf("Expect dy (transposed order):\n");
-        vec::showMatrix(std::cout, args.dy_expect_t.data(),
+        printf("Expect dy:\n");
+        vec::showMatrix(std::cout, args.dy_expect.data(),
                        NUM_EDGES, p.num_y);
         printf("Result dy:\n");
         vec::showMatrix(std::cout, result_dy.data(),
                        NUM_EDGES, p.num_y);
     }
     if (!dmix_match) {
-        printf("Expect dmix (transposed order):\n");
-        vec::showMatrix(std::cout, args.dmix_expect_t.data(),
+        printf("Expect dmix:\n");
+        vec::showMatrix(std::cout, args.dmix_expect.data(),
                        NUM_EDGES * p.num_scalars, p.channels_x);
         printf("Result dmix:\n");
         vec::showMatrix(std::cout, result_dmix.data(),
@@ -500,6 +478,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     cudaFree(irrep_out_d);
     cudaFree(receiver_t_d);
     cudaFree(sender_ptr_d);
+    cudaFree(perm_d);
     cudaFree(dx_d);
     cudaFree(dy_d);
     cudaFree(dmix_d);
