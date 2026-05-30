@@ -22,6 +22,15 @@ using tensor_product::find_coef_bounds;
 
 namespace tp = tensor_product::trailing_channels;
 
+
+// Align to 16B: sizeof(T) should divide 16.
+template<typename T>
+__device__ unsigned int align16(unsigned int n) {
+    constexpr int A = 16 / sizeof(T);
+    return (n + A - 1) / A * A;
+}
+
+
 /*****************************************************************
  *  Buffers for backward convolution:
  *
@@ -66,17 +75,19 @@ struct BuffersBwd {
 
     template<int Stages=1>
     __device__ void to_shared (char *smem_) {
-        constexpr int A = 16 / sizeof(Val);
         dm.data  = reinterpret_cast<Val*>(smem_);
-        x.data   = dm.data  + (dm.size()  + A-1) / A * A;
-        y.data   = x.data   + (x.size()   + A-1) / A * A;
-        mix.data = y.data   + (y.size()   + A-1) / A * A;
-        mix_idx  = reinterpret_cast<Idx*>(mix.data + mix.size());
-        // Advance past mix_idx, re-align to 16 B for dx.
-        unsigned int idx_vals =
-            (dm.shape[0] * sizeof(Idx) + sizeof(Val) - 1) / sizeof(Val);
-        dx.data = mix.data + (mix.size() + idx_vals + A-1) / A * A;
-        dy_scratch = dx.data + (dx.size() + A-1) / A * A;
+        x.data   = dm.data  + align16<Val>(dm.size());
+        y.data   = x.data   + align16<Val>(x.size());
+        mix.data = y.data   + align16<Val>(y.size());
+        mix_idx  = reinterpret_cast<Idx*>(
+            mix.data + align16<Val>(mix.size())
+        );
+        // Align dvance past mix_idx, re-align to 16 B for dx.
+        // Cotangent buffers
+        dx.data = reinterpret_cast<Val*>(
+            mix_idx + align16<Idx>(dm.shape[0])
+        );
+        dy_scratch = dx.data + align16<Val>(dx.size());
     }
 };
 
