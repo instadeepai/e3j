@@ -252,11 +252,30 @@ __device__ void copy_strided(
     }
 }
 
-// Used to flush SMEM buffer.
+// Scalar fill with a 1D block along blockDim.x.
 template <typename T>
 __device__ void fill(T* dst, const T value, const int numel) {
     for (int col = threadIdx.x; col < numel; col += blockDim.x) {
         dst[col] = value;
+    }
+}
+
+// Vectorized fill (N-wide stores, full 2D block).
+template <int N, typename T>
+__device__ void fill(T* dst, const T value, const int numel) {
+    int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    int dim = blockDim.x * blockDim.y;
+    if constexpr (N > 1) {
+        Vect<N, T> v = broadcast<N, T>(value);
+        Vect<N, T>* out = reinterpret_cast<Vect<N, T>*>(dst);
+        int aligned = numel / N;
+        for (int i = tid; i < aligned; i += dim)
+            out[i] = v;
+        for (int i = aligned * N + tid; i < numel; i += dim)
+            dst[i] = value;
+    } else {
+        for (int i = tid; i < numel; i += dim)
+            dst[i] = value;
     }
 }
 

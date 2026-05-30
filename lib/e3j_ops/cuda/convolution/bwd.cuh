@@ -331,7 +331,7 @@ __global__ void kernel_bwd (
             // Zero dmix for this edge, then compute in registers.
             int dmix_edge_size = mix.shape[0] * dm.shape[1];
             if (s == 0)
-                fill(gmem_dmix + edge_t * dmix_edge_size, Val(0), dmix_edge_size);
+                fill<N>(gmem_dmix + edge_t * dmix_edge_size, Val(0), dmix_edge_size);
             __syncthreads();
 
             // dmix[s,c] = sum_{i : mix_idx[i]=s} otimes(x,y)[i,c] * dm[i,c]
