@@ -24,6 +24,7 @@
 #define WARP_MASK 0xffffffff
 #define BUFFER_FWD_COEFS_IN_SMEM true
 
+
 namespace e3j {
 namespace tensor_product {
 
@@ -269,9 +270,13 @@ namespace trailing_channels {
         CuArray2D<Val> lhs,
         CuArray2D<Val> rhs,
         CuArray2D<Val> out,
-        const Channels k,
         Val *scratch
     ) {
+        // Map thread indices to (x,y,z) channels.
+        // Number of parallel channel triplets is k.total
+        Channels k = Channels::get<kMode,N>(
+            threadIdx.x, lhs.shape[1], rhs.shape[1], out.shape[1]
+        );
 
         // NOTE: consumes p.num_out, p.unroll_{x,y}, p.channels_x.
         using Coef = Coef<Idx, Val>;
@@ -370,12 +375,6 @@ __global__ void kernel(
     using Coef = Coef<Idx,Val>;
     using Buffers = Buffers<Val>;
 
-    // Map thread indices to (x,y,z) channels.
-    // Number of parallel channel triplets is k.total
-    Channels k = Channels::get<kMode,N>(
-        threadIdx.x, x.shape[1], y.shape[1], z.shape[1]
-    );
-
     int num_x = x.shape[0];
     int num_y = y.shape[0];
     int size_x = x.size();
@@ -455,7 +454,7 @@ __global__ void kernel(
 
             // Reduce `z[i] = sum(c.val * x[c.j] * y[c.k] for c.i = i)`
             otimes<Idx,Val,kMode,N,accumulate>(
-                coef, coef_range, smem.lhs, smem.rhs, z_s, k, smem.out.data
+                coef, coef_range, smem.lhs, smem.rhs, z_s, smem.out.data
             );
             __syncthreads();
 
