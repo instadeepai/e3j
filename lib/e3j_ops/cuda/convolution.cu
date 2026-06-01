@@ -7,11 +7,10 @@ namespace convolution {
 
 #define FOR_EACH_DTYPE_PAIR(Idx, Val)              \
 template e3j::Error launch<Idx, Val>(              \
-    const Coef<Idx,Val> *coef,                     \
+    const Coef4D<Idx,Val> *coef,                   \
     const Val *x,                                  \
     const Val *y,                                  \
     const Val *r,                                  \
-    const Idx *irrep_out,                          \
     const AdjacencyCSR adj,                        \
     Val *out,                                      \
     Params p,                                      \

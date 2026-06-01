@@ -13,6 +13,13 @@ using std::int32_t;
 using e3j::tensor_product::Coef;
 using e3j::tensor_product::Mode;
 
+template<typename Idx, typename Val>
+struct alignas(next_pow2(sizeof(Val) + 4*sizeof(Idx)))
+Coef4D {
+    Val val;
+    Idx i; Idx j; Idx k; Idx l;
+};
+
 // Note: only Layout::TRAILING_CHANNELS supported.
 struct Params {
     int32_t num_nodes;
@@ -64,11 +71,10 @@ struct AdjacencyCSR {
  *****************************************************************************/
 template <typename Idx, typename Val>
 e3j::Error launch(
-    const Coef<Idx, Val> *coef,
+    const Coef4D<Idx, Val> *coef,
     const Val *x,
     const Val *y,
     const Val *r,
-    const Idx *irrep_out,
     const AdjacencyCSR adj,
     Val *out,
     Params p,

@@ -10,6 +10,7 @@
 #include "cuda_runtime_api.h"
 
 #include "cuda/convolution.cuh"
+#include "cuda/convolution/utils.cuh"
 
 #define NUM_NODES 4
 #define NUM_EDGES 6
@@ -19,6 +20,8 @@
 
 using e3j::convolution::Params;
 using e3j::convolution::AdjacencyCSR;
+using e3j::convolution::Coef4D;
+using e3j::convolution::otimes_mix_coefficients;
 using e3j::tensor_product::Coef;
 using e3j::tensor_product::Layout;
 
@@ -102,7 +105,7 @@ Vec<float> cpu_convolution(
 
 template <typename Idx>
 struct ConvArgs {
-    std::vector<Coef<Idx, float>> coef;
+    std::vector<Coef4D<Idx, float>> coef;
     Vec<float> x;
     Vec<float> y;
     Vec<float> r;
@@ -137,7 +140,7 @@ ConvArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
 
     Vec<Idx> idx_flat = Vec<Idx>::concat({idx_i, idx_j, idx_k});
     Vec<float> val = coef_val.tile(num_strips);
-    std::vector<Coef<Idx, float>> coef =
+    std::vector<Coef<Idx, float>> coef3 =
         packCoefs<Idx>(idx_flat, val, p.num_coef);
 
     // Node features x: [num_nodes, num_x, channels_x] (trailing channels)
@@ -182,9 +185,12 @@ ConvArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
     );
 
     Vec<float> expect = cpu_convolution<Idx>(
-        coef, x, y, r, irrep_out,
+        coef3, x, y, r, irrep_out,
         sender, receiver_ptr, p
     );
+
+    std::vector<Coef4D<Idx, float>> coef =
+        otimes_mix_coefficients<Idx, float>(coef3, irrep_out.data());
 
     return ConvArgs<Idx> {
         .coef = coef,
@@ -211,7 +217,7 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     printf("num_nodes: %d, channels_x: %d, num_strips: %d, scale_r: %d\n",
            p.num_nodes, p.channels_x, num_strips, scale_r);
 
-    using CoefT = Coef<Idx, float>;
+    using CoefT = Coef4D<Idx, float>;
 
     ConvArgs<Idx> args = prepareHostArgs<Idx>(p, num_strips, scale_r);
 

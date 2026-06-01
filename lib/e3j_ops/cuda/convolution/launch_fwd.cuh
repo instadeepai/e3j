@@ -33,7 +33,7 @@ struct LaunchConfig {
     int N;
 
     // SMEM layout matching Buffers::to_shared<Stages=1>:
-    //   [ coef | lhs | rhs | out | mix | mix_idx ]
+    //   [ coef | lhs | rhs | out | mix ]
     // Alignment constant A = 16 / sizeof(Val) matches to_shared.
     static Sizes get_sizes(Params p, dim3 blockDims, int N) {
 
@@ -48,13 +48,11 @@ struct LaunchConfig {
         size_t size_rhs = ((size_t)1 * p.num_y + A - 1) / A * A;
         size_t size_out = ((size_t)unroll_z * p.num_out + A - 1) / A * A;
         size_t size_mix = ((size_t)unroll_z * p.num_scalars + A - 1) / A * A;
-        size_t size_idx = ((size_t)p.num_out * sizeof(Idx) + sizeof(Val) - 1)
-                        / sizeof(Val);
 
         size_t sizeLoad = sizeof(Val)
-            * (size_lhs + size_rhs + size_out + size_mix + size_idx);
+            * (size_lhs + size_rhs + size_out + size_mix);
 
-        size_t sizeCoef = (size_t)p.num_coef * sizeof(Coef<Idx,Val>);
+        size_t sizeCoef = (size_t)p.num_coef * sizeof(Coef4D<Idx,Val>);
         constexpr size_t align = 16;
         sizeCoef = (sizeCoef + align - 1) & ~(align - 1);
 
@@ -195,11 +193,10 @@ struct LaunchConfig {
 
 template<typename Idx, typename Val>
 e3j::Error launch(
-    const Coef<Idx, Val> *coef,
+    const Coef4D<Idx, Val> *coef,
     const Val *gmem_x,
     const Val *gmem_y,
     const Val *gmem_r,
-    const Idx *irrep_out,
     const AdjacencyCSR adj,
     Val *gmem_out,
     Params p,
@@ -230,7 +227,7 @@ e3j::Error launch(
     #define LAUNCH(N)                                                      \
     convolution::kernel<Idx,Val,N>                                         \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>              \
-        (coef, x, y, r, irrep_out, adj, z,                                \
+        (coef, x, y, r, adj, z,                                            \
          p.num_nodes, p.num_coef, unroll)
 
     switch(cfg.N) {
