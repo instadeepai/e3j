@@ -171,7 +171,20 @@ template <int N=1, typename T>
 __device__ void copy_pipe(T* dst, const T* src, const int numel) {
     int tid = threadIdx.x + threadIdx.y * blockDim.x;
     int dim = blockDim.x * blockDim.y;
-    if constexpr (N > 1) {
+    // cp.async supports 4, 8, or 16 byte copies.
+    constexpr size_t cp_size = sizeof(T) * N;
+    if constexpr (cp_size > 16) {
+        static_assert(cp_size % 16 == 0);
+        constexpr int K = cp_size / 16;
+        int4 *dst4 = reinterpret_cast<int4*>(dst);
+        const int4 *src4 = reinterpret_cast<const int4*>(src);
+        #pragma unroll 1
+        for (int i = tid * K; i < numel * K; i += dim * K) {
+            #pragma unroll
+            for (int k = 0; k < K; k++)
+                __pipeline_memcpy_async(&dst4[i + k], &src4[i + k], 16);
+        }
+    } else if constexpr (N > 1) {
         int aligned = (numel / N) * N;
         #pragma unroll 1
         for (int i = tid * N; i < aligned; i += dim * N) {
