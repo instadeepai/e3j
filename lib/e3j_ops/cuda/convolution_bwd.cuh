@@ -11,12 +11,11 @@ namespace convolution {
 
 template <typename Idx, typename Val>
 e3j::Error launch_bwd(
-    const Coef<Idx, Val> *coef,
+    const Coef4D<Idx, Val> *coef,
     const Val *x,
     const Val *y,
     const Val *dz,
     const Val *mix,
-    const Idx *irrep_out,
     const AdjacencyCSR adj,
     const int32_t *edge_perm,
     Val *dx,

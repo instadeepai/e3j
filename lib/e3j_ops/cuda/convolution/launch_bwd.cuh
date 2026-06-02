@@ -30,7 +30,7 @@ struct LaunchConfigBwd {
     int N;
 
     // SMEM layout matching BuffersBwd::to_shared:
-    //   [ coef(2x) | dm | x | y | mix + mix_idx | dx | dy_scratch ]
+    //   [ coef(3x) | dm | x | y | mix | dx | dy_scratch ]
     static SizesBwd get_sizes(Params p, dim3 blockDims, int N) {
 
         constexpr int A = 16 / sizeof(Val);
@@ -39,20 +39,17 @@ struct LaunchConfigBwd {
         size_t size_dm  = ((size_t)unroll_x * p.num_out     + A-1) / A * A;
         size_t size_x   = ((size_t)unroll_x * p.num_x       + A-1) / A * A;
         size_t size_y   = ((size_t)p.num_y                   + A-1) / A * A;
-        size_t idx_vals =
-            (p.num_out * sizeof(Idx) + sizeof(Val) - 1) / sizeof(Val);
-        size_t size_mix_idx =
-            ((size_t)unroll_x * p.num_scalars + idx_vals + A-1) / A * A;
-        size_t size_dx  = ((size_t)unroll_x * p.num_x       + A-1) / A * A;
+        size_t size_mix = ((size_t)unroll_x * p.num_scalars  + A-1) / A * A;
+        size_t size_dx  = ((size_t)unroll_x * p.num_x        + A-1) / A * A;
         int num_warps = max(1u, blockDims.x / 32);
         size_t size_scratch = (size_t)num_warps * p.num_y;
 
         size_t sizeLoad = sizeof(Val) * (
-            size_dm + size_x + size_y + size_mix_idx
+            size_dm + size_x + size_y + size_mix
             + size_dx + size_scratch
         );
 
-        size_t sizeCoef = (size_t)(3 * p.num_coef) * sizeof(Coef<Idx,Val>);
+        size_t sizeCoef = (size_t)(3 * p.num_coef) * sizeof(Coef4D<Idx,Val>);
         size_t align = N * sizeof(Val);
         sizeCoef = (sizeCoef + align - 1) & ~(align - 1);
 
@@ -184,12 +181,11 @@ struct LaunchConfigBwd {
 
 template<typename Idx, typename Val>
 e3j::Error launch_bwd(
-    const Coef<Idx, Val> *coef,
+    const Coef4D<Idx, Val> *coef,
     const Val *gmem_x,
     const Val *gmem_y,
     const Val *gmem_dz,
     const Val *gmem_mix,
-    const Idx *irrep_out,
     const AdjacencyCSR adj,
     const int32_t *edge_perm,
     Val *gmem_dx,
@@ -219,7 +215,7 @@ e3j::Error launch_bwd(
     #define LAUNCH_BWD(N)                                                    \
     convolution::kernel_bwd<Idx,Val,N>                                       \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>                \
-        (coef, x, y, dz, mix, irrep_out, adj, edge_perm,                    \
+        (coef, x, y, dz, mix, adj, edge_perm,                               \
          gmem_dx, gmem_dy, gmem_dmix, p.num_nodes, p.num_coef, unroll)
 
     switch(cfg.N) {

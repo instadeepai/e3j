@@ -59,9 +59,6 @@ struct AdjacencyCSR {
  *  @param x node features.
  *  @param y spherical embeddings of edge vectors.
  *  @param r radial embeddings of edge vectors.
- *  @param irrep_out index of irreducible block along the output coordinate.
- *         Equivalent of repeating each Irrep index 2l + 1 times, necessary
-           for the equivariant scalar mixing.
  *  @param adj adjacency matrix in CSR format.
  *  @param out output node features.
  *  @param p additional problem parameters.

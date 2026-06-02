@@ -366,7 +366,6 @@ xla::Error ConvolutionHandler(
     xla::AnyBuffer x,
     xla::AnyBuffer y,
     xla::AnyBuffer r,
-    xla::AnyBuffer irrep_out,
     xla::BufferR1<xla::DataType::S32> sender,
     xla::BufferR1<xla::DataType::S32> receiver_ptr,
     xla::Result<xla::AnyBuffer> out,
@@ -398,8 +397,8 @@ xla::Error ConvolutionHandler(
             "unsupported (IDX, VAL) dtype pair").to_xla();
 
     #define DISPATCH_DTYPE_PAIR(Idx, Val)                       \
-        using Coef = e3j::tensor_product::Coef<Idx, Val>;       \
-        const Coef *coef_ptr = reinterpret_cast<const Coef*>(   \
+        using Coef = e3j::convolution::Coef4D<Idx, Val>;       \
+        const Coef *coef_ptr = reinterpret_cast<const Coef*>(  \
             coef.typed_data<Idx>()                              \
         );                                                      \
                                                                 \
@@ -423,7 +422,6 @@ xla::Error ConvolutionHandler(
             x.typed_data<Val>(),                                \
             y.typed_data<Val>(),                                \
             r.typed_data<Val>(),                                \
-            irrep_out.typed_data<Idx>(),                        \
             adj,                                                \
             out->typed_data<Val>(),                             \
             params, stream, debug                               \
@@ -441,11 +439,10 @@ XLA_FFI_DEFINE_HANDLER(
     ConvolutionHandler,
     xla::Ffi::Bind()
         .Ctx<xla::PlatformStream<cudaStream_t>>()
-        .Arg<xla::AnyBuffer>()   // coef (packed Coef<Idx,Val> as idx_t vector)
+        .Arg<xla::AnyBuffer>()   // coef (packed Coef4D<Idx,Val> as idx_t vector)
         .Arg<xla::AnyBuffer>()   // x (node features)
         .Arg<xla::AnyBuffer>()   // y (edge embeddings)
         .Arg<xla::AnyBuffer>()   // r (radial scalars)
-        .Arg<xla::AnyBuffer>()   // irrep_out (output irrep index map)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (CSR)
         .Ret<xla::AnyBuffer>()   // out (output node features)
@@ -464,7 +461,6 @@ xla::Error ConvolutionBwdHandler(
     xla::AnyBuffer y,
     xla::AnyBuffer dz,
     xla::AnyBuffer mix,
-    xla::AnyBuffer irrep_out,
     xla::BufferR1<xla::DataType::S32> sender,
     xla::BufferR1<xla::DataType::S32> receiver_ptr,
     xla::BufferR1<xla::DataType::S32> edge_perm,
@@ -501,8 +497,8 @@ xla::Error ConvolutionBwdHandler(
             "unsupported (IDX, VAL) dtype pair").to_xla();
 
     #define DISPATCH_DTYPE_PAIR(Idx, Val)                       \
-        using Coef = e3j::tensor_product::Coef<Idx, Val>;       \
-        const Coef *coef_ptr = reinterpret_cast<const Coef*>(   \
+        using Coef = e3j::convolution::Coef4D<Idx, Val>;       \
+        const Coef *coef_ptr = reinterpret_cast<const Coef*>(  \
             coef.typed_data<Idx>()                              \
         );                                                      \
                                                                 \
@@ -527,7 +523,6 @@ xla::Error ConvolutionBwdHandler(
             y.typed_data<Val>(),                                \
             dz.typed_data<Val>(),                               \
             mix.typed_data<Val>(),                              \
-            irrep_out.typed_data<Idx>(),                        \
             adj,                                                \
             edge_perm.typed_data(),                             \
             dx->typed_data<Val>(),                              \
@@ -548,12 +543,11 @@ XLA_FFI_DEFINE_HANDLER(
     ConvolutionBwdHandler,
     xla::Ffi::Bind()
         .Ctx<xla::PlatformStream<cudaStream_t>>()
-        .Arg<xla::AnyBuffer>()   // coef (packed 3x Coef<Idx,Val>)
+        .Arg<xla::AnyBuffer>()   // coef (packed 3x Coef4D<Idx,Val>)
         .Arg<xla::AnyBuffer>()   // x (node features)
         .Arg<xla::AnyBuffer>()   // y (edge embeddings)
         .Arg<xla::AnyBuffer>()   // dz (cotangent messages)
         .Arg<xla::AnyBuffer>()   // mix (radial scalars)
-        .Arg<xla::AnyBuffer>()   // irrep_out (output irrep index map)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (transposed CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (transposed CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // edge_perm (transposed → original)

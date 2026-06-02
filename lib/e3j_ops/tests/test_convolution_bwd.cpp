@@ -12,6 +12,7 @@
 #include "cuda_runtime_api.h"
 
 #include "cuda/convolution_bwd.cuh"
+#include "cuda/convolution/utils.cuh"
 
 #define NUM_NODES 4
 #define NUM_EDGES 6
@@ -21,6 +22,7 @@
 
 using e3j::convolution::Params;
 using e3j::convolution::AdjacencyCSR;
+using e3j::convolution::Coef4D;
 using e3j::tensor_product::Coef;
 
 using vec::Vec;
@@ -40,30 +42,6 @@ std::vector<Coef<Idx, float>> packCoefs(
             .k = idx_flat[n + nnz * 2],
         };
     }
-    return out;
-}
-
-
-// Transpose coefficient indices for backward pass.
-//   coef_dx: (j, i, k) sorted by j — OUTER on dx
-//   coef_dy: (k, i, j) sorted by k — INNER on dy
-template <typename Idx>
-std::vector<Coef<Idx, float>> transposeCoefs(
-    std::vector<Coef<Idx, float>> coef,
-    int target  // 0 = dx (j,i,k), 1 = dy (k,i,j)
-) {
-    int n = (int)coef.size();
-    std::vector<Coef<Idx, float>> out(n);
-    for (int c = 0; c < n; c++) {
-        if (target == 0) {
-            out[c] = { coef[c].val, coef[c].j, coef[c].i, coef[c].k };
-        } else {
-            out[c] = { coef[c].val, coef[c].k, coef[c].i, coef[c].j };
-        }
-    }
-    std::sort(out.begin(), out.end(), [](auto& a, auto& b) {
-        return a.i < b.i || (a.i == b.i && a.j < b.j);
-    });
     return out;
 }
 
@@ -191,12 +169,11 @@ void cpu_convolution_bwd(
 
 template <typename Idx>
 struct ConvBwdArgs {
-    std::vector<Coef<Idx, float>> coef_packed;
+    std::vector<Coef4D<Idx, float>> coef_packed;
     Vec<float> x;
     Vec<float> y;
     Vec<float> dz;
     Vec<float> mix;
-    Vec<Idx> irrep_out;
     Vec<int32> receiver_t;
     Vec<int32> sender_ptr;
     Vec<int32> perm;
@@ -233,16 +210,6 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
     std::vector<Coef<Idx, float>> coef_fwd =
         packCoefs<Idx>(idx_flat, val, num_coef);
 
-    // Transpose coefs for backward kernel
-    std::vector<Coef<Idx, float>> coef_dx = transposeCoefs<Idx>(coef_fwd, 0);
-    std::vector<Coef<Idx, float>> coef_dy = transposeCoefs<Idx>(coef_fwd, 1);
-
-    std::vector<Coef<Idx, float>> coef_packed;
-    coef_packed.reserve(3 * num_coef);
-    coef_packed.insert(coef_packed.end(), coef_fwd.begin(), coef_fwd.end());
-    coef_packed.insert(coef_packed.end(), coef_dx.begin(), coef_dx.end());
-    coef_packed.insert(coef_packed.end(), coef_dy.begin(), coef_dy.end());
-
     // Node features x: [num_nodes, num_x, channels_x]
     Vec<float> x_strip = {1., 2.};
     Vec<float> x_per_node = x_strip.tile(num_strips).repeat(p.channels_x);
@@ -277,6 +244,26 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
         irrep_out[2 * s + 1] = Idx(s);
     }
 
+    // Transpose coefs for backward kernel: 3 x Coef4D sets.
+    // Forward indices (i, j, k, l) = (m, x, s, y).
+    // Backward orderings: dm first, broadcast operand last.
+    using e3j::convolution::transpose_coef4D;
+    int order_dmix[4] = {2, 0, 1, 3};  // {s, m, x, y} for bigotimes(dm, x, y)
+    int order_dx[4]   = {1, 0, 2, 3};  // {x, m, s, y} for bigotimes(dm, s, y)
+    int order_dy[4]   = {3, 0, 2, 1};  // {y, m, s, x} for bigotimes(dm, s, x)
+    std::vector<Coef4D<Idx, float>> coef_dmix =
+        transpose_coef4D<Idx, float>(coef_fwd, irrep_out.data(), order_dmix);
+    std::vector<Coef4D<Idx, float>> coef_dx =
+        transpose_coef4D<Idx, float>(coef_fwd, irrep_out.data(), order_dx);
+    std::vector<Coef4D<Idx, float>> coef_dy =
+        transpose_coef4D<Idx, float>(coef_fwd, irrep_out.data(), order_dy);
+
+    std::vector<Coef4D<Idx, float>> coef_packed;
+    coef_packed.reserve(3 * num_coef);
+    coef_packed.insert(coef_packed.end(), coef_dmix.begin(), coef_dmix.end());
+    coef_packed.insert(coef_packed.end(), coef_dx.begin(), coef_dx.end());
+    coef_packed.insert(coef_packed.end(), coef_dy.begin(), coef_dy.end());
+
     // Graph adjacency (CSR, same as forward test)
     Vec<int32> sender_fwd       = {1, 2, 0, 3, 0, 1};
     Vec<int32> receiver_ptr_fwd = {0, 2, 4, 5, 6};
@@ -305,7 +292,6 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
         .y = y,
         .dz = dz,
         .mix = mix,
-        .irrep_out = irrep_out,
         .receiver_t = tcsr.receiver,
         .sender_ptr = tcsr.sender_ptr,
         .perm = tcsr.perm,
@@ -327,7 +313,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     printf("num_nodes: %d, channels_x: %d, num_strips: %d, scale_r: %d\n",
            p.num_nodes, p.channels_x, num_strips, scale_r);
 
-    using CoefT = Coef<Idx, float>;
+    using CoefT = Coef4D<Idx, float>;
 
     ConvBwdArgs<Idx> args = prepareHostArgs<Idx>(p, num_strips, scale_r);
 
@@ -341,14 +327,12 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     size_t size_y      = sizeof(float) * num_edges * p.num_y;
     size_t size_dz     = sizeof(float) * p.num_nodes * p.num_out * p.channels_x;
     size_t size_mix    = sizeof(float) * num_edges * p.num_scalars * p.channels_x;
-    size_t size_irrep  = sizeof(Idx) * p.num_out;
     size_t size_dx     = sizeof(float) * p.num_nodes * p.num_x * p.channels_x;
     size_t size_dy     = sizeof(float) * num_edges * p.num_y;
     size_t size_dmix   = sizeof(float) * num_edges * p.num_scalars * p.channels_x;
 
     CoefT *coef_d;
     float *x_d, *y_d, *dz_d, *mix_d, *dx_d, *dy_d, *dmix_d;
-    Idx *irrep_out_d;
     int32 *receiver_t_d, *sender_ptr_d, *perm_d;
 
     cudaMalloc((void**)&coef_d, size_coef);
@@ -356,7 +340,6 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     cudaMalloc((void**)&y_d, size_y);
     cudaMalloc((void**)&dz_d, size_dz);
     cudaMalloc((void**)&mix_d, size_mix);
-    cudaMalloc((void**)&irrep_out_d, size_irrep);
     cudaMalloc((void**)&receiver_t_d, sizeof(int32) * num_edges);
     cudaMalloc((void**)&sender_ptr_d, sizeof(int32) * (p.num_nodes + 1));
     cudaMalloc((void**)&perm_d, sizeof(int32) * num_edges);
@@ -369,7 +352,6 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     cudaMemcpy(y_d, args.y.data(), size_y, H2D);
     cudaMemcpy(dz_d, args.dz.data(), size_dz, H2D);
     cudaMemcpy(mix_d, args.mix.data(), size_mix, H2D);
-    cudaMemcpy(irrep_out_d, args.irrep_out.data(), size_irrep, H2D);
     cudaMemcpy(receiver_t_d, args.receiver_t.data(),
                sizeof(int32) * num_edges, H2D);
     cudaMemcpy(sender_ptr_d, args.sender_ptr.data(),
@@ -389,7 +371,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     AdjacencyCSR adj_t = { receiver_t_d, sender_ptr_d };
 
     e3j::Error err = e3j::convolution::launch_bwd<Idx, float>(
-        coef_d, x_d, y_d, dz_d, mix_d, irrep_out_d, adj_t, perm_d,
+        coef_d, x_d, y_d, dz_d, mix_d, adj_t, perm_d,
         dx_d, dy_d, dmix_d,
         p, cudaStream_t(0), DEBUG
     );
@@ -397,7 +379,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     if (err.failure()) {
         printf("Launch error: %s\n", err.message().c_str());
         cudaFree(coef_d); cudaFree(x_d); cudaFree(y_d); cudaFree(dz_d);
-        cudaFree(mix_d); cudaFree(irrep_out_d);
+        cudaFree(mix_d);
         cudaFree(receiver_t_d); cudaFree(sender_ptr_d); cudaFree(perm_d);
         cudaFree(dx_d); cudaFree(dy_d); cudaFree(dmix_d);
         return 1;
@@ -475,7 +457,6 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     cudaFree(y_d);
     cudaFree(dz_d);
     cudaFree(mix_d);
-    cudaFree(irrep_out_d);
     cudaFree(receiver_t_d);
     cudaFree(sender_ptr_d);
     cudaFree(perm_d);

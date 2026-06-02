@@ -11,8 +11,8 @@
 namespace e3j {
 namespace convolution {
 
-using utils::copy;          // LDG + STS mix_idx
-using utils::copy_strided;  // STG summed messages
+using utils::copy;          // STG messages
+using utils::copy_strided;  // STG messages
 using utils::copy_pipe;
 using utils::copy_pipe_strided;
 using utils::wait_pipe;
@@ -31,7 +31,6 @@ struct Buffers {
     CuArray2D<Val> rhs;
     CuArray2D<Val> out;
     CuArray2D<Val> mix;
-    Idx* mix_idx;
 
     static __device__ Buffers init (
         CuArray2D<const Val> x,
@@ -45,7 +44,6 @@ struct Buffers {
             .rhs = { nullptr, y.shape[0], unroll.y },
             .out = { nullptr, z.shape[0], unroll.z },
             .mix = { nullptr, r.shape[0], unroll.z },
-            .mix_idx = nullptr,
         };
     }
 
@@ -59,7 +57,6 @@ struct Buffers {
         rhs.data = lhs.data + (Stages * lhs.size() + A-1) / A * A;
         out.data = rhs.data + (Stages * rhs.size() + A-1) / A * A;
         mix.data = out.data + (Stages * out.size() + A-1) / A * A;
-        mix_idx = reinterpret_cast<Idx*>(mix.data + Stages * mix.size());
     }
 };
 
@@ -267,7 +264,6 @@ __global__ void kernel (
     CuArray2D<const Val> x,
     CuArray2D<const Val> y,
     CuArray2D<const Val> r,
-    const Idx *irrep_out,
     const AdjacencyCSR adj,
     CuArray2D<Val> z,
     int num_nodes,
@@ -307,11 +303,6 @@ __global__ void kernel (
     }
     // Allocate SMEM buffer addresses.
     smem.to_shared(smem_);
-
-    // Load irrep_out into SMEM (constant across edges).
-    // Regular copy — cp.async requires size >= 4 bytes, Idx may be uint8_t.
-    copy(smem.mix_idx, irrep_out, z.shape[0]);
-    __syncthreads();
 
     // Distribute coefficients across blockDim.y, without z-index overlap.
     // Reuses lhs buffer (not yet populated) as int[blockDim.y + 1] scratch.

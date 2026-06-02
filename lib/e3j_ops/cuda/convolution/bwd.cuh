@@ -2,6 +2,7 @@
 #define _E3J_CONVOLUTION_BWD_H_
 
 #include "cuda/convolution.cuh"
+#include "cuda/convolution/fwd.cuh"
 #include "cuda/tensor_product/details.cuh"
 #include "cuda/tensor_product/trailing_channels.cuh"
 #include "cuda/utils.cuh"
@@ -34,15 +35,14 @@ __device__ unsigned int align16(unsigned int n) {
 /*****************************************************************
  *  Buffers for backward convolution:
  *
- *      [ dm | x | y | mix | mix_idx | dx | dy_scratch ]
+ *      [ dm | x | y | mix | dx | dy_scratch ]
  *
  *  - dm:   cotangent receiver messages
  *  - x:    primal node features
  *  - y:    primal edge features
  *  - mix:  edge scalars
- *  - mix_idx:  indices mapping z = (x ⊗ y) coordinates to scalars.
  *  - dx:   cotangent sender message accumulator
- *  - dy_scratch:  cotantent edge features scratch memory (Mode::INNER)
+ *  - dy_scratch:  cotangent edge features scratch memory (Mode::INNER)
  *
  *****************************************************************/
 template <typename Idx, typename Val>
@@ -51,7 +51,6 @@ struct BuffersBwd {
     CuArray2D<Val> x;
     CuArray2D<Val> y;
     CuArray2D<Val> mix;
-    Idx* mix_idx;
     CuArray2D<Val> dx;
     Val* dy_scratch;
 
@@ -67,7 +66,6 @@ struct BuffersBwd {
             .x   = { nullptr, x.shape[0],   unroll.x },
             .y   = { nullptr, y.shape[0],   1u       },
             .mix = { nullptr, mix.shape[0], unroll.z },
-            .mix_idx = nullptr,
             .dx  = { nullptr, x.shape[0],   unroll.x },
             .dy_scratch = nullptr,
         };
@@ -79,106 +77,10 @@ struct BuffersBwd {
         x.data   = dm.data  + align16<Val>(dm.size());
         y.data   = x.data   + align16<Val>(x.size());
         mix.data = y.data   + align16<Val>(y.size());
-        mix_idx  = reinterpret_cast<Idx*>(
-            mix.data + align16<Val>(mix.size())
-        );
-        // Align dvance past mix_idx, re-align to 16 B for dx.
-        // Cotangent buffers
-        dx.data = reinterpret_cast<Val*>(
-            mix_idx + align16<Idx>(dm.shape[0])
-        );
+        dx.data  = mix.data + align16<Val>(mix.size());
         dy_scratch = dx.data + align16<Val>(dx.size());
     }
 };
-
-
-/*****************************************************************
- *  Mix input with scalars in-place.
- *
- *      dm[i, c] *= mix[mix_idx[i], c];
- *
- *  So that dm contains cotangents dz of z = (x ⊗ y).
- *****************************************************************/
-template<typename Idx, typename Val, int N>
-__device__ void mix_(
-    CuArray2D<Val> dm,
-    CuArray2D<Val> mix,
-    const Idx *mix_idx
-) {
-    int channel_offset = threadIdx.x * N;
-    if (channel_offset >= dm.shape[1]) return;
-
-    Vect<N,Val> *dm_lane =
-        reinterpret_cast<Vect<N,Val>*>(dm.data) + threadIdx.x;
-    int stride = dm.shape[1] / N;
-
-    mix.data += channel_offset;
-
-    for (unsigned int i = threadIdx.y; i < dm.shape[0]; i += blockDim.y) {
-        Vect<N,Val> dz_val = dm_lane[i * stride];
-        Vect<N,Val> s_val  = load<N,Val>(
-            &mix.data[mix_idx[i] * mix.shape[1]]
-        );
-        dm_lane[i * stride] = mul<N,Val>(dz_val, s_val);
-    }
-}
-
-
-/*****************************************************************
- *  Cotangent of mixing scalars, fused with tensor product.
- *
- *      dmix[s, c] += sum_{i : mix_idx[i] = s} tij[i, c] * dm[i, c]
- *
- *  where tij[i] = otimes(lhs, rhs)[i] is computed in registers.
- *  Cross-warp accumulation via atomicAdd to GMEM — caller must
- *  zero dmix before the call.
- *****************************************************************/
-template<typename Idx, typename Val, int N>
-__device__ void otimes_mix_reduce(
-    const Coef<Idx,Val> *coef,
-    const CoefRange range,
-    CuArray2D<Val> lhs,
-    CuArray2D<Val> rhs,
-    CuArray2D<Val> dm,
-    const Idx *mix_idx,
-    CuArray2D<Val> dmix
-) {
-    using Coef = Coef<Idx,Val>;
-    using IdxVal = tp::IdxVal<Idx, Val, N>;
-
-    int col = range.begin;
-    Coef c = coef[col];
-    IdxVal zi,
-           acc = {c.i, broadcast<N,Val>(Val(0))};
-
-    int channel_offset = threadIdx.x * N;
-    lhs.data += channel_offset;
-    dm.data  += channel_offset;
-
-    if (channel_offset >= dm.shape[1]) return;
-
-    while (col <= range.end) {
-        zi = tp::accumulate_products<Idx,Val,Mode::OUTER,N>(
-            acc, coef, col, range.end,
-            lhs.data, rhs.data, lhs.shape[1], rhs.shape[1]
-        );
-        Vect<N,Val> prod = mul<N,Val>(
-            zi.val, load<N,Val>(dm.data + zi.i * dm.shape[1])
-        );
-        Val *dst = dmix.data + mix_idx[zi.i] * dmix.shape[1] + channel_offset;
-        if constexpr (N == 1) {
-            atomicAdd(dst, prod);
-        } else if constexpr (N == 2) {
-            atomicAdd(dst,     prod.x);
-            atomicAdd(dst + 1, prod.y);
-        } else {
-            atomicAdd(dst,     prod.x);
-            atomicAdd(dst + 1, prod.y);
-            atomicAdd(dst + 2, prod.z);
-            atomicAdd(dst + 3, prod.w);
-        }
-    }
-}
 
 
 /*****************************************************************
@@ -190,18 +92,25 @@ __device__ void otimes_mix_reduce(
  *      store per sender — no atomics
  *    - dy written per-edge to GMEM (INNER warp reduction)
  *
- *  Coefficients are packed as [coef_dx | coef_dy] (2 x num_coef).
- *    coef_dx = (j, i, k) sorted by j  →  otimes<OUTER>
- *    coef_dy = (k, i, j) sorted by k  →  otimes<INNER>
+ *  Coefficients in 4D COO format are packed in three orderings:
+ *      [coef_dmix | coef_dx | coef_dy]
+ *
+ *  Given forward coefficients indices (i, j, k, l) for (m, x, s, y)
+ *  the orderings should always keep the broadcasted operand y last,
+ *  and keep dm first by convention:
+ *
+ *   - coef_dmix :  {val, k, i, j, l}  for bigotimes(dm, x, y)
+ *   - coef_dx :    {val, j, i, k, l}  for bigotimes(dm, s, y)
+ *   - coef_dy :    {val, l, i, k, j}  for bigotimes(dm, s, x)
+ *
  *****************************************************************/
 template <typename Idx, typename Val, int N=1>
 __global__ void kernel_bwd (
-    const Coef<Idx, Val> *coef,
+    const Coef4D<Idx, Val> *coef,
     CuArray2D<const Val> x,
     CuArray2D<const Val> y,
     CuArray2D<const Val> dm,
     CuArray2D<const Val> mix,
-    const Idx *irrep_out,
     const AdjacencyCSR adj,
     const int32_t *edge_perm,
     Val *gmem_dx,
@@ -212,7 +121,7 @@ __global__ void kernel_bwd (
     dim3 unroll
 ) {
 
-    using Coef = Coef<Idx,Val>;
+    using Coef = Coef4D<Idx,Val>;
 
     int size_x   = x.size();
     int size_y   = y.size();
@@ -242,33 +151,19 @@ __global__ void kernel_bwd (
     }
     smem.to_shared(smem_);
 
-    // TODO: pass 3 coefficients from FFI (instead of 2 currently)
-    //       computing dmix requires the forward pass coefficients
     const Coef *coef_dx = coef + num_coef;
     const Coef *coef_dy = coef + 2 * num_coef;
 
-    // Load irrep_out → mix_idx (constant across edges).
-    copy(smem.mix_idx, irrep_out, dm.shape[0]);
-    __syncthreads();
-
     // Partition coefficients across blockDim.y
     int *smem_cuts = reinterpret_cast<int*>(smem.dm.data);
-    CoefRange range_fwd = find_coef_bounds<Idx, Val>(
-        smem_cuts, coef, num_coef, dm.shape[0]
+    CoefRange range_dmix = find_coef_bounds<Idx, Val, Coef4D>(
+        smem_cuts, coef, num_coef, mix.shape[0]
     );
-    CoefRange range_dx = find_coef_bounds<Idx, Val>(
+    CoefRange range_dx = find_coef_bounds<Idx, Val, Coef4D>(
         smem_cuts, coef_dx, num_coef, x.shape[0]
     );
-    CoefRange range_dy = find_coef_bounds<Idx, Val>(
+    CoefRange range_dy = find_coef_bounds<Idx, Val, Coef4D>(
         smem_cuts, coef_dy, num_coef, num_y
-    );
-
-    // Channel mappings for OUTER dx and INNER dy.
-    tp::Channels k_dx = tp::Channels::get<Mode::OUTER, N>(
-        threadIdx.x, smem.dm.shape[1], smem.y.shape[1], smem.dx.shape[1]
-    );
-    tp::Channels k_dy = tp::Channels::get<Mode::INNER, N>(
-        threadIdx.x, smem.dm.shape[1], smem.x.shape[1], smem.dm.shape[1]
     );
 
     // Dummy view: only shape[0] = num_y is used (scratch indexing).
@@ -328,42 +223,35 @@ __global__ void kernel_bwd (
             __pipeline_commit();
             wait_pipe();
 
-            // Zero dmix for this edge, then compute in registers.
+            // Edge scalar cotangents
             int dmix_edge_size = mix.shape[0] * dm.shape[1];
-            if (s == 0)
-                fill<N>(gmem_dmix + edge_t * dmix_edge_size, Val(0), dmix_edge_size);
-            __syncthreads();
-
-            // dmix[s,c] = sum_{i : mix_idx[i]=s} otimes(x,y)[i,c] * dm[i,c]
             CuArray2D<Val> dmix_view = {
                 dmix_s + edge_t * dmix_edge_size, mix.shape[0], dm.shape[1]
             };
-            otimes_mix_reduce<Idx, Val, N>(
-                coef, range_fwd,
-                smem.x, smem.y, smem.dm, smem.mix_idx, dmix_view
+
+            bigotimes<Idx,Val,Mode::OUTER,N,false>(
+                coef, range_dmix,
+                smem.dm, smem.x, smem.y,
+                dmix_view, nullptr
             );
             __syncthreads();
 
-            // Cotangent receiver message: dm = mix * dz (in-place).
-            mix_<Idx, Val, N>(smem.dm, smem.mix, smem.mix_idx);
-            __syncthreads();
-
-            // dx[sender] += sum_c coef_dx.val * dm[i,ch] * y[k]
-            tp::otimes<Idx, Val, Mode::OUTER, N, true>(
+            // Sender feature cotangents
+            bigotimes<Idx,Val,Mode::OUTER,N,true>(
                 coef_dx, range_dx,
-                smem.dm, smem.y, smem.dx,
-                k_dx, nullptr
+                smem.dm, smem.mix, smem.y,
+                smem.dx, nullptr
             );
 
             // Prepare dy scratch for INNER warp reduction.
             fill(smem.dy_scratch, Val(0), num_warps * num_y);
             __syncthreads();
 
-            // dy[edge,k] = sum_ch sum_c coef_dy.val * dm[i,ch] * x[j,ch]
-            tp::otimes<Idx, Val, Mode::INNER, N, true>(
+            // Edge feature cotangents
+            bigotimes<Idx,Val,Mode::INNER,N,true>(
                 coef_dy, range_dy,
-                smem.dm, smem.x, dy_view,
-                k_dy, smem.dy_scratch
+                smem.dm, smem.mix, smem.x,
+                dy_view, smem.dy_scratch
             );
             __syncthreads();
 
@@ -379,6 +267,7 @@ __global__ void kernel_bwd (
                         gmem_dy[edge_t * num_y + i] += sum;
                 }
             }
+            __syncthreads();
 
         }//=== Edge loop ===
 
