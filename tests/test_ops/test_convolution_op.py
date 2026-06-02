@@ -6,7 +6,7 @@ import pytest
 from jax import Array
 
 import e3j
-from e3j.ops.coef import Coef
+from e3j.ops.coef import Coef4D
 from e3j.ops.convolution import ConvolutionParams, convolution
 from e3j.utils.sparse import narrow_index_dtype
 
@@ -22,9 +22,9 @@ np.set_printoptions(
 )
 
 
-def pack_coef(val, idx, val_dtype="float32", idx_dtype="int32"):
-    """Pack (nnz,) values + (3, nnz) COO indices into an opaque JAX array."""
-    return Coef(val, idx.T, val_dtype=val_dtype, idx_dtype=idx_dtype).pack_jax()
+def pack_coef4d(val, idx4, val_dtype="float32", idx_dtype="int32"):
+    """Pack (nnz,) values + (4, nnz) COO indices into an opaque JAX array."""
+    return Coef4D(val, idx4.T, val_dtype=val_dtype, idx_dtype=idx_dtype).pack_jax()
 
 
 def assert_allclose(expect, result, rtol=5e-6, atol=5e-6, debug: int = 1):
@@ -108,7 +108,10 @@ class _TestConvolutionOp:
         idx = idx.astype(narrow_index_dtype((nz, nx, ny)))
         val = random.normal(next(keys), (nnz,))
 
-        s_index = np.sort(random.randint(next(keys), (nz,), 0, ns))
+        s_index = np.concat(
+            (np.arange(ns), random.randint(next(keys), (nz - ns,), 0, ns))
+        )
+        s_index = np.sort(s_index)
         params = ConvolutionParams(num_out=nz, num_scalars=ns)
 
         return idx, val, s_index, params
@@ -151,13 +154,13 @@ class _TestConvolutionOp:
     def fwd_op(self):
         idx, val, s_index, params = self.closure()
         sender, receiver = self.graph()
-        coef = pack_coef(val, idx)
+        idx4 = np.stack([idx[0], idx[1], s_index[idx[0]], idx[2]])
+        coef = pack_coef4d(val, idx4)
         return lambda x, y, s: convolution(
             coef,
             x,
             y,
             s,
-            s_index,
             sender,
             receiver,
             params,

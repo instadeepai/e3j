@@ -23,7 +23,6 @@ using e3j::convolution::AdjacencyCSR;
 using e3j::convolution::Coef4D;
 using e3j::convolution::otimes_mix_coefficients;
 using e3j::tensor_product::Coef;
-using e3j::tensor_product::Layout;
 
 using vec::Vec;
 using int32 = std::int32_t;
@@ -109,7 +108,6 @@ struct ConvArgs {
     Vec<float> x;
     Vec<float> y;
     Vec<float> r;
-    Vec<Idx> irrep_out;
     Vec<int32> sender;
     Vec<int32> receiver_ptr;
     Vec<float> out;
@@ -197,7 +195,6 @@ ConvArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
         .x = x,
         .y = y,
         .r = r,
-        .irrep_out = irrep_out,
         .sender = sender,
         .receiver_ptr = receiver_ptr,
         .out = out,
@@ -229,19 +226,16 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     size_t size_x      = sizeof(float) * p.num_nodes * p.num_x * p.channels_x;
     size_t size_y      = sizeof(float) * num_edges * p.num_y;
     size_t size_r      = sizeof(float) * num_edges * p.num_scalars * p.channels_x;
-    size_t size_irrep  = sizeof(Idx) * p.num_out;
     size_t size_out    = sizeof(float) * p.num_nodes * p.num_out * p.channels_x;
 
     CoefT *coef_d;
     float *x_d, *y_d, *r_d, *out_d;
-    Idx *irrep_out_d;
     int32 *sender_d, *receiver_ptr_d;
 
     cudaMalloc((void**)&coef_d, size_coef);
     cudaMalloc((void**)&x_d, size_x);
     cudaMalloc((void**)&y_d, size_y);
     cudaMalloc((void**)&r_d, size_r);
-    cudaMalloc((void**)&irrep_out_d, size_irrep);
     cudaMalloc((void**)&sender_d, sizeof(int32) * num_edges);
     cudaMalloc((void**)&receiver_ptr_d, sizeof(int32) * (p.num_nodes + 1));
     cudaMalloc((void**)&out_d, size_out);
@@ -250,7 +244,6 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     cudaMemcpy(x_d, args.x.data(), size_x, H2D);
     cudaMemcpy(y_d, args.y.data(), size_y, H2D);
     cudaMemcpy(r_d, args.r.data(), size_r, H2D);
-    cudaMemcpy(irrep_out_d, args.irrep_out.data(), size_irrep, H2D);
     cudaMemcpy(sender_d, args.sender.data(), sizeof(int32) * num_edges, H2D);
     cudaMemcpy(receiver_ptr_d, args.receiver_ptr.data(),
                sizeof(int32) * (p.num_nodes + 1), H2D);
@@ -263,15 +256,14 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     AdjacencyCSR adj = { sender_d, receiver_ptr_d };
 
     e3j::Error err = e3j::convolution::launch<Idx, float>(
-        coef_d, x_d, y_d, r_d, irrep_out_d, adj, out_d,
+        coef_d, x_d, y_d, r_d, adj, out_d,
         p, cudaStream_t(0), DEBUG
     );
 
     if (err.failure()) {
         printf("Launch error: %s\n", err.message().c_str());
         cudaFree(coef_d); cudaFree(x_d); cudaFree(y_d); cudaFree(r_d);
-        cudaFree(irrep_out_d); cudaFree(sender_d); cudaFree(receiver_ptr_d);
-        cudaFree(out_d);
+        cudaFree(sender_d); cudaFree(receiver_ptr_d); cudaFree(out_d);
         return 1;
     }
 
@@ -300,7 +292,6 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     cudaFree(x_d);
     cudaFree(y_d);
     cudaFree(r_d);
-    cudaFree(irrep_out_d);
     cudaFree(sender_d);
     cudaFree(receiver_ptr_d);
     cudaFree(out_d);
