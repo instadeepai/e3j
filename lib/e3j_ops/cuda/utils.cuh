@@ -229,12 +229,11 @@ __device__ void copy_strided(
     T* dst,
     const T* src,
     const int num_rows,
-    const int width,
-    const int stride_dst,
-    const int stride_src
+    const int stride,
+    const int width
 ) {
     for (int r = threadIdx.y; r < num_rows; r += blockDim.y) {
-        copy(&dst[r * stride_dst], &src[r * stride_src], width);
+        copy(&dst[r * stride], &src[r * width], width);
     }
 }
 
