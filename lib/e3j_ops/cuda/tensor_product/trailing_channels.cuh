@@ -30,7 +30,6 @@ namespace tensor_product {
 namespace trailing_channels {
 
     using utils::copy_pipe;
-    using utils::copy_pipe_strided;
     using utils::wait_pipe;
     using utils::fill;
     using utils::DeviceProperties;
@@ -385,7 +384,6 @@ __global__ void kernel(
     constexpr bool accumulate = (kMode == Mode::INNER) && strided;
 
     // Shared memory layout: [ coef | x | y | z ]
-    // smem_base is 16-byte aligned (hardware guarantee ≥128 B).
     extern __shared__ __align__(16) char smem__[];
     char* smem_ = reinterpret_cast<char*>(smem__);
     Buffers smem = Buffers::init(x, y, z, unroll);
@@ -442,23 +440,11 @@ __global__ void kernel(
         for (int s = 0; s < num_strides; s++) {
 
             // Load x and y into SMEM via pipeline primitives (LDGSTS).
-            if (x.shape[1] > unroll.x)
-                copy_pipe_strided(smem.lhs.data, x_s.data, num_x, unroll.x, x.shape[1]);
+            smem.lhs.load<N>(x_s);
+            if constexpr (kMode == Mode::OUTER)
+                smem.rhs.load<1>(y_s);
             else
-                copy_pipe<N>(smem.lhs.data, x_s.data, smem.lhs.size());
-
-            if (y.shape[1] > unroll.y)
-                copy_pipe_strided(smem.rhs.data, y_s.data, num_y, unroll.y, y.shape[1]);
-            else if constexpr (N > 1) {
-                // Vectorized copy requires the source to be N*sizeof(T)-byte aligned.
-                // The per-block y pointer advances by num_y*channels_y floats, so
-                // alignment is preserved only when that stride is a multiple of N.
-                if (smem.rhs.size() % N == 0)
-                    copy_pipe<N>(smem.rhs.data, y_s.data, smem.rhs.size());
-                else
-                    copy_pipe<1>(smem.rhs.data, y_s.data, smem.rhs.size());
-            } else
-                copy_pipe<1>(smem.rhs.data, y_s.data, smem.rhs.size());
+                smem.rhs.load<N>(y_s);
 
             __pipeline_commit();
             wait_pipe();
