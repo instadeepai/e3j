@@ -186,7 +186,7 @@ __global__ void kernel_bwd (
         CuArray2D<const Val> x_s   = { x.data,   x.shape[0],   x.shape[1] };
         CuArray2D<const Val> dm_s  = { dm.data,  dm.shape[0],  dm.shape[1] };
         CuArray2D<const Val> mix_s = { mix.data, mix.shape[0], mix.shape[1] };
-        Val *dx_out_s = gmem_dx;
+        CuArray2D<Val> dx_out_s    = { gmem_dx,  x.shape[0],   x.shape[1] };
         Val *dmix_s   = gmem_dmix;
 
         for (int s = 0; s < num_strides; s++) {
@@ -195,13 +195,10 @@ __global__ void kernel_bwd (
         fill(smem.dx.data, Val(0), smem.dx.size());
 
         // Load x[sender] to smem.x (constant across edges from sender).
-        if (x.shape[1] > unroll.x)
-            copy_pipe_strided(smem.x.data, x_s.data + sender * size_x,
-                              x.shape[0], unroll.x, x.shape[1]);
-        else
-            copy_pipe<N>(smem.x.data, x_s.data + sender * size_x, smem.x.size());
+        smem.x.load<N>(x_s, sender);
+
         __pipeline_commit();
-        wait_pipe();
+        wait_pipe<0>();
 
         for (int edge = first_edge; edge < last_edge; edge++) {
 
@@ -209,19 +206,12 @@ __global__ void kernel_bwd (
             int recv = adj.sender[edge];
 
             // Load dm[recv], y[edge_t], mix[edge_t]
-            if (dm.shape[1] > unroll.z)
-                copy_pipe_strided(smem.dm.data, dm_s.data + recv * size_dm,
-                                  dm.shape[0], unroll.z, dm.shape[1]);
-            else
-                copy_pipe<N>(smem.dm.data, dm_s.data + recv * size_dm, smem.dm.size());
-            copy_pipe<1>(smem.y.data, y.data + edge_t * size_y, size_y);
-            if (mix.shape[1] > unroll.z)
-                copy_pipe_strided(smem.mix.data, mix_s.data + edge_t * size_mix,
-                                  mix.shape[0], unroll.z, mix.shape[1]);
-            else
-                copy_pipe<N>(smem.mix.data, mix_s.data + edge_t * size_mix, smem.mix.size());
+            smem.dm.load<N>(dm_s, recv);
+            smem.y.load<1>(y, edge_t);
+            smem.mix.load<N>(mix_s, edge_t);
+
             __pipeline_commit();
-            wait_pipe();
+            wait_pipe<0>();
 
             // Edge scalar cotangents
             int dmix_edge_size = mix.shape[0] * dm.shape[1];
@@ -272,17 +262,12 @@ __global__ void kernel_bwd (
         }//=== Edge loop ===
 
         // Store sender cotangent
-        if (x.shape[1] > unroll.x)
-            copy_strided(dx_out_s + sender * size_x, smem.dx.data,
-                         x.shape[0], smem.dx.shape[1], x.shape[1], smem.dx.shape[1]);
-        else
-            copy(dx_out_s + sender * size_x, smem.dx.data, smem.dx.size());
-        __syncthreads();
+        smem.dx.store(dx_out_s, sender);
 
         // Advance to next channel slice.
         if (x.shape[1]  > unroll.x) {
             x_s.data  += unroll.x;
-            dx_out_s += unroll.x;
+            dx_out_s.data += unroll.x;
         }
         if (dm.shape[1] > unroll.z) {
             dm_s.data += unroll.z;

@@ -263,14 +263,16 @@ __global__ void kernel (
     const Coef4D<Idx, Val> *coef,
     CuArray2D<const Val> x,
     CuArray2D<const Val> y,
-    CuArray2D<const Val> r,
+    CuArray2D<const Val> s,
     const AdjacencyCSR adj,
     CuArray2D<Val> z,
     int num_nodes,
     int num_coef,
     dim3 unroll
 ) {
-
+    // NOTE: forward coefficients for (x, s, y) trilinear mixing!
+    //  - bigotimes requires broadcast operand y to come last
+    //  - public convolution API in terms of (x, y, s).
     using Coef = Coef4D<Idx,Val>;
 
     int size_x = x.size();
@@ -284,7 +286,7 @@ __global__ void kernel (
     extern __shared__ __align__(16) char smem__[];
     char* smem_ = reinterpret_cast<char*>(smem__);
     Buffers<Idx, Val> smem = Buffers<Idx, Val>::init(
-        x, y, z, r, unroll
+        x, y, z, s, unroll
     );
 
     if (BUFFER_CONV_FWD_COEFS_IN_SMEM) {
@@ -317,12 +319,12 @@ __global__ void kernel (
     for (unsigned int receiver = blockIdx.x; receiver < num_nodes; receiver += gridDim.x) {
 
         // Stride-local GMEM views, advanced per channel slice.
-        CuArray2D<const Val> x_s = { x.data, x.shape[0], x.shape[1] };
-        CuArray2D<const Val> r_s = { r.data, r.shape[0], r.shape[1] };
-        CuArray2D<Val> z_s = { z.data, z.shape[0], z.shape[1] };
+        CuArray2D<const Val> x_ = { x.data, x.shape[0], x.shape[1] };
+        CuArray2D<const Val> s_ = { s.data, s.shape[0], s.shape[1] };
+        CuArray2D<Val> z_ = { z.data, z.shape[0], z.shape[1] };
 
         //=== Channel stride loop ===
-        for (int s = 0; s < num_strides; s++) {
+        for (int c = 0; c < num_strides; c++) {
 
             // Zero the SMEM accumulator for this channel slice.
             fill(smem.out.data, Val(0), smem.out.size());
@@ -336,24 +338,9 @@ __global__ void kernel (
                 int sender = adj.sender[edge];
 
                 // Load sender features, edge embeddings, and radial scalars.
-                if (x.shape[1] > unroll.x)
-                    copy_pipe_strided(
-                        smem.lhs.data, x_s.data + (sender * size_x),
-                        x.shape[0], unroll.x, x.shape[1]
-                    );
-                else
-                    copy_pipe<N>(smem.lhs.data, x_s.data + (sender * size_x), smem.lhs.size());
-
-                // y has no channel dimension (channels_y = 1), never strided.
-                copy_pipe<1>(smem.rhs.data, y.data + (edge * size_y), size_y);
-
-                if (r.shape[1] > unroll.z)
-                    copy_pipe_strided(
-                        smem.mix.data, r_s.data + (edge * r.size()),
-                        r.shape[0], unroll.z, r.shape[1]
-                    );
-                else
-                    copy_pipe<N>(smem.mix.data, r_s.data + (edge * r.size()), smem.mix.size());
+                smem.lhs.load<N>(x_, sender);
+                smem.rhs.load<1>(y, edge);
+                smem.mix.load<N>(s_, edge);
 
                 __pipeline_commit();
                 wait_pipe();
@@ -368,20 +355,13 @@ __global__ void kernel (
             }
 
             // Store aggregated output to GMEM once per receiver.
-            if (z.shape[1] > unroll.z)
-                copy_strided(
-                    z_s.data, smem.out.data,
-                    z.shape[0], smem.out.shape[1],
-                    z.shape[1], smem.out.shape[1]
-                );
-            else
-                copy(z_s.data, smem.out.data, smem.out.size());
+            smem.out.store(z_);
             __syncthreads();
 
             // Advance to next channel slice (y is never strided).
-            if (x.shape[1] > unroll.x) x_s.data += unroll.x;
-            if (z.shape[1] > unroll.z) z_s.data += unroll.z;
-            if (r.shape[1] > unroll.z) r_s.data += unroll.z;
+            if (x.shape[1] > unroll.x) x_.data += unroll.x;
+            if (z.shape[1] > unroll.z) z_.data += unroll.z;
+            if (s.shape[1] > unroll.z) s_.data += unroll.z;
 
         }//=== Channel stride loop ===
 
