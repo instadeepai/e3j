@@ -71,6 +71,15 @@ struct CuArray2D {
             );
     }
 
+    // Load a 2D-row from GMEM pointer and restore initial state.
+    // Mostly useful for random accesses (e.g. message-passing).
+    template<int N=1>
+    __device__ void load(CuArray2D<const T> &src, unsigned int row) {
+        src.data += row * src.size();
+        load<N>(src);
+        src.data -= row * src.size();
+    }
+
     // Store a 2D array to global memory (inline copy with striding support).
     __device__ void store(CuArray2D<T> dst) {
         if (shape[1] == dst.shape[1])
@@ -81,6 +90,14 @@ struct CuArray2D {
             utils::copy_strided(
                 dst.data, data, shape[0], dst.shape[1], shape[1]
             );
+    }
+
+    // Store a 2D-row to GMEM pointer and restore initial state.
+    // Mostly useful for random accesses (e.g. message-passing).
+    __device__ void store(CuArray2D<T> &dst, unsigned int row) {
+        dst.data += row * dst.size();
+        store(dst);
+        dst.data -= row * dst.size();
     }
 
 };
