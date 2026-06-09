@@ -181,6 +181,31 @@ def tensor_product(
     return _tensor_product_impl(coef, x, y)
 
 
+def _zero_gap_rows(grad: Array, written: np.ndarray, layout: Layout) -> Array:
+    """Zero ``grad`` rows the fused kernel skipped (coords absent from ``written``).
+
+    The backward kernel only writes output coordinates that appear in the
+    coefficients -- ``written`` is the set of coordinates this pass writes (column
+    0 of the transposed coef). Input coordinates with no surviving coupling, common
+    once the forward output is truncated (e.g. symmetric contraction in MAP mode),
+    are skipped, so the freshly allocated ``grad`` reads back as uninitialized
+    memory (garbage / NaN) there. Their gradient is exactly 0, so we overwrite
+    those rows -- matching the SPARSE/DENSE autodiff gradients.
+
+    ``written`` is a concrete numpy array (extracted inside ensure_compile_time_eval),
+    so this lowers to a constant-index scatter XLA applies in place over only the gap
+    rows -- not a full-buffer pass. The coordinate (lm) axis is last, unless a channel
+    axis trails it (trailing channels), as in `TensorProduct.sparse_eval`.
+    """
+    channels_trail = layout == Layout.TRAILING_CHANNELS and grad.ndim > 2
+    n_coords = grad.shape[-2 if channels_trail else -1]
+    gaps = sorted(set(range(n_coords)) - set(written.flat))
+    if not gaps:
+        return grad
+    g = jnp.asarray(gaps)
+    return (grad.at[..., g, :] if channels_trail else grad.at[..., g]).set(0.0)
+
+
 @partial(custom_vjp, nondiff_argnums=(0, 4))
 def tensor_product_bwd(
     coef: Array,
@@ -199,12 +224,16 @@ def tensor_product_bwd(
     mode = TPMode.parse(params.mode)
     layout = Layout.parse(params.layout)
 
-    # Prepare transposed indices and concatenate two backward arrays
+    # Prepare transposed indices and concatenate two backward arrays.
+    # coef_xzy / coef_yzx are the dx / dy passes; their column 0 (the output
+    # index) is the set of coordinates each pass writes -- used to zero gaps.
     with jax.ensure_compile_time_eval():
         c = Coef.unpack(coef, val_dtype="float32")
         coef_xzy = c.transpose((1, 0, 2))
         coef_yzx = c.transpose((2, 0, 1))
         coef_bwd = jnp.stack([coef_xzy.pack_jax(), coef_yzx.pack_jax()])
+        written_x = np.asarray(coef_xzy.idx[:, 0])
+        written_y = np.asarray(coef_yzx.idx[:, 0])
 
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
@@ -294,7 +323,10 @@ def tensor_product_bwd(
         ct_y = ct_y.reshape((axis_size, num_rows) + ct_y.shape[1:])
         return (ct_x, ct_y), (True, True)
 
-    return _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+    ct_x, ct_y = _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+    ct_x = _zero_gap_rows(ct_x, written_x, layout)
+    ct_y = _zero_gap_rows(ct_y, written_y, layout)
+    return ct_x, ct_y
 
 
 # --- AD Rules for TP forward ---
