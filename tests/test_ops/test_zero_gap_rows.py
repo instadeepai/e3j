@@ -56,7 +56,7 @@ def assert_allclose(expect, result, rtol=5e-6, atol=5e-6, debug: int = 1):
 
 
 def tensor_product_reference(
-    idx, coef, x, y, num_out, mode="OUTER", layout="TRAILING_CHANNELS"
+    idx, coef, x, y, num_out, mode="OUTER", layout="LEADING_CHANNELS"
 ):
     """Reference tensor_product (pure scatter-add; naturally zeros gap rows)."""
     if layout == "TRAILING_CHANNELS":
@@ -139,8 +139,12 @@ class _TestGapRows:
         n = self.num_rows
         nx, ny = self.num_x, self.num_y
         cx, cy = self.channels_x, self.channels_y
-        shape_x = (n, nx) if cx is None else (n, nx, cx)
-        shape_y = (n, ny) if cy is None else (n, ny, cy)
+        if self.layout == "LEADING_CHANNELS":
+            shape_x = (n, nx) if cx is None else (n, cx, nx)
+            shape_y = (n, ny) if cy is None else (n, cy, ny)
+        else:
+            shape_x = (n, nx) if cx is None else (n, nx, cx)
+            shape_y = (n, ny) if cy is None else (n, ny, cy)
         keys = (k for k in random.split(random.key(123), 2))
         x = random.normal(next(keys), shape_x)
         y = random.normal(next(keys), shape_y)
@@ -166,3 +170,10 @@ class TestGapRowsMAP(_TestGapRows):
     mode = "MAP"
     channels_x = 32
     channels_y = 32
+
+
+class TestGapRowsOUTERLeading(_TestGapRows):
+    layout = "LEADING_CHANNELS"
+    mode = "OUTER"
+    channels_x = 32
+    channels_y = None
