@@ -182,20 +182,11 @@ def tensor_product(
 
 
 def _zero_gap_rows(grad: Array, written: np.ndarray, layout: Layout) -> Array:
-    """Zero ``grad`` rows the fused kernel skipped (coords absent from ``written``).
+    """Zero ``grad`` rows skipped by the fused backward kernel.
 
-    The backward kernel only writes output coordinates that appear in the
-    coefficients -- ``written`` is the set of coordinates this pass writes (column
-    0 of the transposed coef). Input coordinates with no surviving coupling, common
-    once the forward output is truncated (e.g. symmetric contraction in MAP mode),
-    are skipped, so the freshly allocated ``grad`` reads back as uninitialized
-    memory (garbage / NaN) there. Their gradient is exactly 0, so we overwrite
-    those rows -- matching the SPARSE/DENSE autodiff gradients.
-
-    ``written`` is a concrete numpy array (extracted inside ensure_compile_time_eval),
-    so this lowers to a constant-index scatter XLA applies in place over only the gap
-    rows -- not a full-buffer pass. The coordinate (lm) axis is last, unless a channel
-    axis trails it (trailing channels), as in `TensorProduct.sparse_eval`.
+    Only coordinates present in ``written`` are written by the backward pass;
+    the rest retain uninitialized memory. Their gradient is exactly zero, so we
+    zero them explicitly to match SPARSE/DENSE autodiff.
     """
     channels_trail = layout == Layout.TRAILING_CHANNELS and grad.ndim > 2
     n_coords = grad.shape[-2 if channels_trail else -1]
