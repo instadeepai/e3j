@@ -872,7 +872,7 @@ wheels = [
 
 [[package]]
 name = "e3j"
-version = "0.1.0b2"
+version = "0.1.0b3"
 source = { editable = "." }
 dependencies = [
     { name = "e3nn-jax" },
@@ -1040,7 +1040,7 @@ tensorboard = [
 
 [[package]]
 name = "e3j-ops"
-version = "0.1.0b2"
+version = "0.1.0b3"
 source = { editable = "lib/e3j_ops" }
 
 [[package]]

@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [0.1.0b3] — 2026-06-10
+
+### Fixed
+
+- Fused tensor product backward (`tensor_product_bwd()`) left gradient rows for
+  uncoupled input coordinates uninitialized (garbage / NaN) instead of zero. The
+  kernel only writes coordinates present in the Clebsch-Gordan coefficients, so
+  coordinates absent from them — common when the forward output is truncated,
+  e.g. symmetric contraction in MAP mode — were never written, diverging from the
+  SPARSE/DENSE autodiff gradients. Those rows are now zeroed explicitly after the
+  kernel.
+
+### Changed
+
+- Tensor product forward and backward CUDA kernels now share a single
+  `CuArray2D.load()` / `.store()` abstraction for global↔shared memory copies,
+  replacing the per-operand branching between contiguous and strided variants.
+  Loads use LDGSTS (asynchronous copy via pipeline primitives) and stride through
+  source channels automatically when they exceed the shared-memory budget.
+
 ## [0.1.0b2] — 2026-05-28
 
 ### Added
