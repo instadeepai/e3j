@@ -35,10 +35,8 @@ namespace tensor_product {
 
 namespace trailing_channels {
 
-using utils::copy;
 using utils::wait_pipe;
 using utils::copy_pipe;
-using utils::copy_pipe_strided;
 using utils::fill;
 using utils::DeviceProperties;
 
@@ -176,39 +174,27 @@ __global__ void kernel_bwd(
         //=== Channel stride loop ===
         for (int s = 0; s < num_strides; s++) {
 
-            // Load dz and y — needed by the dx pass.
-            // Broadcast operands (n_channels <= unroll) are contiguous:
-            // use copy_pipe<1> to avoid 16 B alignment requirement.
-            if (cz > unroll.z)
-                copy_pipe_strided(smem.dz.data, dz_s.data, dz.shape[0], unroll.z, cz);
-            else
-                copy_pipe<N>(smem.dz.data, dz_s.data, smem.dz.size());
-
-            if (cy > unroll.y)
-                copy_pipe_strided(smem.y.data, y_s.data, y.shape[0], unroll.y, cy);
-            else
-                copy_pipe<1>(smem.y.data, y_s.data, smem.y.size());
+            // Load dz and y
+            smem.dz.load<N>(dz_s);
+            smem.y.load<1>(y_s);
             __pipeline_commit();
 
-            // Issue x load — overlaps with the dx otimes below.
-            if (cx > unroll.x)
-                copy_pipe_strided(smem.x.data, x_s.data, x.shape[0], unroll.x, cx);
-            else
-                copy_pipe<N>(smem.x.data, x_s.data, smem.x.size());
+            // Issue x load
+            smem.x.load<N>(x_s);
             __pipeline_commit();
 
-            // Drain dz + y (pipeline group 0).
+            // Drain dz + y
             wait_pipe<1>();
 
-            // Compute dx: reads dz + y (complete), does not touch smem.x.
+            // Compute dx = otimes(dz, y)
             otimes<Idx,Val,dxMode, N, inner_dx>(
                 coef_dx, coef_range_dx, smem.dz, smem.y, dx_s, k_dx, smem.dxy
             );
 
-            // Drain x (pipeline group 1).
+            // Drain x
             wait_pipe();
 
-            // Compute dy: reads dz + x (now complete).
+            // Compute dy = otimes(dz, x)
             otimes<Idx,Val,dyMode, N, inner_dy>(
                 coef_dy, coef_range_dy, smem.dz, smem.x, dy_s, k_dy, smem.dxy
             );
@@ -224,7 +210,7 @@ __global__ void kernel_bwd(
 
         }//=== Channel stride loop ===
 
-        // Flush INNER scratch to GMEM after all strides
+        // Reduce INNER output buffers before STG
         if constexpr (inner_dx) {
             for (unsigned int i = threadIdx.x; i < dx.shape[0]; i += blockDim.x) {
                 Val sum = 0;

@@ -188,9 +188,9 @@ template <typename T>
 __device__ void copy_pipe_strided (
     T* dst,
     const T* src,
-    const int num_rows,
-    const int width,
-    const int stride
+    unsigned int num_rows,
+    unsigned int width,
+    unsigned int stride
 ) {
     constexpr int CHUNK = 16 / sizeof(T);
     int tid = threadIdx.x + threadIdx.y * blockDim.x;
@@ -229,12 +229,11 @@ __device__ void copy_strided(
     T* dst,
     const T* src,
     const int num_rows,
-    const int width,
-    const int stride_dst,
-    const int stride_src
+    const int stride,
+    const int width
 ) {
     for (int r = threadIdx.y; r < num_rows; r += blockDim.y) {
-        copy(&dst[r * stride_dst], &src[r * stride_src], width);
+        copy(&dst[r * stride], &src[r * width], width);
     }
 }
 

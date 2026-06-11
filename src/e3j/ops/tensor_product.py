@@ -181,6 +181,22 @@ def tensor_product(
     return _tensor_product_impl(coef, x, y)
 
 
+def _zero_gap_rows(grad: Array, written: np.ndarray, layout: Layout) -> Array:
+    """Zero ``grad`` rows skipped by the fused backward kernel.
+
+    Only coordinates present in ``written`` are written by the backward pass;
+    the rest retain uninitialized memory. Their gradient is exactly zero, so we
+    zero them explicitly to match SPARSE/DENSE autodiff.
+    """
+    channels_trail = layout == Layout.TRAILING_CHANNELS and grad.ndim > 2
+    n_coords = grad.shape[-2 if channels_trail else -1]
+    gaps = sorted(set(range(n_coords)) - set(written.flat))
+    if not gaps:
+        return grad
+    g = jnp.asarray(gaps)
+    return (grad.at[..., g, :] if channels_trail else grad.at[..., g]).set(0.0)
+
+
 @partial(custom_vjp, nondiff_argnums=(0, 4))
 def tensor_product_bwd(
     coef: Array,
@@ -199,12 +215,16 @@ def tensor_product_bwd(
     mode = TPMode.parse(params.mode)
     layout = Layout.parse(params.layout)
 
-    # Prepare transposed indices and concatenate two backward arrays
+    # Prepare transposed indices and concatenate two backward arrays.
+    # coef_xzy / coef_yzx are the dx / dy passes; their column 0 (the output
+    # index) is the set of coordinates each pass writes -- used to zero gaps.
     with jax.ensure_compile_time_eval():
         c = Coef.unpack(coef, val_dtype="float32")
         coef_xzy = c.transpose((1, 0, 2))
         coef_yzx = c.transpose((2, 0, 1))
         coef_bwd = jnp.stack([coef_xzy.pack_jax(), coef_yzx.pack_jax()])
+        written_x = np.asarray(coef_xzy.idx[:, 0])
+        written_y = np.asarray(coef_yzx.idx[:, 0])
 
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
@@ -294,7 +314,10 @@ def tensor_product_bwd(
         ct_y = ct_y.reshape((axis_size, num_rows) + ct_y.shape[1:])
         return (ct_x, ct_y), (True, True)
 
-    return _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+    ct_x, ct_y = _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+    ct_x = _zero_gap_rows(ct_x, written_x, layout)
+    ct_y = _zero_gap_rows(ct_y, written_y, layout)
+    return ct_x, ct_y
 
 
 # --- AD Rules for TP forward ---

@@ -27,6 +27,8 @@
 #
 ###########################################################
 
+SHELL=/bin/bash
+
 #### G++ ##################################################
 
 # CXX => implicit C++ compilation rules [1]
@@ -135,7 +137,11 @@ test_%: bin/test_%
 cutest: $(CU_TEST)
 
 pytest:
-	uv run pytest -rfps -m "e3j_ops" tests/test_ops
+	if [[ -n "$(k)" ]]; then\
+		uv run pytest -v -m "e3j_ops" -k $(k) tests/test_ops;\
+	else\
+		uv run pytest -v -m "e3j_ops" tests/test_ops/test_tensor_product_op.py;\
+	fi
 
 test: $(CU_TEST) pytest
 

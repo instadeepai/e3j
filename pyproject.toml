@@ -1,6 +1,6 @@
 [project]
 name = "e3j"
-version = "0.1.0b2"
+version = "0.1.0b3"
 description = "Fast Euclid equivariant operations for JAX"
 authors = [
     { name="Olivier Peltre", email="o.peltre@instadeep.com" },
@@ -24,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ops = [
-    "e3j_ops == 0.1.0b2",
+    "e3j_ops == 0.1.0b3",
     "pybind11 >= 2.13.6"
 ]
 

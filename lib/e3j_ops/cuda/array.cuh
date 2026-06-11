@@ -17,9 +17,20 @@
 #define _E3J_ARRAY_H_
 
 #include <cstdint>
+#include "cuda/utils.cuh"
 
 namespace e3j {
 
+/****************************************************************
+ *  CUDA arrays aware of their trailing 2D shapes.
+ *
+ *  Device functions can often be expressed in terms of `CuArray2D`
+ *  with concise signatures, since it contains the necessary problem
+ *  sizes to work on a single batch.
+ *
+ *  Since the leading batch axis is usually shared, it is passed as
+ *  a separate single register.
+ ****************************************************************/
 template <typename T>
 struct CuArray2D {
     T* data;
@@ -45,6 +56,33 @@ struct CuArray2D {
     __device__ T& operator [] (unsigned int pos) {
         return data[pos];
     }
+
+    // Load a 2D array to shared memory (LDGSTS, pipeline primitives API).
+    // Supports striding through source channels when too large to fit in SMEM.
+    template<int N=1>
+    __device__ void load(CuArray2D<const T> src) {
+        if (shape[1] == src.shape[1])
+            utils::copy_pipe<N>(
+                data, src.data, src.size()
+            );
+        else
+            utils::copy_pipe_strided(
+                data, src.data, src.shape[0], shape[1], src.shape[1]
+            );
+    }
+
+    // Store a 2D array to global memory (inline copy with striding support).
+    __device__ void store(CuArray2D<T> dst) {
+        if (shape[1] == dst.shape[1])
+            utils::copy(
+                dst.data, data, size()
+            );
+        else
+            utils::copy_strided(
+                dst.data, data, shape[0], dst.shape[1], shape[1]
+            );
+    }
+
 };
 
 
