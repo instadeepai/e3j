@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- Pallas Mosaic TPU tensor product forward and backward kernels, selectable via
+  the new `TensorProduct.FUSED_MOSAIC_TPU` option (TRAILING_CHANNELS layout, OUTER
+  and MAP modes). The kernels statically unroll the Clebsch-Gordan coefficients
+  and use pipeling to reach peak performance.
+
 ## [0.1.0b3] — 2026-06-10
 
 ### Fixed

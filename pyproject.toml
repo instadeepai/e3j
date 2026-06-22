@@ -19,7 +19,8 @@ dependencies = [
     "flax ~= 0.12.0",
     "pandas ~= 2.2.2",
     "matplotlib >= 3.9.0",
-    "setuptools>=75.8,<78.2"
+    "setuptools>=75.8,<78.2",
+    "pydantic>=2.13.3",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +48,10 @@ cuda13 = [
 ]
 cpu = [
     "jax[cpu] >= 0.6.2",
+    "jaxlib >= 0.6.2"
+]
+tpu = [
+    "jax[tpu] >= 0.6.2",
     "jaxlib >= 0.6.2"
 ]
 

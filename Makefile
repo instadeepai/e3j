@@ -101,7 +101,7 @@ TENSOR_PRODUCT_BWD_OBJ = \
 
 #### RULES ###############################################
 
-.PHONY: cutest pytest test clean uv e3j_ops docs
+.PHONY: cutest pytest test_mosaic_tpu test clean uv e3j_ops docs
 
 #=== Static libraries builds ===
 
@@ -142,6 +142,9 @@ pytest:
 	else\
 		uv run pytest -v -m "e3j_ops" tests/test_ops/test_tensor_product_op.py;\
 	fi
+
+test_mosaic_tpu:
+	uv run pytest -v -m "mosaic_tpu" tests/
 
 test: $(CU_TEST) pytest
 
