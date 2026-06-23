@@ -109,9 +109,22 @@ class _FwdTrailingChannelKernel(FwdKernel):
         assert len(x_origin_shape) == 3, f"x must be (batch, x_dim, mul), got {x.shape}"
         self._validate_y(x, y)
         mul = x.shape[-1]
+        original_batch = x.shape[0]
 
         tpu_info = pltpu.get_tpu_info()
         num_kernel = tpu_info.num_cores
+
+        k = 128 // mul if mul < 128 and 128 % mul == 0 else 1
+        packing = (
+            k >= 4
+            and original_batch % k == 0
+            and (original_batch // k) % num_kernel == 0
+        )
+        self._pack_k = k if packing else 1
+        self._real_mul = mul
+        if packing:
+            x = self._pack_x(x, k, original_batch // k)
+            y = self.pack_y(y, k, original_batch // k)
 
         x = pad_for_tpu(x)
         y = pad_for_tpu(y)
@@ -119,7 +132,9 @@ class _FwdTrailingChannelKernel(FwdKernel):
         mul_padded = x.shape[-1]
         z_dim = params.z_space.dim
 
-        batch_size = x_origin_shape[0]
+        # After packing, x is (packed_batch_size, x_dim, 128)
+        # the kernel's batch is packed_batch_size.
+        batch_size = x.shape[0]
 
         cg_by_zi = group_coef_by_zi(params.indices, params.values)
         cg_groups = tuple(
@@ -146,7 +161,12 @@ class _FwdTrailingChannelKernel(FwdKernel):
                     x_vmem = jax.lax.transpose(x_vmem_src[...], (1, 0, 2))
                 with named_scope("preload_y"):
                     pre_y_vmem = self.preload_y(
-                        y_vmem_src, yis, batch_block_size, mul_padded
+                        y_vmem_src,
+                        yis,
+                        batch_block_size,
+                        mul_padded,
+                        self._pack_k,
+                        self._real_mul,
                     )
                 for zi, contributions in cg_groups:
                     with named_scope(f"zi:{zi}"):
@@ -204,9 +224,28 @@ class _FwdTrailingChannelKernel(FwdKernel):
             name="tensor_product_mtpu_trailing_channel",
         )(x, y)
 
+        if self._pack_k > 1:
+            k = self._pack_k
+            packed_batch_size = tmp.shape[1]
+            tmp = tmp.reshape(z_dim, packed_batch_size, k, mul).reshape(
+                z_dim, packed_batch_size * k, mul
+            )
+
         # transpose(1,0,2) is a free bitcast: {2,1,0} on (z_dim,batch,mul)
         # becomes {2,0,1} on (batch,z_dim,mul) — no data movement.
         return tmp.transpose(1, 0, 2)[:, :, :mul]
+
+    @staticmethod
+    def _pack_x(x: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """Fold ``k`` batch rows into the lane axis."""
+        x_dim, mul = x.shape[1], x.shape[2]
+        x = x.reshape(packed_batch_size, k, x_dim, mul)
+        x = x.transpose(0, 2, 1, 3)
+        return x.reshape(packed_batch_size, x_dim, k * mul)
+
+    @abstractmethod
+    def pack_y(self, y: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """Fold ``k`` batch rows of ``y`` to match :meth:`_pack_x`'s lane layout."""
 
     def _vmem_bytes_per_batch_element(
         self,
@@ -245,9 +284,18 @@ class _FwdTrailingChannelKernel(FwdKernel):
 
     @abstractmethod
     def preload_y(
-        self, y_vmem: jax.Array, yis: frozenset[int], bbs: int, mul: int
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        bbs: int,
+        mul: int,
+        k: int,
+        real_mul: int,
     ) -> dict[int, jax.Array]:
-        """Materialize a `yi -> (bbs, mul)` operand for each used y component."""
+        """Materialize a ``yi -> (bbs, mul)`` operand for each used y component.
+
+        ``k``/``real_mul`` describe the active lane packing (``k == 1`` when off).
+        """
 
 
 class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
@@ -258,17 +306,41 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
             len(y.shape) == 2
         ), f"OUTER mode (y_mul=1) requires 2D y (batch, y_dim), got y={y.shape}"
 
+    def pack_y(self, y: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """OUTER y is ``(batch, y_dim)`` -> ``(packed_batch_size, y_dim, k)`` (scalar per packed row)."""
+        y_dim = y.shape[1]
+        y = y.reshape(packed_batch_size, k, y_dim)
+        return y.transpose(0, 2, 1)
+
     def y_block_shape(
         self, y_shape: tuple[int, ...], bbs: int, mul: int
     ) -> tuple[int, ...]:
+        if len(y_shape) == 3:  # packed: (packed_batch_size, y_dim, k_padded)
+            return (bbs, y_shape[1], y_shape[2])
         return (bbs, y_shape[1])
 
     def y_index_map(self, i: int) -> tuple[int, ...]:
+        if self._pack_k > 1:  # packed y is 3D
+            return (i, 0, 0)
         return (i, 0)
 
     def preload_y(
-        self, y_vmem: jax.Array, yis: frozenset[int], bbs: int, mul: int
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        bbs: int,
+        mul: int,
+        k: int,
+        real_mul: int,
     ) -> dict[int, jax.Array]:
+        if k > 1:
+
+            def _broadcast(yi: int) -> jax.Array:
+                seg = y_vmem[:, yi, :k]  # (bbs, k)
+                seg = jnp.broadcast_to(seg[:, :, None], (bbs, k, real_mul))
+                return seg.reshape(bbs, k * real_mul)  # (bbs, 128 == mul)
+
+            return {yi: _broadcast(yi) for yi in yis}
         return {yi: jnp.broadcast_to(y_vmem[:, yi][:, None], (bbs, mul)) for yi in yis}
 
 
@@ -280,6 +352,10 @@ class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
             len(y.shape) == 3 and x.shape[-1] == y.shape[-1]
         ), f"MAP mode requires 3D y with matching mul, got x={x.shape} y={y.shape}"
 
+    def pack_y(self, y: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """MAP y is ``(batch, y_dim, mul)`` -> packed identically to x: ``(packed_batch_size, y_dim, 128)``."""
+        return self._pack_x(y, k, packed_batch_size)
+
     def y_block_shape(
         self, y_shape: tuple[int, ...], bbs: int, mul: int
     ) -> tuple[int, ...]:
@@ -289,7 +365,13 @@ class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
         return (i, 0, 0)
 
     def preload_y(
-        self, y_vmem: jax.Array, yis: frozenset[int], bbs: int, mul: int
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        bbs: int,
+        mul: int,
+        k: int,
+        real_mul: int,
     ) -> dict[int, jax.Array]:
         return {yi: y_vmem[:, yi, :] for yi in yis}
 

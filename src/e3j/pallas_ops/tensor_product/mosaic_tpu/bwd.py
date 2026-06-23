@@ -116,6 +116,9 @@ class _BwdTrailingChannelKernel(BwdKernel):
          a per-channel scalar, MAP writes the full `(batch_block, mul)` vector.
     """
 
+    # Only used for mul=32 as it was slowing down for mul=64
+    _PACK_MIN_K = 4
+
     def __call__(
         self,
         x: jax.Array,
@@ -139,14 +142,34 @@ class _BwdTrailingChannelKernel(BwdKernel):
         tpu_info = pltpu.get_tpu_info()
         num_kernel = tpu_info.num_cores
 
-        x = pad_for_tpu(x)  # (batch, x_dim_padded, mul_padded)
-        dz = pad_for_tpu(dz.transpose(1, 0, 2))  # (out_dim, batch, mul_padded)
-        y = pad_for_tpu(y)  # OUTER: (batch, y_dim_p); MAP: (batch, y_dim_p, mul_p)
+        k = 128 // mul if mul < 128 and 128 % mul == 0 else 1
+        packing = (
+            k >= self._PACK_MIN_K
+            and batch_size % k == 0
+            and (batch_size // k) % num_kernel == 0
+        )
+        self._pack_k = k if packing else 1
+        self._real_mul = mul
+        if packing:
+            packed_batch_size = batch_size // k
+            x = self._pack_rows(
+                x, k, packed_batch_size
+            )  # (packed_batch_size, x_dim, k*mul == 128)
+            dz = self._pack_rows(
+                dz, k, packed_batch_size
+            )  # (packed_batch_size, out_dim, 128)
+            y = self.pack_y(y, k, packed_batch_size)
 
+        x = pad_for_tpu(x)  # (kbatch, x_dim_padded, mul_padded)
+        dz = pad_for_tpu(dz.transpose(1, 0, 2))  # (out_dim, kbatch, mul_padded)
+        y = pad_for_tpu(y)  # OUTER: (kbatch, y_dim_p); MAP: (kbatch, y_dim_p, mul_p)
+
+        # After packing the kernel runs on the shrunk batch ``packed_batch_size``.
+        kernel_batch = x.shape[0]
         x_dim_padded = x.shape[1]
         z_dim = dz.shape[0]
         mul_padded = x.shape[2]
-        dy_kernel_shape = self.dy_kernel_shape(y, batch_size)
+        dy_kernel_shape = self.dy_kernel_shape(y, kernel_batch)
 
         cg_by_xi = tuple(
             (xi, tuple((oi, yi, v) for oi, yi, v in contribs))
@@ -156,7 +179,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         yi_used = range(y_dim)
 
         batch_block_size = select_batch_block_size(
-            batch_size=batch_size,
+            batch_size=kernel_batch,
             vmem_bytes_per_batch_element=self._vmem_bytes_per_batch_element(
                 x_dim_padded, mul_padded, y, z_dim, len(yis), y_dim, x.dtype.itemsize
             ),
@@ -164,7 +187,10 @@ class _BwdTrailingChannelKernel(BwdKernel):
             vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
             override=bwd_config.batch_block_size,
         )
-        num_blocks = batch_size // batch_block_size
+        num_blocks = kernel_batch // batch_block_size
+
+        pack_k = self._pack_k
+        real_mul = self._real_mul
 
         def bwd_kernel(dz_ref, x_ref, y_ref, dx_ref, dy_ref):
             def body(dz_vmem, x_vmem_src, y_vmem, dx_vmem, dy_vmem):
@@ -172,7 +198,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
                 # transpose so the inner loop can index its leading dim for free.
                 x_vmem = jax.lax.transpose(x_vmem_src[...], (1, 0, 2))
                 pre_broadcast_y = self.preload_y(
-                    y_vmem, yis, batch_block_size, mul_padded
+                    y_vmem, yis, batch_block_size, mul_padded, pack_k, real_mul
                 )
                 zero = jnp.zeros((batch_block_size, mul_padded), jnp.float32)
                 # Per-yi (bbs, mul) accumulators. In OUTER they're reduced over
@@ -198,7 +224,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
                 )
 
                 for yi in yi_used:
-                    self.write_dy(dy_vmem, yi, dy_acc[yi])
+                    self.write_dy(dy_vmem, yi, dy_acc[yi], pack_k, real_mul)
 
             pltpu.emit_pipeline(
                 body,
@@ -234,7 +260,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         dx, dy = pl.pallas_call(
             bwd_kernel,
             out_shape=[
-                jax.ShapeDtypeStruct((batch_size, x_dim_padded, mul_padded), x.dtype),
+                jax.ShapeDtypeStruct((kernel_batch, x_dim_padded, mul_padded), x.dtype),
                 jax.ShapeDtypeStruct(dy_kernel_shape, x.dtype),
             ],
             in_specs=[
@@ -242,7 +268,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
             ],
             out_specs=[
                 pl.BlockSpec(
-                    (batch_size, x_dim_padded, mul_padded), memory_space=pltpu.HBM
+                    (kernel_batch, x_dim_padded, mul_padded), memory_space=pltpu.HBM
                 ),
                 pl.BlockSpec(dy_kernel_shape, memory_space=pltpu.HBM),
             ],
@@ -253,7 +279,29 @@ class _BwdTrailingChannelKernel(BwdKernel):
             name="tensor_product_mtpu_trailing_channel_bwd",
         )(dz, x, y)
 
-        return dx[:, :x_dim, :mul], self.finalize_dy(dy, y_dim, mul)
+        dx = self._unpack_dx(dx, batch_size, x_dim, mul)
+        return dx, self.finalize_dy(dy, y_dim, mul, batch_size)
+
+    @staticmethod
+    def _pack_rows(x: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """Fold ``k`` batch rows into the lane axis."""
+        chan, mul = x.shape[1], x.shape[2]
+        x = x.reshape(packed_batch_size, k, chan, mul)
+        x = x.transpose(0, 2, 1, 3)
+        return x.reshape(packed_batch_size, chan, k * mul)
+
+    def _unpack_dx(self, dx: jax.Array, batch: int, x_dim: int, mul: int) -> jax.Array:
+        """Reconstruct ``dx (batch, x_dim, mul)`` from the kernel output."""
+        if self._pack_k == 1:
+            return dx[:, :x_dim, :mul]
+        k = self._pack_k
+        packed_batch_size, x_dim_p = dx.shape[0], dx.shape[1]
+        # (packed_batch_size, x_dim_p, 128) -> (packed_batch_size, x_dim_p, k, mul): split lane (free).
+        dx = dx.reshape(packed_batch_size, x_dim_p, k, mul)
+        # Move k next to packed_batch_size then merge -> (batch, x_dim_p, mul). This crosses
+        # x_dim so it is a genuine sub-128-lane relayout (the un-fold tax).
+        dx = dx.transpose(0, 2, 1, 3).reshape(packed_batch_size * k, x_dim_p, mul)
+        return dx[:, :x_dim, :mul]
 
     def _vmem_bytes_per_batch_element(
         self,
@@ -298,8 +346,14 @@ class _BwdTrailingChannelKernel(BwdKernel):
         """Assert `y` has the rank/shape this mode expects relative to `x`."""
 
     @abstractmethod
-    def dy_kernel_shape(self, y_padded: jax.Array, batch_size: int) -> tuple[int, ...]:
-        """Return the full HBM shape of the `dy` output for this mode."""
+    def pack_y(self, y: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """Fold ``k`` batch rows of ``y`` to match :meth:`_pack_x`'s lane layout."""
+
+    @abstractmethod
+    def dy_kernel_shape(
+        self, y_padded: jax.Array, kernel_batch: int
+    ) -> tuple[int, ...]:
+        """Return the full HBM shape of the ``dy`` output for this mode."""
 
     @abstractmethod
     def y_block_shape(self, y_padded: jax.Array, bbs: int) -> tuple[int, ...]:
@@ -311,17 +365,31 @@ class _BwdTrailingChannelKernel(BwdKernel):
 
     @abstractmethod
     def preload_y(
-        self, y_vmem: jax.Array, yis: frozenset[int], bbs: int, mul: int
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        bbs: int,
+        mul: int,
+        k: int,
+        real_mul: int,
     ) -> dict[int, jax.Array]:
-        """Materialize a `yi -> (bbs, mul)` operand for each used y component."""
+        """Materialize a ``yi -> (bbs, mul)`` operand for each used y component.
+
+        ``k``/``real_mul`` describe the active lane packing (``k == 1`` when off).
+        """
 
     @abstractmethod
-    def write_dy(self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array) -> None:
-        """Store the accumulated `(bbs, mul)` `dy_acc` for component `yi`."""
+    def write_dy(
+        self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array, k: int, real_mul: int
+    ) -> None:
+        """Store the accumulated ``(bbs, mul)`` ``dy_acc`` for component ``yi``.
+
+        ``k``/``real_mul`` describe the active lane packing (``k == 1`` when off).
+        """
 
     @abstractmethod
-    def finalize_dy(self, dy: jax.Array, y_dim: int, mul: int) -> jax.Array:
-        """Trim the raw dy buffer back to the user-facing shape."""
+    def finalize_dy(self, dy: jax.Array, y_dim: int, mul: int, batch: int) -> jax.Array:
+        """Trim/unpack the raw dy buffer back to the user-facing shape."""
 
 
 class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
@@ -332,8 +400,17 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
             len(y.shape) == 2
         ), f"OUTER mode requires 2D y (batch, y_dim), got {y.shape}"
 
-    def dy_kernel_shape(self, y_padded: jax.Array, batch_size: int) -> tuple[int, ...]:
-        return (batch_size, y_padded.shape[1])
+    def pack_y(self, y: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """pack y:``(batch, y_dim)`` -> ``(packed_batch_size, y_dim * k)``."""
+        y_dim = y.shape[1]
+        y = y.reshape(packed_batch_size, k, y_dim)  # (packed_batch_size, k, y_dim)
+        y = y.transpose(0, 2, 1)  # (packed_batch_size, y_dim, k)
+        return y.reshape(packed_batch_size, y_dim * k)  # (packed_batch_size, y_dim * k)
+
+    def dy_kernel_shape(
+        self, y_padded: jax.Array, kernel_batch: int
+    ) -> tuple[int, ...]:
+        return (kernel_batch, y_padded.shape[1])
 
     def y_block_shape(self, y_padded: jax.Array, bbs: int) -> tuple[int, ...]:
         return (bbs, y_padded.shape[1])
@@ -342,17 +419,45 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
         return (i, 0)
 
     def preload_y(
-        self, y_vmem: jax.Array, yis: frozenset[int], bbs: int, mul: int
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        bbs: int,
+        mul: int,
+        k: int,
+        real_mul: int,
     ) -> dict[int, jax.Array]:
+        if k > 1:
+
+            def _broadcast(yi: int) -> jax.Array:
+                seg = y_vmem[:, yi * k : (yi + 1) * k]  # (bbs, k)
+                seg = jnp.broadcast_to(seg[:, :, None], (bbs, k, real_mul))
+                return seg.reshape(bbs, k * real_mul)  # (bbs, 128 == mul)
+
+            return {yi: _broadcast(yi) for yi in yis}
         return {yi: jnp.broadcast_to(y_vmem[:, yi][:, None], (bbs, mul)) for yi in yis}
 
-    def write_dy(self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array) -> None:
-        # OUTER's dy is (batch, y_dim): reduce dy_acc over the mul axis to a
-        # (bbs,) scalar before storing.
+    def write_dy(
+        self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array, k: int, real_mul: int
+    ) -> None:
+        # OUTER's dy is (batch, y_dim): reduce dy_acc over the mul axis.
+        if k > 1:
+            # Reduce per k
+            for j in range(k):
+                seg = dy_acc[:, j * real_mul : (j + 1) * real_mul]  # (bbs, real_mul)
+                dy_vmem[:, yi * k + j] = jnp.sum(seg, axis=-1).astype(dy_vmem.dtype)
+            return
         dy_vmem[:, yi] = jnp.sum(dy_acc, axis=-1).astype(dy_vmem.dtype)
 
-    def finalize_dy(self, dy: jax.Array, y_dim: int, mul: int) -> jax.Array:
-        return dy[:, :y_dim]
+    def finalize_dy(self, dy: jax.Array, y_dim: int, mul: int, batch: int) -> jax.Array:
+        if self._pack_k == 1:
+            return dy[:, :y_dim]
+        k = self._pack_k
+        packed_batch_size = dy.shape[0]
+        dy = dy[:, : y_dim * k]  # (packed_batch_size, y_dim * k)
+        dy = dy.reshape(packed_batch_size, y_dim, k)  # (packed_batch_size, y_dim, k)
+        dy = dy.transpose(0, 2, 1)  # (packed_batch_size, k, y_dim)
+        return dy.reshape(packed_batch_size * k, y_dim)  # (batch, y_dim)
 
 
 class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
@@ -363,8 +468,14 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
             len(y.shape) == 3 and x.shape[-1] == y.shape[-1]
         ), f"MAP mode requires 3D y with matching mul, got x={x.shape} y={y.shape}"
 
-    def dy_kernel_shape(self, y_padded: jax.Array, batch_size: int) -> tuple[int, ...]:
-        return (batch_size, y_padded.shape[1], y_padded.shape[2])
+    def pack_y(self, y: jax.Array, k: int, packed_batch_size: int) -> jax.Array:
+        """MAP y is ``(batch, y_dim, mul)`` -> packed identically to x: ``(packed_batch_size, y_dim, 128)``."""
+        return self._pack_rows(y, k, packed_batch_size)
+
+    def dy_kernel_shape(
+        self, y_padded: jax.Array, kernel_batch: int
+    ) -> tuple[int, ...]:
+        return (kernel_batch, y_padded.shape[1], y_padded.shape[2])
 
     def y_block_shape(self, y_padded: jax.Array, bbs: int) -> tuple[int, ...]:
         return (bbs, y_padded.shape[1], y_padded.shape[2])
@@ -373,15 +484,27 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         return (i, 0, 0)
 
     def preload_y(
-        self, y_vmem: jax.Array, yis: frozenset[int], bbs: int, mul: int
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        bbs: int,
+        mul: int,
+        k: int,
+        real_mul: int,
     ) -> dict[int, jax.Array]:
         return {yi: y_vmem[:, yi, :] for yi in yis}
 
-    def write_dy(self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array) -> None:
+    def write_dy(
+        self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array, k: int, real_mul: int
+    ) -> None:
         dy_vmem[:, yi, :] = dy_acc.astype(dy_vmem.dtype)
 
-    def finalize_dy(self, dy: jax.Array, y_dim: int, mul: int) -> jax.Array:
-        return dy[:, :y_dim, :mul]
+    def finalize_dy(self, dy: jax.Array, y_dim: int, mul: int, batch: int) -> jax.Array:
+        if self._pack_k == 1:
+            return dy[:, :y_dim, :mul]
+        # dy is packed (packed_batch_size, y_dim_padded, 128); unpack like dx (it shares x's
+        # lane layout) back to (batch, y_dim, mul).
+        return self._unpack_dx(dy, batch, y_dim, mul)
 
 
 def _tensor_product_kernel_mosaic_tpu_bwd(
