@@ -98,7 +98,7 @@ struct LaunchConfigBwd {
         if (find_N)
             N = get_vectorization(p);
 
-        // Phase 1: bound blockDim.x by per-channel SMEM cost.
+        // Bound blockDim.x to avoid SMEM overflow.
         // Channel-scaled buffers: dm + x + mix + dx.
         unsigned int size_per_ch =
             sizeof(Val) * (p.num_out + 2 * p.num_x + p.num_scalars);
@@ -112,10 +112,16 @@ struct LaunchConfigBwd {
             }
         }
         threadsX = max(32u, 32u * (threadsX / 32));
+        // Reduce N so that threadsX * N divides channels evenly.
+        if (find_N) {
+            while (p.channels_x % (threadsX * N) != 0 && N > 1)
+                N /= 2;
+        }
 
+        // Estimate SMEM footprint with blockDim.y = 1.
         SizesBwd size = get_sizes(p, {threadsX, 1, 1}, N);
 
-        // Phase 2: increase blockDim.y for occupancy.
+        // Distribute coeffiecients over blockDim.y to increase occupancy.
         unsigned int maxBlocks = device.smem_max / size.smem;
         unsigned int threadsY = 1;
         while (
