@@ -115,19 +115,18 @@ __device__ tp::IdxVal<Idx,Val,N> accumulate_trilinear(
         //  - Reset accumulator with FMUL and return current sum if new
         //  - Update accumulator with FFMA otherwise
         //
-        // OUTER:     Channels of last operand only are broadcast for now.
-        //            => Call on (x, s, y) with channels_x = channels_s
-        //               (node features, scalars) and channels_y = 1
-        //               (harmonic embeddings).
+        // OUTER:     Middle operand is broadcast (ch=1).
+        //            => Call on (x, y, s) matching the public API,
+        //               with channels_y = 1 (harmonic embeddings).
         //
         // INNER/MAP: All operands are vectorized.
         if constexpr (kMode == Mode::OUTER) {
-            Val x3_l = x3[c.l * channels_x3];
-            Vect<N,Val> x2_k = load<N,Val>(x2 + c.k * channels_x2);
+            Val x2_k = x2[c.k * channels_x2];
+            Vect<N,Val> x3_l = load<N,Val>(x3 + c.l * channels_x3);
             Vect<N,Val> x1_j = load<N,Val>(x1 + c.j * channels_x1);
             // Multiply twice
-            Vect<N,Val> prod = broadcast<N, Val>(c.val * x3_l);
-            prod = mul<N, Val>(prod, x2_k);
+            Vect<N,Val> prod = broadcast<N, Val>(c.val * x2_k);
+            prod = mul<N, Val>(prod, x3_l);
             // Branch on output index to apply last mul
             if (c.i != acc.i) {
                 acc = {c.i, mul<N,Val>(prod, x1_j)};
@@ -196,12 +195,12 @@ __device__ void bigotimes(
     int num_warps_x = 1 + (x1.shape[1] - 1) / (32 * N);
 
     // Apply threadwise channel offsets:
-    //  - OUTER:        3rd operand only is broadcast
+    //  - OUTER:        middle operand only is broadcast
     //  - INNER | MAP:  all operands have same number of channels
     x1.data += threadIdx.x * N;
-    x2.data += threadIdx.x * N;
+    x3.data += threadIdx.x * N;
     if constexpr (kMode == Mode::INNER || kMode == Mode::MAP)
-        x3.data += threadIdx.x * N;
+        x2.data += threadIdx.x * N;
 
     if constexpr (kMode == Mode::OUTER || kMode == Mode::MAP) {
         // Prevent OOB threads from writing out.
@@ -219,7 +218,7 @@ __device__ void bigotimes(
             //       read the coefficient. Accumulation then returns without
             //       loading out-of-bounds coefficient.
             while (col <= range.end) {
-                // Compute z[i] = ∑ c[ijk] * x[j] * y[k] by channel.
+                // Compute z[i] = ∑ c_ijkl * x[j] * s[k] * y[l] by channel.
                 zi = accumulate_trilinear<Idx,Val,kMode,N>(
                     acc, coef, col, range.end,
                     x1.data, x2.data, x3.data,
@@ -285,9 +284,8 @@ __global__ void kernel (
     int num_coef,
     dim3 unroll
 ) {
-    // NOTE: forward coefficients for (x, s, y) trilinear mixing!
-    //  - bigotimes requires broadcast operand y to come last
-    //  - public convolution API in terms of (x, y, s).
+    // Forward coefficients for (x, y, s) trilinear mixing,
+    // matching the public convolution API.
     using Coef = Coef4D<Idx,Val>;
 
     int size_x = x.size();
@@ -363,7 +361,7 @@ __global__ void kernel (
                 // Fused TP reduction + scalar mixing, accumulates into smem.out.
                 bigotimes<Idx,Val,Mode::OUTER,N,true>(
                     coef, coef_range,
-                    smem.lhs, smem.mix, smem.rhs,
+                    smem.lhs, smem.rhs, smem.mix,
                     smem.out, nullptr
                 );
                 __syncthreads();

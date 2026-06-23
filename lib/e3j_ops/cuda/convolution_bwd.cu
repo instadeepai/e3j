@@ -25,13 +25,13 @@ template e3j::Error launch_bwd<Idx, Val>(          \
     const Coef4D<Idx,Val> *coef,                   \
     const Val *x,                                  \
     const Val *y,                                  \
-    const Val *dz,                                 \
-    const Val *mix,                                \
+    const Val *s,                                  \
+    const Val *dm,                                 \
     const AdjacencyCSR adj,                        \
     const int32_t *edge_perm,                      \
     Val *dx,                                       \
     Val *dy,                                       \
-    Val *dmix,                                     \
+    Val *ds,                                       \
     Params p,                                      \
     cudaStream_t stream,                           \
     int debug                                      \

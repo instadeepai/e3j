@@ -107,16 +107,12 @@ struct BuffersBwd {
  *      store per sender — no atomics
  *    - dy written per-edge to GMEM (INNER warp reduction)
  *
- *  Coefficients in 4D COO format are packed in three orderings:
- *      [coef_dmix | coef_dx | coef_dy]
+ *  The backward coefficients should be packed as a
+ *  triple (coef_dx, coef_dy, coef_ds) such that:
  *
- *  Given forward coefficients indices (i, j, k, l) for (m, x, s, y)
- *  the orderings should always keep the broadcasted operand y last,
- *  and keep dm first by convention:
- *
- *   - coef_dmix :  {val, k, i, j, l}  for bigotimes(dm, x, y)
- *   - coef_dx :    {val, j, i, k, l}  for bigotimes(dm, s, y)
- *   - coef_dy :    {val, l, i, k, j}  for bigotimes(dm, s, x)
+ *   - dx = bigotimes(coef_dx, dm, y, s)
+ *   - dy = bigotimes(coef_dy, dm, x, s)
+ *   - ds = bigotimes(coef_ds, dm, y, x)
  *
  *****************************************************************/
 template <typename Idx, typename Val, int N=1>
@@ -124,13 +120,13 @@ __global__ void kernel_bwd (
     const Coef4D<Idx, Val> *coef,
     CuArray2D<const Val> x,
     CuArray2D<const Val> y,
+    CuArray2D<const Val> s,
     CuArray2D<const Val> dm,
-    CuArray2D<const Val> mix,
     const AdjacencyCSR adj,
     const int32_t *edge_perm,
     Val *gmem_dx,
     Val *gmem_dy,
-    Val *gmem_dmix,
+    Val *gmem_ds,
     unsigned int num_nodes,
     unsigned int num_coef,
     dim3 unroll
@@ -141,7 +137,7 @@ __global__ void kernel_bwd (
     int size_x   = x.size();
     int size_y   = y.size();
     int size_dm  = dm.size();
-    int size_mix = mix.size();
+    int size_mix = s.size();
     int num_y    = y.shape[0];
     int num_warps = blockDim.x / 32;
 
@@ -150,7 +146,7 @@ __global__ void kernel_bwd (
     extern __shared__ __align__(16) char smem__[];
     char* smem_ = reinterpret_cast<char*>(smem__);
     BuffersBwd<Idx, Val> smem = BuffersBwd<Idx, Val>::init(
-        x, y, dm, mix, unroll
+        x, y, dm, s, unroll
     );
 
     if (BUFFER_CONV_BWD_COEFS_IN_SMEM) {
@@ -166,13 +162,14 @@ __global__ void kernel_bwd (
     }
     smem.to_shared(smem_);
 
-    const Coef *coef_dx = coef + num_coef;
-    const Coef *coef_dy = coef + 2 * num_coef;
+    const Coef *coef_dx = coef;
+    const Coef *coef_dy = coef + num_coef;
+    const Coef *coef_ds = coef + 2 * num_coef;
 
     // Partition coefficients across blockDim.y
     int *smem_cuts = reinterpret_cast<int*>(smem.dm.data);
-    CoefRange range_dmix = find_coef_bounds<Idx, Val, Coef4D>(
-        smem_cuts, coef, num_coef, mix.shape[0]
+    CoefRange range_ds = find_coef_bounds<Idx, Val, Coef4D>(
+        smem_cuts, coef_ds, num_coef, s.shape[0]
     );
     CoefRange range_dx = find_coef_bounds<Idx, Val, Coef4D>(
         smem_cuts, coef_dx, num_coef, x.shape[0]
@@ -198,19 +195,19 @@ __global__ void kernel_bwd (
         int first_edge = adj.receiver_ptr[sender],
             last_edge  = adj.receiver_ptr[sender + 1];
 
-        CuArray2D<const Val> x_s   = { x.data,   x.shape[0],   x.shape[1] };
-        CuArray2D<const Val> dm_s  = { dm.data,  dm.shape[0],  dm.shape[1] };
-        CuArray2D<const Val> mix_s = { mix.data, mix.shape[0], mix.shape[1] };
-        CuArray2D<Val> dx_out_s    = { gmem_dx,  x.shape[0],   x.shape[1] };
-        Val *dmix_s   = gmem_dmix;
+        CuArray2D<const Val> x_ = { x.data, x.shape[0], x.shape[1] };
+        CuArray2D<const Val> s_ = { s.data, s.shape[0], s.shape[1] };
+        CuArray2D<const Val> dm_ = { dm.data, dm.shape[0], dm.shape[1] };
+        CuArray2D<Val> dx_out_ = { gmem_dx, x.shape[0], x.shape[1] };
+        Val *ds_   = gmem_ds;
 
-        for (int s = 0; s < num_strides; s++) {
+        for (int channel0 = 0; channel0 < num_strides; channel0++) {
 
         // Zero dx accumulator for this sender.
         fill(smem.dx.data, Val(0), smem.dx.size());
 
         // Load x[sender] to smem.x (constant across edges from sender).
-        smem.x.load<N>(x_s, sender);
+        smem.x.load<N>(x_, sender);
 
         __pipeline_commit();
         wait_pipe<0>();
@@ -220,31 +217,31 @@ __global__ void kernel_bwd (
             int edge_t = edge_perm ? edge_perm[edge] : edge;
             int recv = adj.sender[edge];
 
-            // Load dm[recv], y[edge_t], mix[edge_t]
-            smem.dm.load<N>(dm_s, recv);
+            // Load dm[receiver], y[edge_t], s[edge_t]
+            smem.dm.load<N>(dm_, recv);
             smem.y.load<1>(y, edge_t);
-            smem.mix.load<N>(mix_s, edge_t);
+            smem.mix.load<N>(s_, edge_t);
 
             __pipeline_commit();
             wait_pipe<0>();
 
-            // Edge scalar cotangents
-            int dmix_edge_size = mix.shape[0] * dm.shape[1];
-            CuArray2D<Val> dmix_view = {
-                dmix_s + edge_t * dmix_edge_size, mix.shape[0], dm.shape[1]
+            // Edge scalar cotangents (ds)
+            int size_ds = s.shape[0] * dm.shape[1];
+            CuArray2D<Val> ds_view = {
+                ds_ + edge_t * size_ds, s.shape[0], dm.shape[1]
             };
 
             bigotimes<Idx,Val,Mode::OUTER,N,false>(
-                coef, range_dmix,
-                smem.dm, smem.x, smem.y,
-                dmix_view, nullptr
+                coef_ds, range_ds,
+                smem.dm, smem.y, smem.x,
+                ds_view, nullptr
             );
             __syncthreads();
 
-            // Sender feature cotangents
+            // Sender feature cotangents (dx)
             bigotimes<Idx,Val,Mode::OUTER,N,true>(
                 coef_dx, range_dx,
-                smem.dm, smem.mix, smem.y,
+                smem.dm, smem.y, smem.mix,
                 smem.dx, nullptr
             );
 
@@ -252,10 +249,10 @@ __global__ void kernel_bwd (
             fill(smem.dy_scratch, Val(0), num_warps * num_y);
             __syncthreads();
 
-            // Edge feature cotangents
+            // Edge feature cotangents (dy)
             bigotimes<Idx,Val,Mode::INNER,N,true>(
                 coef_dy, range_dy,
-                smem.dm, smem.mix, smem.x,
+                smem.dm, smem.x, smem.mix,
                 dy_view, smem.dy_scratch
             );
             __syncthreads();
@@ -266,7 +263,7 @@ __global__ void kernel_bwd (
                     Val sum = 0;
                     for (int w = 0; w < num_warps; w++)
                         sum += smem.dy_scratch[w * num_y + i];
-                    if (s == 0)
+                    if (channel0 == 0)
                         gmem_dy[edge_t * num_y + i] = sum;
                     else
                         gmem_dy[edge_t * num_y + i] += sum;
@@ -277,17 +274,17 @@ __global__ void kernel_bwd (
         }//=== Edge loop ===
 
         // Store sender cotangent
-        smem.dx.store(dx_out_s, sender);
+        smem.dx.store(dx_out_, sender);
 
         // Advance to next channel slice.
         if (x.shape[1]  > unroll.x) {
-            x_s.data  += unroll.x;
-            dx_out_s.data += unroll.x;
+            x_.data  += unroll.x;
+            dx_out_.data += unroll.x;
         }
         if (dm.shape[1] > unroll.z) {
-            dm_s.data += unroll.z;
-            mix_s.data += unroll.z;
-            dmix_s += unroll.z;
+            dm_.data += unroll.z;
+            s_.data += unroll.z;
+            ds_ += unroll.z;
         }
 
         }//=== Channel stride loop ===

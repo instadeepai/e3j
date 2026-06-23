@@ -168,7 +168,7 @@ class _TestConvolutionOp:
     def fwd_op(self):
         idx, val, s_index, params = self.closure()
         sender, receiver = self.graph()
-        idx4 = np.stack([idx[0], idx[1], s_index[idx[0]], idx[2]])
+        idx4 = np.stack([idx[0], idx[1], idx[2], s_index[idx[0]]])
         coef = pack_coef4d(val, idx4)
         return lambda x, y, s: convolution(
             coef,

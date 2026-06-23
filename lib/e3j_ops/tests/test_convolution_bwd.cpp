@@ -113,9 +113,9 @@ void cpu_convolution_bwd(
     std::vector<Coef<Idx, float>> coef,
     Vec<float> x,
     Vec<float> y,
-    Vec<float> dz,
     Vec<float> mix,
-    Vec<Idx> irrep_out,
+    Vec<float> dz,
+    Vec<Idx> mix_idx,
     Vec<int32> sender,
     Vec<int32> receiver_ptr,
     Params p,
@@ -143,7 +143,7 @@ void cpu_convolution_bwd(
                     float y_val = y[edge * p.num_y + k];
                     float dz_val = dz[recv * p.num_out * p.channels_x
                                       + i * p.channels_x + ch];
-                    int s = irrep_out[i];
+                    int s = mix_idx[i];
                     dmix_out[edge * p.num_scalars * p.channels_x
                              + s * p.channels_x + ch] += v * x_val * y_val * dz_val;
                 }
@@ -151,7 +151,7 @@ void cpu_convolution_bwd(
                 // Cotangent receiver message: dm = mix * dz
                 std::vector<float> dm(p.num_out, 0.f);
                 for (int i = 0; i < p.num_out; i++) {
-                    int s = irrep_out[i];
+                    int s = mix_idx[i];
                     float mix_val = mix[edge * p.num_scalars * p.channels_x
                                         + s * p.channels_x + ch];
                     float dz_val = dz[recv * p.num_out * p.channels_x
@@ -222,7 +222,7 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
     Vec<Idx> idx_flat = Vec<Idx>::concat({idx_i, idx_j, idx_k});
     Vec<float> val = coef_val.tile(num_strips);
     int num_coef = p.num_coef;
-    std::vector<Coef<Idx, float>> coef_fwd =
+    std::vector<Coef<Idx, float>> coef_fwd_3d =
         packCoefs<Idx>(idx_flat, val, num_coef);
 
     // Node features x: [num_nodes, num_x, channels_x]
@@ -252,32 +252,39 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
         mix = Vec<float>::ones(num_edges * p.num_scalars * p.channels_x);
     }
 
-    // irrep_out: 2 output features per strip, one scalar per strip
-    Vec<Idx> irrep_out(p.num_out);
+    // mix_idx: 2 output features per strip, one scalar per strip
+    Vec<Idx> mix_idx(p.num_out);
     for (int s = 0; s < num_strips; s++) {
-        irrep_out[2 * s]     = Idx(s);
-        irrep_out[2 * s + 1] = Idx(s);
+        mix_idx[2 * s]     = Idx(s);
+        mix_idx[2 * s + 1] = Idx(s);
     }
 
-    // Transpose coefs for backward kernel: 3 x Coef4D sets.
-    // Forward indices (i, j, k, l) = (m, x, s, y).
-    // Backward orderings: dm first, broadcast operand last.
+    // Join scalar mixing indices to bilinear TP coefficients
+    std::vector<Coef4D<Idx, float>> coef_fwd = e3j::convolution::otimes_mix_coefficients(
+        coef_fwd_3d, mix_idx.data()
+    );
+
+    // Transpose coefficients for backward kernel, passed as a triple
+    // (coef_dx, coef_dy, coef_ds) such that:
+    //   - dx = bigotimes(coef_dx, dm, y, s)
+    //   - dy = bigotimes(coef_dy, dm, x, s)
+    //   - ds = bigotimes(coef_ds, dm, y, x)
     using e3j::convolution::transpose_coef4D;
-    int order_dmix[4] = {2, 0, 1, 3};  // {s, m, x, y} for bigotimes(dm, x, y)
-    int order_dx[4]   = {1, 0, 2, 3};  // {x, m, s, y} for bigotimes(dm, s, y)
-    int order_dy[4]   = {3, 0, 2, 1};  // {y, m, s, x} for bigotimes(dm, s, x)
-    std::vector<Coef4D<Idx, float>> coef_dmix =
-        transpose_coef4D<Idx, float>(coef_fwd, irrep_out.data(), order_dmix);
+    int order_dx[4] = {1, 0, 2, 3};  // {dx, dm, y, s}
+    int order_dy[4] = {2, 0, 1, 3};  // {dy, dm, x, s}
+    int order_ds[4] = {3, 0, 2, 1};  // {ds, dm, y, x}
     std::vector<Coef4D<Idx, float>> coef_dx =
-        transpose_coef4D<Idx, float>(coef_fwd, irrep_out.data(), order_dx);
+        transpose_coef4D<Idx, float>(coef_fwd, order_dx);
     std::vector<Coef4D<Idx, float>> coef_dy =
-        transpose_coef4D<Idx, float>(coef_fwd, irrep_out.data(), order_dy);
+        transpose_coef4D<Idx, float>(coef_fwd, order_dy);
+    std::vector<Coef4D<Idx, float>> coef_ds =
+        transpose_coef4D<Idx, float>(coef_fwd, order_ds);
 
     std::vector<Coef4D<Idx, float>> coef_packed;
     coef_packed.reserve(3 * num_coef);
-    coef_packed.insert(coef_packed.end(), coef_dmix.begin(), coef_dmix.end());
     coef_packed.insert(coef_packed.end(), coef_dx.begin(), coef_dx.end());
     coef_packed.insert(coef_packed.end(), coef_dy.begin(), coef_dy.end());
+    coef_packed.insert(coef_packed.end(), coef_ds.begin(), coef_ds.end());
 
     // Graph adjacency (CSR, same as forward test)
     Vec<int32> sender_fwd       = {1, 2, 0, 3, 0, 1};
@@ -296,7 +303,7 @@ ConvBwdArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
     );
 
     cpu_convolution_bwd<Idx>(
-        coef_fwd, x, y, dz, mix, irrep_out,
+        coef_fwd_3d, x, y, mix, dz, mix_idx,
         sender_fwd, receiver_ptr_fwd, p,
         dx_expect, dy_expect, dmix_expect
     );
@@ -386,7 +393,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     AdjacencyCSR adj_t = { receiver_t_d, sender_ptr_d };
 
     e3j::Error err = e3j::convolution::launch_bwd<Idx, float>(
-        coef_d, x_d, y_d, dz_d, mix_d, adj_t, perm_d,
+        coef_d, x_d, y_d, mix_d, dz_d, adj_t, perm_d,
         dx_d, dy_d, dmix_d,
         p, cudaStream_t(0), DEBUG
     );

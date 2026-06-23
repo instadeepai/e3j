@@ -60,19 +60,12 @@ std::vector<Coef<Idx, float>> packCoefs(
 }
 
 
-// CPU reference: for each receiver, sum reweighted tensor products over edges.
-//
-//   out[recv, i, ch] += r[edge, irrep_out[i]]
-//                     * sum_c(c.val * x[sender, c.j, ch] * y[edge, c.k])
-//
-// Layout: trailing channels (feature-major).
 template<typename Idx>
 Vec<float> cpu_convolution(
-    std::vector<Coef<Idx, float>> coef,
+    std::vector<Coef4D<Idx, float>> coef,
     Vec<float> x,
     Vec<float> y,
-    Vec<float> r,
-    Vec<Idx> irrep_out,
+    Vec<float> s,
     Vec<int32> sender,
     Vec<int32> receiver_ptr,
     Params p
@@ -82,33 +75,29 @@ Vec<float> cpu_convolution(
         p.num_nodes * p.num_out * p.channels_x
     );
 
-    for (int recv = 0; recv < p.num_nodes; recv++) {
-        int first = receiver_ptr[recv];
-        int last  = receiver_ptr[recv + 1];
+    for (int receiver = 0; receiver < p.num_nodes; receiver++) {
+        int first = receiver_ptr[receiver];
+        int last  = receiver_ptr[receiver + 1];
+        int nc = p.channels_x;
 
         for (int edge = first; edge < last; edge++) {
-            int send = sender[edge];
 
-            for (int ch = 0; ch < p.channels_x; ch++) {
+            for (int u = 0; u < p.channels_x; u++) {
                 // TP reduction per output feature (OUTER, channels_y = 1)
-                std::vector<float> tp(p.num_out, 0.f);
-                for (int c = 0; c < num_coef; c++) {
-                    int i = coef[c].i;
-                    int j = coef[c].j;
-                    int k = coef[c].k;
-                    float v = coef[c].val;
-                    float x_val = x[send * p.num_x * p.channels_x
-                                    + j * p.channels_x + ch];
-                    float y_val = y[edge * p.num_y + k];
-                    tp[i] += v * x_val * y_val;
+                std::vector<float> message (p.num_out, 0.f);
+
+                for (int n = 0; n < num_coef; n++) {
+                    Coef4D<Idx,float> c = coef[n];
+
+                    float xj = x[sender[edge] * p.num_x * nc + c.j * nc + u];
+                    float yk = y[edge * p.num_y + c.k];
+                    float sl = s[edge * p.num_scalars * nc + c.l * nc + u];
+
+                    message[c.i] += c.val * xj * yk * sl;
                 }
                 // Scalar mixing + scatter-add
                 for (int i = 0; i < p.num_out; i++) {
-                    int s = irrep_out[i];
-                    float r_val = r[edge * p.num_scalars * p.channels_x
-                                    + s * p.channels_x + ch];
-                    out[recv * p.num_out * p.channels_x
-                        + i * p.channels_x + ch] += r_val * tp[i];
+                    out[receiver * p.num_out * nc + i * nc + u] += message[i];
                 }
             }
         }
@@ -197,13 +186,13 @@ ConvArgs<Idx> prepareHostArgs(Params p, int num_strips, bool scale_r) {
         p.num_nodes * p.num_out * p.channels_x
     );
 
-    Vec<float> expect = cpu_convolution<Idx>(
-        coef3, x, y, r, irrep_out,
-        sender, receiver_ptr, p
-    );
-
     std::vector<Coef4D<Idx, float>> coef =
         otimes_mix_coefficients<Idx, float>(coef3, irrep_out.data());
+
+    Vec<float> expect = cpu_convolution<Idx>(
+        coef, x, y, r,
+        sender, receiver_ptr, p
+    );
 
     return ConvArgs<Idx> {
         .coef = coef,

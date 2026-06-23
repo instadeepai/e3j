@@ -459,14 +459,14 @@ xla::Error ConvolutionBwdHandler(
     xla::AnyBuffer coef,
     xla::AnyBuffer x,
     xla::AnyBuffer y,
-    xla::AnyBuffer dz,
-    xla::AnyBuffer mix,
+    xla::AnyBuffer s,
+    xla::AnyBuffer dm,
     xla::BufferR1<xla::DataType::S32> sender,
     xla::BufferR1<xla::DataType::S32> receiver_ptr,
     xla::BufferR1<xla::DataType::S32> edge_perm,
     xla::Result<xla::AnyBuffer> dx,
     xla::Result<xla::AnyBuffer> dy,
-    xla::Result<xla::AnyBuffer> dmix,
+    xla::Result<xla::AnyBuffer> ds,
     int32_t num_nodes,
     int debug = 0
 ) {
@@ -480,8 +480,8 @@ xla::Error ConvolutionBwdHandler(
     int32_t num_x = dims_x[1];
     int32_t channels_x = dims_x.size() > 2 ? dims_x.back() : 1;
     int32_t num_y = dims_y[1];
-    int32_t num_out = dz.dimensions()[1];
-    int32_t num_scalars = mix.dimensions()[1];
+    int32_t num_out = dm.dimensions()[1];
+    int32_t num_scalars = s.dimensions()[1];
 
     // Assert LHS channels are 32-multiple
     bool supported = (channels_x % 32 == 0);
@@ -521,13 +521,13 @@ xla::Error ConvolutionBwdHandler(
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
             y.typed_data<Val>(),                                \
-            dz.typed_data<Val>(),                               \
-            mix.typed_data<Val>(),                              \
+            s.typed_data<Val>(),                                \
+            dm.typed_data<Val>(),                               \
             adj,                                                \
             edge_perm.typed_data(),                             \
             dx->typed_data<Val>(),                              \
             dy->typed_data<Val>(),                              \
-            dmix->typed_data<Val>(),                            \
+            ds->typed_data<Val>(),                            \
             params, stream, debug                               \
         ).to_xla();
 
@@ -546,14 +546,14 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // coef (packed 3x Coef4D<Idx,Val>)
         .Arg<xla::AnyBuffer>()   // x (node features)
         .Arg<xla::AnyBuffer>()   // y (edge embeddings)
-        .Arg<xla::AnyBuffer>()   // dz (cotangent messages)
-        .Arg<xla::AnyBuffer>()   // mix (radial scalars)
+        .Arg<xla::AnyBuffer>()   // s (radial scalars)
+        .Arg<xla::AnyBuffer>()   // dm (cotangent messages)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (transposed CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (transposed CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // edge_perm (transposed → original)
         .Ret<xla::AnyBuffer>()   // dx (cotangent node features)
-        .Ret<xla::AnyBuffer>()   // dy (cotangent edge embeddings)
-        .Ret<xla::AnyBuffer>()   // dmix (cotangent radial scalars)
+        .Ret<xla::AnyBuffer>()   // dy (cotangent edge features)
+        .Ret<xla::AnyBuffer>()   // ds (cotangent edge scalars)
         .Attr<int32_t>("num_nodes")
         .Attr<int32_t>("debug")
 );

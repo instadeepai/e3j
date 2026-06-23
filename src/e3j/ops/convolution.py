@@ -71,9 +71,18 @@ def convolution(
 ) -> Array:
     """Primitive bound to the CUDA convolution kernel.
 
-    Gathers sender node features, computes the tensor product with edge
-    spherical embeddings, mixes with radial scalars, and scatter-reduces
-    by receiver.
+    The equivariant convolution computes the following operation:
+
+        mⱼ= ∑ᵢ (xᵢ⊗ yᵢⱼ) ⊙  sᵢⱼ
+
+    Where the sum runs over neighbor nodes i of the receiver node j.
+    In other words, the convolution kernel fuses the following operations:
+    * gather sender node features `x`,
+    * compute the tensor product with edge (spherical) embeddings `y`,
+    * mix with edge scalars `s`,
+    * scatter-reduce by receiver index.
+
+    The edge messages are computed as a single trilinear mixing of x, y, z.
 
     Args:
         coef: Packed Coef4D coefficients (opaque idx_dtype vector).
@@ -117,9 +126,9 @@ def convolution(
         z = convolution_op(x, y, s)
         return z, (x, y, s)
 
-    def _bwd(res, dz):
+    def _bwd(res, dm):
         x, y, s = res
-        return convolution_bwd(coef, x, y, s, sender, receiver, dz, params)
+        return convolution_bwd(coef, x, y, s, sender, receiver, dm, params)
 
     convolution_op.defvjp(_fwd, _bwd)
 
@@ -139,15 +148,20 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     perm, graph_t, _ = graph.transpose()
 
     with jax.ensure_compile_time_eval():
+        # Transpose coefficients for backward kernel, passed as a triple
+        # (coef_dx, coef_dy, coef_ds) such that:
+        #   - dx = bigotimes(coef_dx, dm, y, s)
+        #   - dy = bigotimes(coef_dy, dm, x, s)
+        #   - ds = bigotimes(coef_ds, dm, y, x)
         c = Coef4D.unpack(coef, val_dtype="float32")
-        coef_dmix = c.transpose((2, 0, 1, 3)).pack_jax()
         coef_dx = c.transpose((1, 0, 2, 3)).pack_jax()
-        coef_dy = c.transpose((3, 0, 2, 1)).pack_jax()
-        coef_3x = jnp.stack([coef_dmix, coef_dx, coef_dy])
+        coef_dy = c.transpose((2, 0, 1, 3)).pack_jax()
+        coef_ds = c.transpose((3, 0, 2, 1)).pack_jax()
+        coef_bwd = jnp.stack([coef_dx, coef_dy, coef_ds])
 
     @custom_vjp
     def convolution_bwd_op(x, y, s, dm):
-        dx, dy, dmix = ffi_call(
+        dx, dy, ds = ffi_call(
             "convolution_bwd",
             (
                 jax.ShapeDtypeStruct(x.shape, x.dtype),
@@ -155,11 +169,11 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
                 jax.ShapeDtypeStruct(s.shape, s.dtype),
             ),
         )(
-            coef_3x,
+            coef_bwd,
             x,
             y,
-            dm,
             s,
+            dm,
             graph_t.sender,
             graph_t.receiver_ptr,
             perm,
@@ -167,11 +181,11 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
             debug=int32(config().debug_level),
         )
 
-        return dx, dy, dmix
+        return dx, dy, ds
 
     conv = partial(
         convolution,
-        coef=coef,
+        coef,
         sender=sender,
         receiver=receiver,
         params=params,

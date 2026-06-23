@@ -206,13 +206,13 @@ e3j::Error launch_bwd(
     const Coef4D<Idx, Val> *coef,
     const Val *gmem_x,
     const Val *gmem_y,
-    const Val *gmem_dz,
-    const Val *gmem_mix,
+    const Val *gmem_s,
+    const Val *gmem_dm,
     const AdjacencyCSR adj,
     const int32_t *edge_perm,
     Val *gmem_dx,
     Val *gmem_dy,
-    Val *gmem_dmix,
+    Val *gmem_ds,
     Params p,
     cudaStream_t stream,
     int debug
@@ -229,16 +229,16 @@ e3j::Error launch_bwd(
         (unsigned int)min((int)cfg.blockDim.x * cfg.N, p.channels_x),
     };
 
-    CuArray2D<const Val> x   = { gmem_x,   p.num_x,       p.channels_x };
-    CuArray2D<const Val> y   = { gmem_y,   p.num_y,       1             };
-    CuArray2D<const Val> dz  = { gmem_dz,  p.num_out,     p.channels_x };
-    CuArray2D<const Val> mix = { gmem_mix, p.num_scalars, p.channels_x  };
+    CuArray2D<const Val> x = { gmem_x, p.num_x, p.channels_x };
+    CuArray2D<const Val> y = { gmem_y, p.num_y, 1 };
+    CuArray2D<const Val> s = { gmem_s, p.num_scalars, p.channels_x };
+    CuArray2D<const Val> dm  = { gmem_dm, p.num_out, p.channels_x };
 
     #define LAUNCH_BWD(N)                                                    \
     convolution::kernel_bwd<Idx,Val,N>                                       \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>                \
-        (coef, x, y, dz, mix, adj, edge_perm,                               \
-         gmem_dx, gmem_dy, gmem_dmix, p.num_nodes, p.num_coef, unroll)
+        (coef, x, y, s, dm, adj, edge_perm,                                  \
+         gmem_dx, gmem_dy, gmem_ds, p.num_nodes, p.num_coef, unroll)
 
     switch(cfg.N) {
         case 4:  LAUNCH_BWD(4); break;
