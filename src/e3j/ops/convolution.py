@@ -69,7 +69,7 @@ def convolution(
     receiver: Array,
     params: ConvolutionParams,
 ) -> Array:
-    """Equivariant convolution: fused tensor product + scalar mixing + aggregation.
+    """Primitive bound to the CUDA convolution kernel.
 
     Gathers sender node features, computes the tensor product with edge
     spherical embeddings, mixes with radial scalars, and scatter-reduces
@@ -127,9 +127,9 @@ def convolution(
 
 
 def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
-    """Backward pass for equivariant convolution.
+    """Primitive bound to the CUDA convolution backward kernel.
 
-    Computes cotangents `dx`, `dy`, `dmix` from output cotangent `ct_z`
+    Computes cotangents `dx`, `dy`, `ds` from output cotangent `dm`
     by calling the fused backward kernel with transposed coefficients
     and transposed CSR adjacency.
     """
