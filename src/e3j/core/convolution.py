@@ -135,6 +135,9 @@ class Convolution:
         rule calls a dedicated `convolution_bwd()` primitive and kernel,
         while higher order derivatives are implemented in terms of
         `convolution()` and `convolution_bwd()`.
+
+        Note:
+            Edges (and edge features) must be sorted by receivers.
         """
         with jax.ensure_compile_time_eval():
             coef4D_packed = coef.pack_jax()
@@ -173,11 +176,16 @@ class Convolution:
         broadcast with node features along the channel axis.
 
         Args:
-            node_features: array of shape `(n0, num_x, num_channels)`
-            edge_features: array of shape `(n1, num_y)`
-            edge_scalars: array of shape `(n1, num_scalars, num_channels)`
-            senders: index vector of length n1, in bounds [0, n0)
-            receivers: index vector of length n2, in bounds [0, n0)
+            node_features: array of shape `(num_nodes, num_x, num_channels)`
+            edge_features: array of shape `(num_edges, num_y)`
+            edge_scalars: array of shape `(num_edges, num_scalars, num_channels)`
+            senders: index vector of length num_edges, in bounds [0, num_nodes)
+            receivers: index vector of length num_edges, in bounds [0, num_nodes)
+
+        Note:
+            When using the CUDA convolution kernel, edges must be sorted by receiver
+            index at graph construction time for now. The adjacency relationship is
+            encoded in a sparse CSR format to avoid atomic (memory-locked) operations.
         """
         match self.config.convolution:
             case options.Convolution.UNFUSED:

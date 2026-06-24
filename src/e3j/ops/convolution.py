@@ -119,6 +119,12 @@ def convolution(
 
     The edge messages are computed as a single trilinear mixing of x, y, z.
 
+    Note:
+        Edges and edge features should be sorted by receiver index, in order
+        to compute the CSR adjacency matrix correctly. This ordering should be
+        done at graph creation time to avoid having to reorder features at
+        every convolution call.
+
     Args:
         coef: Packed Coef4D coefficients (opaque idx_dtype vector).
         x: Node features, shape (num_nodes, num_x, channels_x).
