@@ -49,6 +49,18 @@ class Aggregation(Enum):
     DENSE = "DENSE"
 
 
+class Convolution(Enum):
+    """Evaluation strategy for :class:`~e3j.core.Convolution`.
+
+    Values:
+        UNFUSED: Naive JAX implementation.
+        FUSED_CUDA: Dispatch to custom CUDA kernel via XLA-FFI (requires `e3j_ops`).
+    """
+
+    UNFUSED = "UNFUSED"
+    FUSED_CUDA = "FUSED_CUDA"
+
+
 # FIXME: Integer code translation of enums for the XLA handler.
 #        See lib/e3j_ops/ffi/e3j_ops.h
 # We cannot pass C++ strings to the XLA-FFI handler yet,

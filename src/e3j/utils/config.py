@@ -22,7 +22,7 @@ from pathlib import Path
 import yaml
 
 from e3j.utils._yaml_config import YamlConfig
-from e3j.utils.options import Aggregation, Layout, TensorProduct
+from e3j.utils.options import Aggregation, Convolution, Layout, TensorProduct
 
 E3J_CONFIG = Path(os.environ.get("E3J_CONFIG") or "e3j.yaml")
 
@@ -53,6 +53,8 @@ class Config(YamlConfig):
         aggregation: Aggregation method for sparse reduction steps.
             Only used if `tensor_product` option is "SPARSE".
             See :class:`~e3j.utils.options.Aggregation`.
+        convolution: Evaluation strategy for convolution.
+            See :class:`~e3j.utils.options.Convolution`.
         debug_level: Verbosity level (0 = silent).
 
     Example::
@@ -63,6 +65,9 @@ class Config(YamlConfig):
     layout: Layout = Layout.TRAILING_CHANNELS
     tensor_product: TensorProduct = TensorProduct.SPARSE
     aggregation: Aggregation = Aggregation.SCATTER
+    convolution: Convolution = (
+        Convolution.FUSED_CUDA if E3J_OPS_AVAILABLE else Convolution.UNFUSED
+    )
     debug_level: int = 0
 
 
