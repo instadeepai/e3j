@@ -29,6 +29,12 @@ class Convolution:
     4. Scatter-add messages on receiver nodes.
 
     Optionally, the sum of messages is divided by `avg_num_neighbors`.
+
+    Note:
+        When using the CUDA convolution kernel, edges must be sorted by receiver
+        index for now (at graph construction time). The adjacency relationship
+        is encoded in a sparse CSR format to avoid atomic (memory-locked, non-
+        deterministic) operations.
     """
 
     def __init__(
@@ -180,12 +186,9 @@ class Convolution:
             edge_features: array of shape `(num_edges, num_y)`
             edge_scalars: array of shape `(num_edges, num_scalars, num_channels)`
             senders: index vector of length num_edges, in bounds [0, num_nodes)
-            receivers: index vector of length num_edges, in bounds [0, num_nodes)
-
-        Note:
-            When using the CUDA convolution kernel, edges must be sorted by receiver
-            index at graph construction time for now. The adjacency relationship is
-            encoded in a sparse CSR format to avoid atomic (memory-locked) operations.
+            receivers: index vector of length num_edges, in bounds [0, num_nodes).
+                Expected to be monotonically increasing when using the CUDA
+                convolution kernel (for sparse CSR adjacency representation).
         """
         match self.config.convolution:
             case options.Convolution.UNFUSED:
