@@ -16,12 +16,15 @@ import e3nn_jax as e3nn
 import jax
 import jax.numpy as np
 import jax.random as random
+import numpy
 import pytest
 from conftest import assert_allclose
 
 import e3j
 from e3j.core.convolution import Convolution
+from e3j.ops.coef import Coef4D
 from e3j.utils.options import Layout
+from e3j.utils.sparse import narrow_index_dtype
 
 
 class _TestConvolution:
@@ -107,6 +110,42 @@ class _TestConvolution:
         senders, receivers = graph
         z = module(*inputs, senders, receivers)
         assert z.shape == (self.num_nodes, *self._feature_shape(module.target.dim))
+
+    def test_coef(self, module):
+        """`coef` is a rank-4 Coef4D with self-consistent index dtype.
+
+        Regression guard: the scalar-index column is taken from `mix_indices`,
+        whose default integer type is wider than the narrowed CG index dtype.
+        Without an explicit cast it promotes the stacked array, leaving
+        `coef.idx` and `coef.idx_dtype` inconsistent (and `pack_jax` unsound).
+        """
+        coef = module.coef
+        assert isinstance(coef, Coef4D)
+        assert coef.rank == 4
+        assert coef.idx.shape == (coef.val.shape[0], 4)
+
+        # The index array dtype must match the declared idx_dtype, and be the
+        # smallest integer type fitting the four (output, x, y, scalar) bounds.
+        bounds = (
+            module.target.dim,
+            module.source[0].dim,
+            module.source[1].dim,
+            module.source[2].dim,
+        )
+        assert numpy.dtype(coef.idx.dtype) == numpy.dtype(coef.idx_dtype)
+        assert numpy.dtype(coef.idx_dtype) == numpy.dtype(narrow_index_dtype(bounds))
+        assert numpy.dtype(coef.val.dtype) == numpy.dtype(coef.val_dtype)
+
+        # Indices stay in bounds and the scalar column routes via mix_indices.
+        assert int(coef.idx.min()) >= 0
+        assert bool((coef.idx.max(axis=0) < numpy.array(bounds)).all())
+        numpy.testing.assert_array_equal(
+            coef.idx[:, 3], module._mix.mix_indices[coef.idx[:, 0]]
+        )
+
+        # Packing preserves the index dtype through a round-trip.
+        unpacked = Coef4D.unpack(coef.pack_jax(), val_dtype=coef.val_dtype)
+        assert numpy.dtype(unpacked.idx.dtype) == numpy.dtype(coef.idx_dtype)
 
     def test_equivariance(self, module, inputs, graph, rotations):
         """Convolution commutes with SO3 acting on node and edge features."""
