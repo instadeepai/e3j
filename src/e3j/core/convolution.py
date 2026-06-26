@@ -72,11 +72,12 @@ class Convolution:
         # Statically rescale coefficients by num_neighbors to skip
         # the node-wise message rescaling overhead.
         if avg_num_neighbors is not None:
-            otimes.coef = sparse_bcoo(
-                values=otimes.values / avg_num_neighbors,
-                indices=otimes.indices,
-                shape=otimes.coef.shape,
-            )
+            with jax.ensure_compile_time_eval():
+                otimes.coef = sparse_bcoo(
+                    values=otimes.values / avg_num_neighbors,
+                    indices=otimes.indices,
+                    shape=otimes.coef.shape,
+                )
 
         # Scalar mixing block
         mix = ScalarMixing(otimes.target, layout=layout)
@@ -97,16 +98,17 @@ class Convolution:
     @cache
     def coef(self) -> Coef4D:
         """Return packed Coef4D coefficients for the forward pass."""
-        mix, otimes = self._mix, self._otimes
-        idx = otimes.indices.T
-        mix_idx = np.array(mix.mix_indices, dtype=idx.dtype)
-        coef4D = Coef4D(
-            otimes.values,
-            np.stack([idx[0], idx[1], idx[2], mix_idx[idx[0]]], axis=-1),
-            val_dtype=np.float32,
-            idx_dtype=idx.dtype,
-        )
-        return coef4D
+        with jax.ensure_compile_time_eval():
+            mix, otimes = self._mix, self._otimes
+            idx = otimes.indices.T
+            mix_idx = np.array(mix.mix_indices, dtype=idx.dtype)
+            coef4D = Coef4D(
+                otimes.values,
+                np.stack([idx[0], idx[1], idx[2], mix_idx[idx[0]]], axis=-1),
+                val_dtype=np.float32,
+                idx_dtype=idx.dtype,
+            )
+            return coef4D
 
     def _unfused_eval(
         self,
