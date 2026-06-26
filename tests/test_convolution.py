@@ -205,3 +205,61 @@ class TestConvolutionLeading(_TestConvolution):
     in_edge = "0e + 1o + 2e"
     out = None
     layout = "LEADING_CHANNELS"
+
+
+@pytest.mark.e3j_ops
+class TestConvolutionFused(_TestConvolution):
+    """Fused CUDA kernel must agree with the unfused plain-JAX reference."""
+
+    in_node = "2x0e + 2x1o"
+    in_edge = "0e + 1o + 2e"
+    out = "0e + 1o + 2e"
+    # The convolution kernel currently requires LHS channels in multiples of 32.
+    num_channels = 32
+
+    def assert_zero(self, data, tol: float = 5e-5):
+        # Looser bound: float32 accumulation in the fused kernel.
+        super().assert_zero(data, tol)
+
+    @pytest.fixture(scope="class")
+    def module(self) -> Convolution:
+        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
+            return Convolution(
+                (self.in_node, self.in_edge), self.out, layout=self.layout
+            )
+
+    @pytest.fixture(scope="class")
+    def reference(self) -> Convolution:
+        with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
+            return Convolution(
+                (self.in_node, self.in_edge), self.out, layout=self.layout
+            )
+
+    def test_fused_matches_unfused(self, module, reference, inputs, graph):
+        """`fused_eval` reproduces the gather/TP/mix/scatter reference."""
+        senders, receivers = graph
+        result = module(*inputs, senders, receivers)
+        expect = reference(*inputs, senders, receivers)
+        assert_allclose(expect, result, rtol=2e-3, atol=2e-3)
+
+    def test_jit_pack_jax(self, inputs, reference, graph):
+        """`coef.pack_jax()` must succeed at trace time inside fused_eval.
+
+        Building the module within the traced function forces the packed
+        Coef4D to be materialized during compilation, which only works if the
+        coefficient setup is excluded from the trace via
+        `jax.ensure_compile_time_eval()`.
+        """
+        senders, receivers = graph
+        source = (self.in_node, self.in_edge)
+
+        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
+            f = jax.jit(
+                lambda a, b, c: Convolution(source, self.out, layout=self.layout)(
+                    a, b, c, senders, receivers
+                )
+            )
+            z = f(*inputs)
+
+        expect = reference(*inputs, senders, receivers)
+        assert_allclose(expect, z, rtol=2e-3, atol=2e-3)
