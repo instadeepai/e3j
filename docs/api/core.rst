@@ -13,6 +13,7 @@ core
     :toctree: _core
 
     TensorProduct
+    Convolution
     ScalarMixing
     Monomial
     Polynomial

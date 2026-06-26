@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .bigotimes import Bigotimes
+from .convolution import Convolution
 from .filter import Filter
 from .harmonics import Harmonics
 from .permutation import Permutation
@@ -31,4 +32,5 @@ __all__ = [
     "PowerExpansion",
     "ScalarMixing",
     "TensorProduct",
+    "Convolution",
 ]
