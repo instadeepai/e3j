@@ -99,7 +99,7 @@ class Convolution:
         """Return packed Coef4D coefficients for the forward pass."""
         mix, otimes = self._mix, self._otimes
         idx = otimes.indices.T
-        mix_idx = mix.mix_idx
+        mix_idx = np.array(mix.mix_indices, dtype=idx.dtype)
         coef4D = Coef4D(
             otimes.values,
             np.stack([idx[0], idx[1], idx[2], mix_idx[idx[0]]], axis=-1),

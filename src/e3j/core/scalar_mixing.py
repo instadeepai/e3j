@@ -42,7 +42,7 @@ class ScalarMixing:
         return sum(m for m, ir in self.source)
 
     @property
-    def mix_idx(self) -> Array:
+    def mix_indices(self) -> Array:
         """Return index map from equivariant coordinates to scalars."""
         repeats = []
         for mul, ir in self.source:
@@ -59,7 +59,7 @@ class ScalarMixing:
         n_feats, n_scalars = self.source.dim, self.num_irreps
         values = np.ones(n_feats)
         idx_feats = np.arange(n_feats)
-        idx_scalars = self.mix_idx[idx_feats]
+        idx_scalars = self.mix_indices[idx_feats]
         indices = np.stack((idx_feats, idx_scalars, idx_feats), axis=-1)
         shape = (n_feats, n_scalars, n_feats)
         return sparse_bcoo(values, indices, shape)
@@ -82,7 +82,7 @@ class ScalarMixing:
         if scalars.shape[1:] != scalar_shape:
             scalars = scalars.reshape((-1, *scalar_shape))
 
-        mix_idx = self.mix_idx
+        mix_idx = self.mix_indices
         if layout == Layout.LEADING_CHANNELS:
             return scalars[..., mix_idx] * features
         return scalars[:, mix_idx] * features
