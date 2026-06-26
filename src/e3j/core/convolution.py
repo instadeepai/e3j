@@ -11,6 +11,7 @@ from e3j.spaces import O3Space
 from e3j.utils import options
 from e3j.utils.cache import cache
 from e3j.utils.options import Layout
+from e3j.utils.sparse import sparse_bcoo
 
 
 class Convolution:
@@ -68,6 +69,15 @@ class Convolution:
             normalization=normalization,
             layout=layout,
         )
+        # Statically rescale coefficients by num_neighbors to skip
+        # the node-wise message rescaling overhead.
+        if avg_num_neighbors is not None:
+            otimes.coef = sparse_bcoo(
+                values=otimes.values / avg_num_neighbors,
+                indices=otimes.indices,
+                shape=otimes.coef.shape,
+            )
+
         # Scalar mixing block
         mix = ScalarMixing(otimes.target, layout=layout)
 
@@ -90,13 +100,8 @@ class Convolution:
         mix, otimes = self._mix, self._otimes
         idx = otimes.indices.T
         mix_idx = mix.mix_idx
-        values = (
-            otimes.values
-            if self.avg_num_neighbors is None
-            else otimes.values / self.avg_num_neighbors
-        )
         coef4D = Coef4D(
-            values,
+            otimes.values,
             np.stack([idx[0], idx[1], idx[2], mix_idx[idx[0]]], axis=-1),
             val_dtype=np.float32,
             idx_dtype=idx.dtype,
@@ -122,8 +127,6 @@ class Convolution:
             .at[receivers]
             .add(messages)
         )
-        if self.avg_num_neighbors is not None:
-            return receiver_feats / self.avg_num_neighbors
         return receiver_feats
 
     def _fused_eval(
@@ -133,7 +136,6 @@ class Convolution:
         edge_scalars: Array,
         senders: Array,
         receivers: Array,
-        coef: Coef4D,
     ) -> Array:
         """Apply the :func:`e3j.ops.convolution.convolution` primitive.
 
@@ -146,7 +148,7 @@ class Convolution:
             Edges (and edge features) must be sorted by receivers.
         """
         with jax.ensure_compile_time_eval():
-            coef4D_packed = coef.pack_jax()
+            coef4D_packed = self.coef.pack_jax()
 
         params = ConvolutionParams(
             num_out=self.target.dim,
@@ -200,14 +202,12 @@ class Convolution:
                     receivers,
                 )
             case options.Convolution.FUSED_CUDA:
-                coef = self.coef
                 return self._fused_eval(
                     node_features,
                     edge_features,
                     edge_scalars,
                     senders,
                     receivers,
-                    coef,
                 )
             case _:
                 raise RuntimeError("Unknow convolution implementation.")
