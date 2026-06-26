@@ -214,11 +214,20 @@ __global__ void kernel_bwd (
 
         for (int edge = first_edge; edge < last_edge; edge++) {
 
+            // Gather edge features by `edge_t` in the backward pass
+            // since transposing the graph's CSR adjacency requires to
+            // order edges by senders (instead of receivers).
+            //
+            // NOTE: We could also assume edge transposition acts by (-1)^p
+            //       by equivariance of edge features. It is worth checking
+            //       first how much overhead is incurred by the permuted
+            //       gathering of edge features.
             int edge_t = edge_perm ? edge_perm[edge] : edge;
-            int recv = adj.sender[edge];
+
+            int receiver = adj.sender[edge];
 
             // Load dm[receiver], y[edge_t], s[edge_t]
-            smem.dm.load<N>(dm_, recv);
+            smem.dm.load<N>(dm_, receiver);
             smem.y.load<1>(y, edge_t);
             smem.mix.load<N>(s_, edge_t);
 
