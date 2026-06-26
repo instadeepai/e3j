@@ -40,7 +40,7 @@ class Convolution:
     def __init__(
         self,
         source: tuple[O3Space, O3Space] | tuple[O3Space, O3Space, O3Space],
-        target: O3Space | None,
+        target: O3Space | None = None,
         layout: Layout = Layout.TRAILING_CHANNELS,
         avg_num_neighbors: float | None = None,
         normalization: str | options.TPNormalization = "SQRT_DIM_OUT",
