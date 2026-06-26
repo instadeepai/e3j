@@ -14,6 +14,8 @@
 
 """JAX integration tests for convolution: vmap, sharding, AD composition."""
 
+import re
+
 import jax
 import jax.numpy as np
 import jax.random as random
@@ -188,7 +190,31 @@ def test_vmap_fwd_convolution_multi_devices():
     ).compile()
 
     hlo = compiled.as_text()
-    assert 'custom_call_target="convolution"' in hlo
+
+    # The batch (4) is sharded over 2 devices and the custom_vmap rule folds the
+    # 2 per-shard elements into the kernel row axis: node arrays get 2 * 4 = 8
+    # rows, edge arrays 2 * 12 = 24. The CSR adjacency is replicated, hence tiled
+    # for the full batch: sender 4 * 12 = 48, receiver_ptr 4 * 4 + 1 = 17.
+    #
+    # Dimension legend (also used by the backward test):
+    #   8  = sharded nodes, 24 = sharded edges, 4 = NUM_OUT/X/Y, 32 = CHANNELS_X
+    #   2  = NUM_SCALARS, 20 = nnz, 8 (coef) = packed Coef4D entry (1 val + 4 idx)
+    regex = re.compile(
+        r"= f32\[8,4,32\]\{2,1,0\} custom-call.+"  # output: messages z
+        r'custom_call_target="convolution".+'
+        r"operand_layout_constraints=\{"
+        r"s32\[20,8\]\{1,0\}, "  # coef (packed Coef4D)
+        r"f32\[8,4,32\]\{2,1,0\}, "  # x (node features)
+        r"f32\[24,4\]\{1,0\}, "  # y (edge embeddings)
+        r"f32\[24,2,32\]\{2,1,0\}, "  # s (edge scalars)
+        r"s32\[48\]\{0\}, "  # sender (CSR, replicated)
+        r"s32\[17\]\{0\}\}",  # receiver_ptr (CSR, replicated)
+        flags=re.MULTILINE,
+    )
+    assert len(list(regex.finditer(hlo))) == 1, (
+        f"Expected exactly one convolution custom call, found "
+        f"{len(list(regex.finditer(hlo)))}.\n\nHLO:\n{hlo}"
+    )
 
 
 def test_vmap_grad_convolution_multi_devices():
@@ -233,7 +259,30 @@ def test_vmap_grad_convolution_multi_devices():
     ).compile()
 
     hlo = compiled.as_text()
-    assert 'custom_call_target="convolution_bwd"' in hlo
+
+    # Same shard/batch folding as the forward test; see its dimension legend.
+    # Extras here: coef_bwd stacks the 3 transposed COO orderings (dx, dy, ds),
+    # and perm (the edge sort) joins the replicated CSR adjacency operands.
+    regex = re.compile(
+        # outputs: (dx, dy, ds)
+        r"\(f32\[8,4,32\]\{2,1,0\}, f32\[24,4\]\{1,0\}, f32\[24,2,32\]\{2,1,0\}\)"
+        r" custom-call.+"
+        r'custom_call_target="convolution_bwd".+'
+        r"operand_layout_constraints=\{"
+        r"s32\[3,20,8\]\{2,1,0\}, "  # coef_bwd (dx, dy, ds orderings)
+        r"f32\[8,4,32\]\{2,1,0\}, "  # x
+        r"f32\[24,4\]\{1,0\}, "  # y
+        r"f32\[24,2,32\]\{2,1,0\}, "  # s
+        r"f32\[8,4,32\]\{2,1,0\}, "  # dm (output cotangent)
+        r"s32\[48\]\{0\}, "  # sender_t (transposed CSR)
+        r"s32\[17\]\{0\}, "  # receiver_ptr_t
+        r"s32\[48\]\{0\}\}",  # perm (edge permutation)
+        flags=re.MULTILINE,
+    )
+    assert len(list(regex.finditer(hlo))) == 1, (
+        f"Expected exactly one convolution_bwd custom call, found "
+        f"{len(list(regex.finditer(hlo)))}.\n\nHLO:\n{hlo}"
+    )
 
 
 # --- Hessian (jacrev ∘ grad) ---
