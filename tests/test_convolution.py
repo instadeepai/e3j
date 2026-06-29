@@ -30,8 +30,8 @@ from e3j.utils.sparse import narrow_index_dtype
 class _TestConvolution:
     """Base class for Convolution tests, exercising the unfused plain-JAX path."""
 
-    in_node: str
-    in_edge: str
+    node_irreps: str
+    edge_irreps: str
     out: str | None = None
     num_nodes: int = 6
     num_edges: int = 18
@@ -68,7 +68,7 @@ class _TestConvolution:
         """Build a Convolution capturing the unfused config at construction."""
         with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
             return Convolution(
-                (self.in_node, self.in_edge), self.out, layout=self.layout
+                (self.node_irreps, self.edge_irreps), self.out, layout=self.layout
             )
 
     @pytest.fixture(scope="class")
@@ -169,7 +169,7 @@ class _TestConvolution:
         avg = 3.0
         with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
             scaled = Convolution(
-                (self.in_node, self.in_edge),
+                (self.node_irreps, self.edge_irreps),
                 self.out,
                 layout=self.layout,
                 avg_num_neighbors=avg,
@@ -189,20 +189,44 @@ class _TestConvolution:
 
 
 class TestConvolution_full(_TestConvolution):
-    in_node = "2x0e + 1o"
-    in_edge = "0e + 1o + 2e"
+    node_irreps = "0e + 1o + 2e + 3o"
+    edge_irreps = "0e + 1o + 2e + 3o"
     out = None
 
 
 class TestConvolution_filtered(_TestConvolution):
-    in_node = "2x0e + 2x1o"
-    in_edge = "0e + 1o + 2e"
+    node_irreps = "2x0e + 2x1o"
+    edge_irreps = "0e + 1o + 2e"
     out = "0e + 1o + 2e"
 
 
+class TestConvolution_pseudotensors(_TestConvolution):
+    """Check parity-flipped irreps under improper rotations."""
+
+    node_irreps = "0o + 1e + 2o + 3e"
+    edge_irreps = "0o + 1e + 2o + 3e"
+    out = None
+
+    @pytest.fixture(scope="class")
+    def rotations(self, module) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Output, node and edge action matrices for an improper rotation.
+
+        Negating a proper rotation `R` (det +1) yields `-R`, which stays
+        orthogonal and has det -1 in 3D, hence represents a rotation composed
+        with the inversion that distinguishes pseudo-tensors from tensors.
+        """
+        rotation = -e3nn.rand_matrix(self.key)
+        node_space, edge_space, _ = module.source
+        return (
+            module.target.action(rotation),
+            node_space.action(rotation),
+            edge_space.action(rotation),
+        )
+
+
 class TestConvolutionLeading(_TestConvolution):
-    in_node = "2x0e + 1o"
-    in_edge = "0e + 1o + 2e"
+    node_irreps = "2x0e + 1o"
+    edge_irreps = "0e + 1o + 2e"
     out = None
     layout = "LEADING_CHANNELS"
 
@@ -211,9 +235,9 @@ class TestConvolutionLeading(_TestConvolution):
 class TestConvolutionFused(_TestConvolution):
     """Fused CUDA kernel must agree with the unfused plain-JAX reference."""
 
-    in_node = "2x0e + 2x1o"
-    in_edge = "0e + 1o + 2e"
-    out = "0e + 1o + 2e"
+    node_irreps = "0e + 1o + 2e + 3o"
+    edge_irreps = "0e + 1o + 2e + 3o"
+    out = "0e + 1o + 2e + 3o"
     # The convolution kernel currently requires LHS channels in multiples of 32.
     num_channels = 32
 
@@ -225,14 +249,14 @@ class TestConvolutionFused(_TestConvolution):
     def module(self) -> Convolution:
         with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
             return Convolution(
-                (self.in_node, self.in_edge), self.out, layout=self.layout
+                (self.node_irreps, self.edge_irreps), self.out, layout=self.layout
             )
 
     @pytest.fixture(scope="class")
     def reference(self) -> Convolution:
         with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
             return Convolution(
-                (self.in_node, self.in_edge), self.out, layout=self.layout
+                (self.node_irreps, self.edge_irreps), self.out, layout=self.layout
             )
 
     def test_fused_matches_unfused(self, module, reference, inputs, graph):
@@ -251,7 +275,7 @@ class TestConvolutionFused(_TestConvolution):
         `jax.ensure_compile_time_eval()`.
         """
         senders, receivers = graph
-        source = (self.in_node, self.in_edge)
+        source = (self.node_irreps, self.edge_irreps)
 
         with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
             f = jax.jit(
@@ -263,3 +287,53 @@ class TestConvolutionFused(_TestConvolution):
 
         expect = reference(*inputs, senders, receivers)
         assert_allclose(expect, z, rtol=2e-3, atol=2e-3)
+
+    @staticmethod
+    def _loss(conv):
+        """Quadratic loss closing over `conv`; indices are plain arguments."""
+
+        def loss(node, edge, scalar, snd, rcv):
+            return np.sum(conv(node, edge, scalar, snd, rcv) ** 2)
+
+        return loss
+
+    def test_grad_traced_indices(self, module, reference, inputs, graph):
+        """Backward with senders/receivers passed as traced arguments.
+
+        Every other fused test closes over the adjacency as compile-time
+        constants. MLIP instead feeds the graph in as a runtime argument, so
+        the fused op closes over index *tracers* rather than constants. This
+        guards that path (regression for a tracer routed through the
+        `custom_vjp`/`custom_partitioning` index closures) against the unfused
+        reference gradient. `snd`/`rcv` are arguments (hence tracers) but not
+        differentiated.
+        """
+        senders, receivers = graph
+        argnums = (0, 1, 2)
+        g_fused = jax.grad(self._loss(module), argnums=argnums)(
+            *inputs, senders, receivers
+        )
+        g_ref = jax.grad(self._loss(reference), argnums=argnums)(
+            *inputs, senders, receivers
+        )
+        for gf, gr in zip(g_fused, g_ref):
+            assert_allclose(gf, gr, rtol=2e-3, atol=2e-3)
+
+    def test_grad_jit_traced_indices(self, module, reference, inputs, graph):
+        """`grad` of a jitted call with traced indices (the MLIP nesting).
+
+        Same as :meth:`test_grad_traced_indices`, but differentiates *through*
+        an inner `jit` (`grad(jit(f))`) as MLIP does via `jax.jit(apply)`.
+        Pairing the two isolates whether the nested `jit` is required to
+        trigger the failure or whether traced indices alone suffice.
+        """
+        senders, receivers = graph
+        argnums = (0, 1, 2)
+        g_fused = jax.grad(jax.jit(self._loss(module)), argnums=argnums)(
+            *inputs, senders, receivers
+        )
+        g_ref = jax.grad(self._loss(reference), argnums=argnums)(
+            *inputs, senders, receivers
+        )
+        for gf, gr in zip(g_fused, g_ref):
+            assert_allclose(gf, gr, rtol=2e-3, atol=2e-3)
