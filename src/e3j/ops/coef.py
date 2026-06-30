@@ -13,11 +13,16 @@
 # limitations under the License.
 
 """
-Example:
+Structured dtype arrays used to pack sparse COO coefficients.
+
+While Numpy supports structured dtype such as:
 
     _Coef = numpy.dtype([
         ("val", "float32"), ("i", "int32"), ("j", "int32"), ("k", "int32")
     ])
+
+JAX does not, so we have to reinterpret_cast the packed Numpy array as
+an opaque `idx_t*` array to pass coefficients through the XLA-FFI call.
 """
 
 from enum import Enum
@@ -28,25 +33,17 @@ import jax.numpy as jnp
 import numpy
 from flax import struct
 
-# TODO: add support for F16 and/or BF16
-
 
 def _next_pow2(n: int) -> int:
-    if n <= 1:
-        return 1
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    return n + 1
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
 
 
 class ValDtype(Enum):
     """Scalar value dtypes supported by the e3j_ops binary."""
 
     F32 = "float32"
+
+    # TODO: add support for F16 and/or BF16
 
     def __str__(self):
         return self.value
@@ -57,6 +54,8 @@ class IdxDtype(Enum):
 
     I32 = "int32"
     U8 = "uint8"
+
+    # TODO: reintroduce support for U16
 
     def __str__(self):
         return self.value
