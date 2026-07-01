@@ -288,9 +288,9 @@ __global__ void kernel (
     // matching the public convolution API.
     using Coef = Coef4D<Idx,Val>;
 
-    int size_x = x.size();
-    int size_y = y.size();
-    int size_out = z.size();
+    // NOTE: size_t so `blockIdx.x * size_out` / `gridDim.x * size_out` below
+    //       are computed in 64 bit, avoiding output offset overflow on large graphs.
+    size_t size_out = z.size();
 
     int num_strides = 1 + (max((int)x.shape[1], (int)z.shape[1]) - 1)
                          / (blockDim.x * N);
@@ -349,6 +349,13 @@ __global__ void kernel (
             for (int edge = first_edge; edge < last_edge; edge++) {
 
                 int sender = adj.sender[edge];
+
+                // NOTE: temporary guard. `sender` is used below as an unchecked
+                // offset into node features (x[sender]); a value >= num_nodes
+                // reads past `x` and causes CUDA_ERROR_ILLEGAL_ADDRESS. Skipping
+                // such edges tells us whether out-of-range senders are the cause
+                // of the random segfaults. Remove once root cause is confirmed.
+                if (sender < 0 || sender >= num_nodes) continue;
 
                 // Load sender features, edge embeddings, and radial scalars.
                 smem.lhs.load<N>(x_, sender);

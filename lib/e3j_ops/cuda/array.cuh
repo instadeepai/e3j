@@ -71,10 +71,12 @@ struct CuArray2D {
             );
     }
 
-    // Load a 2D-row from GMEM pointer and restore initial state.
-    // Mostly useful for random accesses (e.g. message-passing).
+    // Load a 2D slice from a GMEM CuArray2D and random row index.
+    //
+    // NOTE: The `row * size()` address must be computed in 64 bit to avoid overflows
+    //       and segmentation faults on large graphs and feature sizes.
     template<int N=1>
-    __device__ void load(CuArray2D<const T> &src, unsigned int row) {
+    __device__ void load(CuArray2D<const T> &src, size_t row) {
         src.data += row * src.size();
         load<N>(src);
         src.data -= row * src.size();
@@ -92,9 +94,11 @@ struct CuArray2D {
             );
     }
 
-    // Store a 2D-row to GMEM pointer and restore initial state.
-    // Mostly useful for random accesses (e.g. message-passing).
-    __device__ void store(CuArray2D<T> &dst, unsigned int row) {
+    // Store a 2D slice to a GMEM CuArray2D at a random row index.
+    //
+    // NOTE: The `row * size()` address must be computed in 64 bit to avoid overflows
+    //       and segmentation faults on large graphs and feature sizes.
+    __device__ void store(CuArray2D<T> &dst, size_t row) {
         dst.data += row * dst.size();
         store(dst);
         dst.data -= row * dst.size();

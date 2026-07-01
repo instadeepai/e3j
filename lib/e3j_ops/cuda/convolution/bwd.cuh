@@ -222,7 +222,7 @@ __global__ void kernel_bwd (
             //       by equivariance of edge features. It is worth checking
             //       first how much overhead is incurred by the permuted
             //       gathering of edge features.
-            int edge_t = edge_perm ? edge_perm[edge] : edge;
+            size_t edge_t = (size_t)(edge_perm ? edge_perm[edge] : edge);
 
             int receiver = adj.sender[edge];
 
