@@ -84,7 +84,7 @@ __global__ void kernel(
     // - trailing ones hold 0s for safe full-warp shuffling
     // - pipeline one read ahead to hide GMEM latency
     Val val_next = 0;
-    Idx idx_next = -lane;
+    Idx idx_next = -1 - lane;
     if (col < p.num_idx and row < p.num_rows) {
         val_next = val[p.num_idx * row + col];
         idx_next = idx[col];
@@ -111,6 +111,9 @@ __global__ void kernel(
         if (next < p.num_idx and row < p.num_rows) {
             val_next = val[p.num_idx * row + next];
             idx_next = idx[next];
+        } else {
+            val_next = 0;
+            idx_next = -1 - lane;   // strictly-negative, per-lane unique sentinel
         }
 
         // "Forest" reduction of values across warps
