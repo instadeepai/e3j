@@ -53,7 +53,8 @@ class Convolution:
         Args:
             source: representations of the two tensor-product inputs (node and
                 edge features), optionally followed by the edge-scalar space.
-            target: output representation, inferred by default.
+            target: output representation, inferred by default. Passing a target
+                argument enforces a filter on the output irreducible blocks.
             layout: specifies the channel axis, `TRAILING_CHANNELS` is faster.
             avg_num_neighbors: if given, messages are divided by this factor.
             normalization: normalization of the tensor product's Clebsch-Gordan
