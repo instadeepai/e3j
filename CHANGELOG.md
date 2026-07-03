@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- Pallas Mosaic TPU tensor product forward and backward kernels, selectable via
+  the new `TensorProduct.FUSED_MOSAIC_TPU` option (TRAILING_CHANNELS layout, OUTER
+  and MAP modes). These kernels reach about 80% of HBM throughput with 128 channels
+  on a TPU v4.
+
 ## [0.1.0b3] — 2026-06-10
 
 ### Fixed

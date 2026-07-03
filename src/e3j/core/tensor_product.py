@@ -29,6 +29,10 @@ import e3j.utils as utils
 from e3j.ops import TensorProductParams as Params
 from e3j.ops import tensor_product
 from e3j.ops.coef import Coef
+from e3j.pallas_ops.tensor_product import (
+    PallasMosaicTPUTensorProductParams,
+    tensor_product_pallas_mosaic_tpu,
+)
 from e3j.spaces import O3Space
 from e3j.utils import cache, options
 from e3j.utils.options import Layout
@@ -46,11 +50,20 @@ class TensorProduct(SparseMixin):
 
     defined by a 3D coefficient array `c` in sparse BCOO format.
 
-    Evaluation is implemented by:
+    The sparse evaluation algorithm consists of a loop over non-zero coefficients,
 
     1. a pull-back of `x` and `y` by coefficient indices `j` and `k`,
     2. a product of `x[:,j]`, `y[:,k]` and coefficient values `c[i,j,k]`,
-    3. a sparse reduction step to aggregate output coordinates `z[:,i]`.
+    3. accumulation on output coordinates `z[:,i]`.
+
+    Dedicated kernels for GPU and TPU should be selected from the environment in
+    the global :class:`~e3j.utils.config.Config`. Otherwise, run:
+
+    .. code:: python
+
+        e3j.config(tensor_product="FUSED")              # CUDA
+        e3j.config(tensor_product="FUSED_MOSAIC_TPU")   # Pallas MTPU
+        e3j.config(tensor_product="SPARSE")             # plain JAX, all platforms
     """
 
     @utils.cache
@@ -153,6 +166,10 @@ class TensorProduct(SparseMixin):
     @property
     def is_fused(self):
         return self.config.tensor_product == options.TensorProduct.FUSED
+
+    @property
+    def is_mtpu(self):
+        return self.config.tensor_product == options.TensorProduct.FUSED_MOSAIC_TPU
 
     @classmethod
     def infer_target(
@@ -331,6 +348,40 @@ class TensorProduct(SparseMixin):
             coef = Coef(val, idx, val_dtype=val.dtype, idx_dtype=idx.dtype).pack_jax()
         return tensor_product(coef, x, y, params)
 
+    def _mtpu_params(self, coef: sparse.BCOO | None = None):
+        """Build Pallas Mosaic TPU kernel parameters from this tensor product.
+
+        The kernel statically unrolls the Clebsch-Gordan structure from the
+        COO `(idx, coef)` arrays, so they are materialized as concrete numpy
+        arrays at trace time.
+        """
+
+        if coef is None:
+            coef = self.coef
+        if self.mode not in (options.TPMode.OUTER, options.TPMode.MAP):
+            raise NotImplementedError(
+                f"Mosaic TPU tensor product does not support mode {self.mode}; "
+                "use 'OUTER' or 'MAP'."
+            )
+        with jax.ensure_compile_time_eval():
+            idx = numpy.asarray(coef.indices)
+            val = numpy.asarray(coef.data)
+        return PallasMosaicTPUTensorProductParams(
+            indices=idx,
+            values=val,
+            layout=self.layout,
+            mode=self.mode,
+            x_space=self.source[0],
+            y_space=self.source[1],
+            z_space=self.target,
+        )
+
+    def mtpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
+        """Evaluate bilinear map via the Pallas Mosaic TPU kernel."""
+
+        params = self._mtpu_params(coef)
+        return tensor_product_pallas_mosaic_tpu(x, y, params)
+
     def __call__(self, x: Array, y: Array, coef: Array | None = None) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         # Only load coefficients from `self` if not passed explicitly
@@ -341,5 +392,7 @@ class TensorProduct(SparseMixin):
             return self.dense_eval(x, y, coef)
         if self.is_fused:
             return self.fused_eval(x, y, coef)
+        if self.is_mtpu:
+            return self.mtpu_eval(x, y, coef)
         else:
             return self.sparse_eval(x, y, coef)

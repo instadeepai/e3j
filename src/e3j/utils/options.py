@@ -22,21 +22,23 @@ class TensorProduct(Enum):
 
     Values:
         SPARSE: Pull-back inputs by CG indices, multiply, then aggregate.
-        DENSE: Evaluate via ``einsum`` on dense CG coefficient array.
-        FUSED: Dispatch to custom CUDA kernel via XLA-FFI (requires ``e3j_ops``).
+        DENSE: Evaluate via `einsum` on dense CG coefficient array.
+        FUSED: Dispatch to custom CUDA kernel via XLA-FFI (requires `e3j_ops`).
+        FUSED_MOSAIC_TPU: Dispatch to the Pallas Mosaic TPU kernel.
     """
 
     FUSED = "FUSED"
     SPARSE = "SPARSE"
     DENSE = "DENSE"
+    FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
 
 
 class Aggregation(Enum):
     """Aggregation method for the sparse reduction step.
 
     Values:
-        SCATTER: ``jax.lax.scatter_add`` — JAX-native, CPU and GPU compatible.
-        SCATTER_1: Custom CUDA ``scatter_add_1`` kernel (requires ``e3j_ops``).
+        SCATTER: `jax.lax.scatter_add` — JAX-native, CPU and GPU compatible.
+        SCATTER_1: Custom CUDA `scatter_add_1` kernel (requires `e3j_ops`).
         SPARSE: Matmul with a sparse BCOO target matrix.
         DENSE: Matmul with a dense target matrix.
     """
