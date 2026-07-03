@@ -187,11 +187,10 @@ class TensorProduct(SparseMixin):
         return O3Space.otimes(source[0], source[1], target, sort)
 
     def sort(self) -> "TensorProduct":
-        """Sort irreducible output blocks.
+        """Sort irreducible output blocks by degree and parity.
 
-        In contrast with `e3nn`, the reordering of output coordinates is
-        performed once and for all on the full coefficient tensor,
-        avoiding the associated overhead at evaluation time.
+        The ordering agrees with `e3nn`. It is performed once for all
+        on the coefficient tensor by permuting target coordinates.
         """
         perm = Permutation.sort(self.target)
         if not self.is_dense:
