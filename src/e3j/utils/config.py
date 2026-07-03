@@ -60,9 +60,7 @@ class Config(YamlConfig):
     """
 
     layout: Layout = Layout.TRAILING_CHANNELS
-    tensor_product: TensorProduct = (
-        TensorProduct.FUSED if E3J_OPS_AVAILABLE else TensorProduct.SPARSE
-    )
+    tensor_product: TensorProduct = TensorProduct.SPARSE
     aggregation: Aggregation = Aggregation.SCATTER
     debug_level: int = 0
 
@@ -97,23 +95,47 @@ class config(Config):
 
     def __new__(cls, **kwargs):
         """Get/set the global configuration object."""
-        # Initialize global configuration
+        # Initialize global singleton: config() -> config
         if not cls._is_initialized:
+            # Set singleton config object from default Config dataclass
+            default_config = cls._default_backend_config()
             _state = super().__new__(cls)
+            for key in cls.fields():
+                setattr(_state, key, getattr(default_config, key))
             cls._state = _state
-        # Getter
+            cls._is_initialized = True
+        # Getter: config(key) -> value
         if not len(kwargs):
             return cls._state
-        # Setter
+        # Setter: config(key=value)
         for key, value in kwargs.items():
             setattr(cls._state, key, value)
         return cls._state
 
     def __init__(self, **kwargs):
-        if self.__class__._is_initialized:
-            return None
-        super().__init__(**kwargs)
-        self.__class__._is_initialized = True
+        # Global state is created and seeded in __new__; nothing to do here.
+        return None
+
+    @classmethod
+    def _default_backend_config(cls) -> Config:
+        """Backend-specific default configuration.
+
+        The tensor product strategy depends on the active JAX backend
+        (`E3J_BACKEND` overrides it, e.g. for tests) and on whether the
+        `e3j_ops` CUDA extension is available: the fused CUDA kernel on
+        GPU, the Pallas Mosaic kernel on TPU, and the portable sparse
+        path otherwise. All other fields keep their dataclass defaults.
+        """
+        backend = os.environ.get("E3J_BACKEND")
+        if not backend:
+            import jax
+
+            backend = jax.default_backend()
+        if backend == "tpu":
+            return Config(tensor_product=TensorProduct.FUSED_MOSAIC_TPU)
+        if backend == "gpu" and E3J_OPS_AVAILABLE:
+            return Config(tensor_product=TensorProduct.FUSED)
+        return Config()
 
     @classmethod
     def fields(cls):
