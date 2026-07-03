@@ -50,11 +50,20 @@ class TensorProduct(SparseMixin):
 
     defined by a 3D coefficient array `c` in sparse BCOO format.
 
-    Evaluation is implemented by:
+    The sparse evaluation algorithm consists of a loop over non-zero coefficients,
 
     1. a pull-back of `x` and `y` by coefficient indices `j` and `k`,
     2. a product of `x[:,j]`, `y[:,k]` and coefficient values `c[i,j,k]`,
-    3. a sparse reduction step to aggregate output coordinates `z[:,i]`.
+    3. accumulation on output coordinates `z[:,i]`.
+
+    Dedicated kernels for GPU and TPU should be selected from the environment in
+    the global :class:`~e3j.utils.config.Config`. Otherwise, run:
+
+    .. code:: python
+
+        e3j.config(tensor_product="FUSED")              # CUDA
+        e3j.config(tensor_product="FUSED_MOSAIC_TPU")   # Pallas MTPU
+        e3j.config(tensor_product="SPARSE")             # plain JAX, all platforms
     """
 
     @utils.cache
