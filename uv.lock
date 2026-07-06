@@ -424,7 +424,7 @@ wheels = [
 
 [[package]]
 name = "e3j"
-version = "0.1.0b3"
+version = "0.1.0b4"
 source = { editable = "." }
 dependencies = [
     { name = "e3nn-jax" },
@@ -540,7 +540,7 @@ tpu = [
 
 [[package]]
 name = "e3j-ops"
-version = "0.1.0b3"
+version = "0.1.0b4"
 source = { editable = "lib/e3j_ops" }
 
 [[package]]

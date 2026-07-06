@@ -41,10 +41,24 @@ CXX_LIBS=
 # NVCC compiler options:
 # -g -lineinfo will relate cuda source to SASS
 NVCC=nvcc
+
+# Compute capability of the local GPU, e.g. "89" for sm_89.
+GPU_ARCH ?= $(shell __nvcc_device_query)
+
+# Fall back to a default set of architectures when no GPU is detected.
+ifeq ($(strip $(GPU_ARCH)),)
+GPU_ARCH := 80 86
+$(info No GPU detected, building for sm_$(GPU_ARCH))
+else
+$(info Building for sm_$(GPU_ARCH))
+endif
+
+GENCODE_FLAGS=$(foreach arch,$(GPU_ARCH),\
+	--generate-code=arch=compute_$(arch),code=[compute_$(arch),sm_$(arch)])
+
 NVCC_FLAGS=--threads 4 -Xcompiler -Wall -ldl\
 	--expt-relaxed-constexpr -O3 -DNDEBUG -Xcompiler -O3\
-	--generate-code=arch=compute_80,code=[compute_80,sm_80]\
-	--generate-code=arch=compute_86,code=[compute_86,sm_86]\
+	$(GENCODE_FLAGS)\
 	-Xcompiler=-fPIC -Xcompiler=-fvisibility=hidden
 NVCC_LIBS=
 

@@ -9,10 +9,13 @@ find_package(pybind11 CONFIG REQUIRED)
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --threads 4 -Xcompiler -w \
     -ldl --expt-relaxed-constexpr -O3 -DNDEBUG -O3 \
-    -arch=sm_90\
+    -gencode=arch=compute_80,code=sm_80\
+    -gencode=arch=compute_86,code=sm_86\
+    -gencode=arch=compute_89,code=sm_89\
     -gencode=arch=compute_90,code=sm_90\
     -gencode=arch=compute_90a,code=sm_90a\
-    -gencode=arch=compute_90a,code=compute_90a\
+    -gencode=arch=compute_100,code=sm_100\
+    -gencode=arch=compute_100,code=compute_100\
   -Xcompiler=-fPIC -Xcompiler=-fvisibility=hidden")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto=auto -fno-fat-lto-objects")
