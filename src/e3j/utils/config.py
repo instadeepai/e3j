@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -25,11 +26,11 @@ from e3j.utils.options import Aggregation, Layout, TensorProduct
 
 E3J_CONFIG = Path(os.environ.get("E3J_CONFIG") or "e3j.yaml")
 
-E3J_OPS_AVAILABLE = True
-try:
-    import e3j_ops  # noqa
-except ModuleNotFoundError:
-    E3J_OPS_AVAILABLE = False
+# Check if `e3j_ops` is installed for our CUDA binaries
+_E3J_OPS_AVAILABLE = importlib.util.find_spec("e3j_ops") is not None
+
+# Check if `jax[tpu]` is installed, without initializing JAX backends.
+_TPU_AVAILABLE = importlib.util.find_spec("libtpu") is not None
 
 
 @dataclass
@@ -91,19 +92,16 @@ class config(Config):
 
     _path = E3J_CONFIG if E3J_CONFIG.exists() else None
 
-    _is_initialized: bool = False
-
     def __new__(cls, **kwargs):
         """Get/set the global configuration object."""
         # Initialize global singleton: config() -> config
-        if not cls._is_initialized:
+        if cls._state is None:
             # Set singleton config object from default Config dataclass
             default_config = cls._default_backend_config()
             _state = super().__new__(cls)
             for key in cls.fields():
                 setattr(_state, key, getattr(default_config, key))
             cls._state = _state
-            cls._is_initialized = True
         # Getter: config(key) -> value
         if not len(kwargs):
             return cls._state
@@ -120,21 +118,26 @@ class config(Config):
     def _default_backend_config(cls) -> Config:
         """Backend-specific default configuration.
 
-        The tensor product strategy depends on the active JAX backend
-        (`E3J_BACKEND` overrides it, e.g. for tests) and on whether the
-        `e3j_ops` CUDA extension is available: the fused CUDA kernel on
-        GPU, the Pallas Mosaic kernel on TPU, and the portable sparse
-        path otherwise. All other fields keep their dataclass defaults.
+        Detects available JAX backends from the package environment
+        using `importlib`, to avoid initializing JAX backends, assuming
+        the install is consistent.
+
+        The backend detection logic can be overriden by the `$E3J_BACKEND`
+        environment variable.
         """
+        # Bypass our fragile backend detection attempts with $E3J_BACKEND
         backend = os.environ.get("E3J_BACKEND")
         if not backend:
-            import jax
+            if _E3J_OPS_AVAILABLE:
+                backend = "gpu"
+            if _TPU_AVAILABLE:
+                backend = "tpu"
 
-            backend = jax.default_backend()
-        if backend == "tpu":
-            return Config(tensor_product=TensorProduct.FUSED_MOSAIC_TPU)
-        if backend == "gpu" and E3J_OPS_AVAILABLE:
+        if backend == "gpu" and _E3J_OPS_AVAILABLE:
             return Config(tensor_product=TensorProduct.FUSED)
+        if backend == "tpu" and _TPU_AVAILABLE:
+            return Config(tensor_product=TensorProduct.FUSED_MOSAIC_TPU)
+
         return Config()
 
     @classmethod
