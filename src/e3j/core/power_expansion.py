@@ -174,16 +174,12 @@ class PowerExpansion:
         for nu in range(2, self.exponent + 1):
             # Filter output
             irreps_out = self.get_target_filter(nu)
-            # TODO: support MAP mode with leading channels too, which allows
-            #       to unroll over the batch axis.
-            layout = Layout.parse(self.layout)
-            mode = TPMode.MAP if layout == Layout.TRAILING_CHANNELS else TPMode.OUTER
             # Accumulate TP layer
             otimes = TensorProduct(
                 (irrep_nu, self.source),
                 irreps_out,
                 layout=self.layout,
-                mode=mode,
+                mode=TPMode.MAP,
             )
             irrep_nu = otimes.target
             layers.append(otimes)
