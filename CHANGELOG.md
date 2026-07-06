@@ -4,34 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased]
+## [0.1.0b4] — 2026-07-06
 
 ### Added
 
 - Pallas Mosaic TPU tensor product forward and backward kernels, selectable via
-  the new `TensorProduct.FUSED_MOSAIC_TPU` option (TRAILING_CHANNELS layout, OUTER
+  the new `TensorProduct.FUSED_MOSAIC_TPU` option (trailing channels layout, OUTER
   and MAP modes). These kernels reach about 80% of HBM throughput with 128 channels
   on a TPU v4.
+
+### Changed
+
+- Binaries for `e3j_ops` now built as SASS for compute capabilities 8.0, 8.6, 8.9,
+  9.0, 9.0a, 10.0 and as 10.0+ forward compatible PTX, mostly improving support for
+  earlier 8.x compute capabilities.
 
 ## [0.1.0b3] — 2026-06-10
 
 ### Fixed
 
 - Fused tensor product backward (`tensor_product_bwd()`) left gradient rows for
-  uncoupled input coordinates uninitialized (garbage / NaN) instead of zero. The
-  kernel only writes coordinates present in the Clebsch-Gordan coefficients, so
-  coordinates absent from them — common when the forward output is truncated,
-  e.g. symmetric contraction in MAP mode — were never written, diverging from the
-  SPARSE/DENSE autodiff gradients. Those rows are now zeroed explicitly after the
-  kernel.
+  uncoupled input coordinates uninitialized instead of zero, causing bugs when
+  the coefficients do not cover source and target coordinates.
+  Those rows are now zeroed explicitly after the kernel if they exist.
 
 ### Changed
 
 - Tensor product forward and backward CUDA kernels now share a single
-  `CuArray2D.load()` / `.store()` abstraction for global↔shared memory copies,
-  replacing the per-operand branching between contiguous and strided variants.
-  Loads use LDGSTS (asynchronous copy via pipeline primitives) and stride through
-  source channels automatically when they exceed the shared-memory budget.
+  `CuArray2D.load()` / `.store()` abstraction for global to/from shared memory copies.
+  Loads use LDGSTS (asynchronous copy via pipeline primitives) and loop over channels
+  when the shared buffer is made smaller than its global counterpart to fit in SMEM.
 
 ## [0.1.0b2] — 2026-05-28
 
@@ -64,7 +66,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 ### Fixed
 
 - Tensor product broadcasting behaviour when only one operand has an additional batch axis.
-  The bug occured for instance when computing Hessians with `jax.jacrev`, batched cotangents
+  The bug occurred for instance when computing Hessians with `jax.jacrev`, batched cotangents
   then require broadcast.
 
 ### Changed
@@ -93,10 +95,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   of RHS `y`, to match calls where `x` stands for node features and `y` stands
   for harmonic embeddings of edge vectors (better mnemonics).
 - O3Space now supports `tuple[MulIrrep]` as input, since `flax.linen` modules
-  implicitly casts `e3nn.Irreps` into `tuple[MulIrrep]`. It is not necessary
+  implicitly cast `e3nn.Irreps` into `tuple[MulIrrep]`. It is not necessary
   to serialize e3nn irreps to strings as flax attributes anymore.
 - O3Space and SO3space are now hashable.
-
 
 ## [0.1.0a10] — 2026-04-29
 
@@ -186,7 +187,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 - Return subtype of `xla::Ffi::Error` from CUDA kernels and XLA handlers.
 - Overflow in index computation by using `size_t` instead of `int`.
 - Device synchronization before freeing coefficient memory with `TRAILING_CHANNELS`.
-- Attribute name `space.l_max` in `RBF` and `Linear`
+- Attribute name `space.l_max` in `RBF` and `Linear`.
 
 ### Changed
 
