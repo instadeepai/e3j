@@ -64,18 +64,21 @@ struct AdjacencyCSR {
 /****************************************************************************
  *  Convolution of node features with equivariant edge embeddings.
  *
- *  Sender node features `x_i` are first gathered from node features `x`.
- *  On each edge, the tensor product of `x_i` with spherical embeddings `y` is then
- *  computed, and multiplied by the radial embedding `r` (scalar mixing).
- *  The messages are finally scatter-reduced by receiver indices to produce the
- *  output node features.
+ *  Computes a trilinear mixing of node features `x` (gathered by senders),
+ *  edge features `y` and edge scalars `s`, accumulated on receiver nodes:
+ *
+ *          mⱼ= ∑ᵢ (xᵢ⊗ yᵢⱼ) ⊙  sᵢⱼ
+ *
+ *  The receiver messages `m` are returned, without materializing the
+ *  intermediate edge-wise messages, and without resorting to atomic
+ *  operations.
  *
  *  @param coef Clebsch-Gordan coefficients for the edge-wise tensor product.
  *  @param x node features.
- *  @param y spherical embeddings of edge vectors.
- *  @param r radial embeddings of edge vectors.
+ *  @param y edge features (typically harmonic embeddings of edge vectors).
+ *  @param s edge scalars (typically MLP of RBF radial embeddings).
  *  @param adj adjacency matrix in CSR format.
- *  @param out output node features.
+ *  @param m output node features.
  *  @param p additional problem parameters.
  *  @param stream CUDA stream (default 0)
  *  @param debug flag for stricter error catching and verbose logging.
@@ -86,9 +89,9 @@ e3j::Error launch(
     const Coef4D<Idx, Val> *coef,
     const Val *x,
     const Val *y,
-    const Val *r,
+    const Val *s,
     const AdjacencyCSR adj,
-    Val *out,
+    Val *m,
     Params p,
     cudaStream_t stream,
     int debug

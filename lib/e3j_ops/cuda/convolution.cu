@@ -25,9 +25,9 @@ template e3j::Error launch<Idx, Val>(              \
     const Coef4D<Idx,Val> *coef,                   \
     const Val *x,                                  \
     const Val *y,                                  \
-    const Val *r,                                  \
+    const Val *s,                                  \
     const AdjacencyCSR adj,                        \
-    Val *out,                                      \
+    Val *m,                                        \
     Params p,                                      \
     cudaStream_t stream,                           \
     int debug                                      \
