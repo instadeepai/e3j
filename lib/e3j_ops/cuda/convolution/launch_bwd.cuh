@@ -7,7 +7,7 @@
 #include "cuda/array.cuh"
 #include "ffi/error.h"
 
-#define MAX_BLOCK_SIZE 512
+#define MAX_BLOCK_SIZE 256
 
 namespace e3j {
 namespace convolution {
@@ -66,7 +66,8 @@ struct LaunchConfigBwd {
         int ch = p.channels_x;
         if (ch / 4 >= 32 && ch % 4 == 0) {
             return 4;
-        } else if (ch / 2 >= 32 && ch % 2 == 0) {
+        } else
+        if (ch / 2 >= 32 && ch % 2 == 0) {
             return 2;
         } else {
             return 1;
