@@ -61,6 +61,14 @@
 
 namespace e3j_ops {
 
+namespace {
+
+    // NOTE: only power of 2 number of channels well supported for now.
+    constexpr bool is_pow_2 (int n) {
+        return n > 0 && (n & (n - 1)) == 0;
+    }
+}
+
 namespace xla = xla::ffi;
 
 //===----------------------------------------------------------===//
@@ -157,27 +165,19 @@ xla::Error TensorProductHandler(
             return e3j::Error::InvalidArgument("Invalid tensor product layout.").to_xla();
     }
 
-    // FIXME: support non-32 multiples with TRAILING_CHANNELS
+    // FIXME: support arbitrary numbers of channels in TRAILING_CHANNELS layout.
     if (layout == Layout::TRAILING_CHANNELS) {
-        // Assert channels are 32-multiple or 1 in Mode::OUTER
-        if (
-            mode == Mode::OUTER
-            and (channels_x % 32 != 0 or channels_x == 1)
-            and (channels_y % 32 != 0 or channels_y == 1)
-        ) {
+        // Assert channels are powers of 2 in Mode::OUTER
+        if (mode == Mode::OUTER and not (is_pow_2(channels_x) and is_pow_2(channels_y))) {
             std::string msg =
-                "TRAILING_CHANNELS requires 32 multiple as LHS channels "
-                "broadcast with 1 RHS channel with mode OUTER. Got ("
+                "TRAILING_CHANNELS requires powers of 2 as LHS and RHS channels."
                 + std::to_string(channels_x) + ", " + std::to_string(channels_y) + ").";
             return e3j::Error::Unimplemented(msg).to_xla();
         }
-        // Assert channels are 32-multiples and match in Mode::MAP | Mode::INNER
-        else if (
-            mode != Mode::OUTER
-            and channels_x % 32 != 0 and channels_y != channels_x
-        ) {
+        // Assert channels are powers of 2 and match in Mode::MAP | Mode::INNER
+        if (mode != Mode::OUTER and not (is_pow_2(channels_x) and channels_x == channels_y)) {
             std::string msg =
-                "TRAILING_CHANNELS requires 32 multiple as LHS channels "
+                "TRAILING_CHANNELS requires power of 2 as LHS channels "
                 "and as many RHS channels with modes MAP | INNER. Got ("
                 + std::to_string(channels_x) + ", " + std::to_string(channels_y) + ").";
             return e3j::Error::Unimplemented(msg).to_xla();
@@ -384,10 +384,10 @@ xla::Error ConvolutionHandler(
     int32_t num_scalars = r.dimensions()[1];
 
     // Assert LHS channels are 32-multiple
-    bool supported = (channels_x % 32 == 0);
+    bool supported = (is_pow_2(channels_x));
     if (not supported) {
         std::string msg =
-            "Convolution requires 32 multiple as LHS channels for now. Got "
+            "Convolution requires power of 2 as LHS channels for now. Got "
             + std::to_string(channels_x) + ".\n";
         return e3j::Error::Unimplemented(msg).to_xla();
     }
