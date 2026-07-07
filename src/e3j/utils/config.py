@@ -65,9 +65,7 @@ class Config(YamlConfig):
     layout: Layout = Layout.TRAILING_CHANNELS
     tensor_product: TensorProduct = TensorProduct.SPARSE
     aggregation: Aggregation = Aggregation.SCATTER
-    convolution: Convolution = (
-        Convolution.FUSED_CUDA if E3J_OPS_AVAILABLE else Convolution.UNFUSED
-    )
+    convolution: Convolution = Convolution.UNFUSED
     debug_level: int = 0
 
 
@@ -139,9 +137,14 @@ class config(Config):
                 backend = "tpu"
 
         if backend == "gpu" and _E3J_OPS_AVAILABLE:
-            return Config(tensor_product=TensorProduct.FUSED)
+            return Config(
+                tensor_product=TensorProduct.FUSED,
+                convolution=Convolution.FUSED_CUDA,
+            )
         if backend == "tpu" and _TPU_AVAILABLE:
-            return Config(tensor_product=TensorProduct.FUSED_MOSAIC_TPU)
+            return Config(
+                tensor_product=TensorProduct.FUSED_MOSAIC_TPU,
+            )
 
         return Config()
 
