@@ -26,7 +26,7 @@ from jax.ffi import ffi_call
 from numpy import int32
 
 from e3j.ops.coef import Coef
-from e3j.utils import config
+from e3j.utils import config, is_pow2
 from e3j.utils.exceptions import ShardingError
 from e3j.utils.options import Layout, TPMode
 
@@ -72,6 +72,14 @@ def tensor_product(
         channels_y = y.shape[-1] if has_cy else 1
     else:
         raise ValueError(f"Unsupported layout: {layout}")
+
+    # Catch unsupported channel configurations
+    if layout == Layout.TRAILING_CHANNELS:
+        if not is_pow2(channels_x) or not is_pow2(channels_y):
+            raise NotImplementedError(
+                "TRAILING_CHANNELS layout requires power of 2 channel dimensions, "
+                f"Got ({channels_x, channels_y})."
+            )
 
     num_out = params.num_out
 
@@ -215,6 +223,35 @@ def tensor_product_bwd(
     mode = TPMode.parse(params.mode)
     layout = Layout.parse(params.layout)
 
+    # Check current support
+    if layout != Layout.TRAILING_CHANNELS:
+        raise NotImplementedError(
+            f"No `tensor_product_bwd` handler registered for layout: {layout}. "
+            "This pathway shouldn't be reached by default AD rules."
+        )
+
+    has_cx, has_cy = x.ndim > 2, y.ndim > 2
+    channels_x = x.shape[-1] if has_cx else 1
+    channels_y = y.shape[-1] if has_cy else 1
+
+    if mode != TPMode.OUTER and channels_x != channels_y:
+        raise ValueError(
+            "MAP and INNER modes require same number of LHS and RHS channels. "
+            f"Got ({channels_x, channels_y})."
+        )
+
+    if not (is_pow2(channels_x) and is_pow2(channels_y)):
+        raise NotImplementedError(
+            "The `tensor_product_bwd` handler only supports power of 2 numbers of "
+            f"channels, got ({channels_x, channels_y})."
+        )
+
+    if mode == TPMode.OUTER and not (channels_x == 1 or channels_y == 1):
+        raise NotImplementedError(
+            "The `tensor_product_bwd` handler requires either LHS or RHS to "
+            f"have one channel for now, got ({channels_x, channels_y})."
+        )
+
     # Prepare transposed indices and concatenate two backward arrays.
     # coef_xzy / coef_yzx are the dx / dy passes; their column 0 (the output
     # index) is the set of coordinates each pass writes -- used to zero gaps.
@@ -225,8 +262,6 @@ def tensor_product_bwd(
         coef_bwd = jnp.stack([coef_xzy.pack_jax(), coef_yzx.pack_jax()])
         written_x = np.asarray(coef_xzy.idx[:, 0])
         written_y = np.asarray(coef_yzx.idx[:, 0])
-
-    has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
     @jax.custom_batching.custom_vmap
     def _tensor_product_bwd_impl(coef_bwd, x, y, ct_z):

@@ -15,6 +15,7 @@
 import e3j.utils.options as options
 from e3j.utils.cache import cache
 from e3j.utils.config import Config, config
+from e3j.utils.pow2 import is_pow2, next_pow2
 from e3j.utils.remote import set_ram_limits
 
 __all__ = [
@@ -23,4 +24,6 @@ __all__ = [
     "config",
     "Config",
     "set_ram_limits",
+    "is_pow2",
+    "next_pow2",
 ]

@@ -33,9 +33,7 @@ import jax.numpy as jnp
 import numpy
 from flax import struct
 
-
-def _next_pow2(n: int) -> int:
-    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+from e3j.utils import next_pow2
 
 
 class ValDtype(Enum):
@@ -98,7 +96,7 @@ class Coef:
         val_t, idx_t = numpy.dtype(val_t), numpy.dtype(idx_t)
         fields = [("val", val_t)] + [(name, idx_t) for name in cls.index_names]
         dt = numpy.dtype(fields, align=True)
-        target = _next_pow2(val_t.itemsize + cls.rank * idx_t.itemsize)
+        target = next_pow2(val_t.itemsize + cls.rank * idx_t.itemsize)
         if dt.itemsize < target:
             dt = numpy.dtype(
                 {

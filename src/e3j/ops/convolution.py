@@ -22,7 +22,7 @@ from jax.ffi import ffi_call
 from numpy import int32
 
 from e3j.ops.coef import Coef4D
-from e3j.utils import config
+from e3j.utils import config, is_pow2
 
 
 @dataclass
@@ -105,6 +105,8 @@ def convolution(
 
     if y.ndim == x.ndim and y.shape[-1] != 1:
         raise NotImplementedError("RHS y should have only one channel.")
+    if not is_pow2(channels_x):
+        raise NotImplementedError("LHS x should have power of 2 number of channels.")
 
     @custom_vjp
     def convolution_op(x, y, s):
