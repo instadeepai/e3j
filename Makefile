@@ -184,7 +184,7 @@ pytest:
 	if [[ -n "$(k)" ]]; then\
 		uv run pytest -v -m "e3j_ops" -k $(k) tests/test_ops;\
 	else\
-		uv run pytest -v -m "e3j_ops" tests/test_ops/test_tensor_product_op.py;\
+		uv run pytest -v -m "e3j_ops" tests/test_ops;\
 	fi
 
 test_mosaic_tpu:
