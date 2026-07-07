@@ -40,7 +40,7 @@ class Convolution:
 
     def __init__(
         self,
-        source: tuple[O3Space, O3Space] | tuple[O3Space, O3Space, O3Space],
+        source: tuple[O3Space, O3Space],
         target: O3Space | None = None,
         layout: Layout = Layout.TRAILING_CHANNELS,
         avg_num_neighbors: float | None = None,
@@ -51,15 +51,16 @@ class Convolution:
         Initialize a Convolution block from parameters.
 
         Args:
-            source: representations of the two tensor-product inputs (node and
-                edge features), optionally followed by the edge-scalar space.
-            target: output representation, inferred by default. Passing a target
+            source: Representations of the two tensor-product inputs (node and
+                edge features). The third source space (mixing scalars) is
+                inferred from the former two in the `.source` attribute.
+            target: Output representation, inferred by default. Passing a target
                 argument enforces a filter on the output irreducible blocks.
-            layout: specifies the channel axis, `TRAILING_CHANNELS` is faster.
-            avg_num_neighbors: if given, messages are divided by this factor.
-            normalization: normalization of the tensor product's Clebsch-Gordan
+            layout: Specifies the channel axis, `TRAILING_CHANNELS` is faster.
+            avg_num_neighbors: If given, messages are divided by this factor.
+            normalization: Normalization of the tensor product's Clebsch-Gordan
                 coefficients, see :class:`e3j.utils.options.TPNormalization`.
-            config: global :class:`e3j.utils.config.Config` (optional) pointing
+            config: Global :class:`e3j.utils.config.Config` (optional) pointing
                 to the implementation path. The best available option should be
                 automatically selected based on the environment.
         """
