@@ -365,7 +365,7 @@ xla::Error ConvolutionHandler(
     xla::AnyBuffer coef,
     xla::AnyBuffer x,
     xla::AnyBuffer y,
-    xla::AnyBuffer r,
+    xla::AnyBuffer s,
     xla::BufferR1<xla::DataType::S32> sender,
     xla::BufferR1<xla::DataType::S32> receiver_ptr,
     xla::Result<xla::AnyBuffer> out,
@@ -381,7 +381,7 @@ xla::Error ConvolutionHandler(
     int32_t channels_x = dims_x.size() > 2 ? dims_x.back() : 1;
     int32_t num_y = dims_y[1];
     int32_t num_out = out->dimensions()[1];
-    int32_t num_scalars = r.dimensions()[1];
+    int32_t num_scalars = s.dimensions()[1];
 
     // Assert LHS channels are 32-multiple
     bool supported = (is_pow_2(channels_x));
@@ -421,7 +421,7 @@ xla::Error ConvolutionHandler(
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
             y.typed_data<Val>(),                                \
-            r.typed_data<Val>(),                                \
+            s.typed_data<Val>(),                                \
             adj,                                                \
             out->typed_data<Val>(),                             \
             params, stream, debug                               \
@@ -442,7 +442,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // coef (packed Coef4D<Idx,Val> as idx_t vector)
         .Arg<xla::AnyBuffer>()   // x (node features)
         .Arg<xla::AnyBuffer>()   // y (edge embeddings)
-        .Arg<xla::AnyBuffer>()   // r (radial scalars)
+        .Arg<xla::AnyBuffer>()   // s (radial scalars)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (CSR)
         .Ret<xla::AnyBuffer>()   // out (output node features)

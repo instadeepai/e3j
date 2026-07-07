@@ -55,7 +55,7 @@ e3j::Error launch_bwd(
     const Val *x,
     const Val *y,
     const Val *s,
-    const Val *dz,
+    const Val *dm,
     const AdjacencyCSR adj,
     const int32_t *edge_perm,
     Val *dx,

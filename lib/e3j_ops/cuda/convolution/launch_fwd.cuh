@@ -211,7 +211,7 @@ e3j::Error launch(
     const Coef4D<Idx, Val> *coef,
     const Val *gmem_x,
     const Val *gmem_y,
-    const Val *gmem_r,
+    const Val *gmem_s,
     const AdjacencyCSR adj,
     Val *gmem_out,
     Params p,
@@ -234,15 +234,15 @@ e3j::Error launch(
 
     CuArray2D<const Val> x = { gmem_x, p.num_x,       p.channels_x };
     CuArray2D<const Val> y = { gmem_y, p.num_y,       1             };
-    CuArray2D<const Val> r = { gmem_r, p.num_scalars, p.channels_x  };
-    CuArray2D<Val>       z = { gmem_out, p.num_out,   p.channels_x  };
+    CuArray2D<const Val> s = { gmem_s, p.num_scalars, p.channels_x  };
+    CuArray2D<Val>       m = { gmem_out, p.num_out,   p.channels_x  };
 
     // Dispatch over vectorization N.
 
     #define LAUNCH(N)                                                      \
     convolution::kernel<Idx,Val,N>                                         \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>              \
-        (coef, x, y, r, adj, z,                                            \
+        (coef, x, y, s, adj, m,                                            \
          p.num_nodes, p.num_coef, unroll)
 
     switch(cfg.N) {

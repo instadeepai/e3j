@@ -50,15 +50,15 @@ struct Buffers {
     static __device__ Buffers init (
         CuArray2D<const Val> x,
         CuArray2D<const Val> y,
-        CuArray2D<Val> z,
-        CuArray2D<const Val> r,
+        CuArray2D<Val> m,
+        CuArray2D<const Val> s,
         dim3 unroll
     ) {
         return Buffers {
             .lhs = { nullptr, x.shape[0], unroll.x },
             .rhs = { nullptr, y.shape[0], unroll.y },
-            .out = { nullptr, z.shape[0], unroll.z },
-            .mix = { nullptr, r.shape[0], unroll.z },
+            .out = { nullptr, m.shape[0], unroll.z },
+            .mix = { nullptr, s.shape[0], unroll.z },
         };
     }
 
@@ -209,7 +209,7 @@ __device__ void bigotimes(
             Vect<N,Val> *out_lane =
                 reinterpret_cast<Vect<N,Val>*>(out.data) + threadIdx.x;
             int stride_out = out.shape[1] / N;
-            // For each i, accumulate outputs (i, z[i]) above i.
+            // For each i, accumulate outputs (i, out[i]) above i.
             // Jumped indices should be zeroed out from the outside.
             //
             // NOTE: col <= range.end important to not skip the case where
@@ -218,7 +218,7 @@ __device__ void bigotimes(
             //       read the coefficient. Accumulation then returns without
             //       loading out-of-bounds coefficient.
             while (col <= range.end) {
-                // Compute z[i] = ∑ c_ijkl * x[j] * s[k] * y[l] by channel.
+                // Compute out[i] = ∑ c_ijkl * x1[j] * x2[k] * x3[l] by channel.
                 zi = accumulate_trilinear<Idx,Val,kMode,N>(
                     acc, coef, col, range.end,
                     x1.data, x2.data, x3.data,
@@ -240,7 +240,7 @@ __device__ void bigotimes(
         //       as we can't synchronize over blockDim.y without
         //       reaching deadlock within the loop over coefficients.
         while (col <= range.end) {
-            // Sum z[i] over 32 channels at a time
+            // Sum out[i] over 32 channels at a time
             zi = accumulate_trilinear<Idx,Val,kMode,N>(
                 acc, coef, col, range.end,
                 x1.data, x2.data, x3.data,
@@ -279,7 +279,7 @@ __global__ void kernel (
     CuArray2D<const Val> y,
     CuArray2D<const Val> s,
     const AdjacencyCSR adj,
-    CuArray2D<Val> z,
+    CuArray2D<Val> m,
     int num_nodes,
     int num_coef,
     dim3 unroll
@@ -290,16 +290,16 @@ __global__ void kernel (
 
     // NOTE: size_t so `blockIdx.x * size_out` / `gridDim.x * size_out` below
     //       are computed in 64 bit, avoiding output offset overflow on large graphs.
-    size_t size_out = z.size();
+    size_t size_out = m.size();
 
-    int num_strides = 1 + (max((int)x.shape[1], (int)z.shape[1]) - 1)
+    int num_strides = 1 + (max((int)x.shape[1], (int)m.shape[1]) - 1)
                          / (blockDim.x * N);
 
-    // Shared memory layout: [ coef | x | y | z ] or [ x | y | z ]
+    // Shared memory layout: [ coef | x | y | m ] or [ x | y | m ]
     extern __shared__ __align__(16) char smem__[];
     char* smem_ = reinterpret_cast<char*>(smem__);
     Buffers<Idx, Val> smem = Buffers<Idx, Val>::init(
-        x, y, z, s, unroll
+        x, y, m, s, unroll
     );
 
     if (BUFFER_CONV_FWD_COEFS_IN_SMEM) {
@@ -319,14 +319,14 @@ __global__ void kernel (
     // Allocate SMEM buffer addresses.
     smem.to_shared(smem_);
 
-    // Distribute coefficients across blockDim.y, without z-index overlap.
+    // Distribute coefficients across blockDim.y, without m-index overlap.
     // Reuses lhs buffer (not yet populated) as int[blockDim.y + 1] scratch.
     CoefRange coef_range = find_coef_bounds<Idx, Val, Coef4D>(
-        reinterpret_cast<int*>(smem.lhs.data), coef, num_coef, z.shape[0]
+        reinterpret_cast<int*>(smem.lhs.data), coef, num_coef, m.shape[0]
     );
 
     // First receiver for this block.
-    z.data += blockIdx.x * size_out;
+    m.data += blockIdx.x * size_out;
 
     //=== Grid stride loop ===
     for (unsigned int receiver = blockIdx.x; receiver < num_nodes; receiver += gridDim.x) {
@@ -334,7 +334,7 @@ __global__ void kernel (
         // Stride-local GMEM views, advanced per channel slice.
         CuArray2D<const Val> x_ = { x.data, x.shape[0], x.shape[1] };
         CuArray2D<const Val> s_ = { s.data, s.shape[0], s.shape[1] };
-        CuArray2D<Val> z_ = { z.data, z.shape[0], z.shape[1] };
+        CuArray2D<Val> m_ = { m.data, m.shape[0], m.shape[1] };
 
         //=== Channel stride loop ===
         for (int c = 0; c < num_strides; c++) {
@@ -375,18 +375,18 @@ __global__ void kernel (
             }
 
             // Store aggregated output to GMEM once per receiver.
-            smem.out.store(z_);
+            smem.out.store(m_);
             __syncthreads();
 
             // Advance to next channel slice (y is never strided).
             if (x.shape[1] > unroll.x) x_.data += unroll.x;
-            if (z.shape[1] > unroll.z) z_.data += unroll.z;
+            if (m.shape[1] > unroll.z) m_.data += unroll.z;
             if (s.shape[1] > unroll.z) s_.data += unroll.z;
 
         }//=== Channel stride loop ===
 
         // Advance to next receiver for this block.
-        z.data += gridDim.x * size_out;
+        m.data += gridDim.x * size_out;
 
     }//=== Grid-stride loop ===
 
