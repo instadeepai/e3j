@@ -37,11 +37,12 @@ class GraphCSR:
     """Compressed Sparse Row (CSR) directed-graph adjacency.
 
     Edges are grouped by receiver so the convolution kernel can reduce
-    messages per receiver without atomics. Beyond construction and
-    transposition, this class owns the index arithmetic the `vmap` rules use
-    to fold a batch axis into a single disjoint (block-diagonal) graph -- both
-    when the graph is shared across the batch (tiling) and when it varies per
-    batch element (concatenation).
+    messages per receiver without atomics.
+
+    Beyond construction and transposition, this class owns index arithmetic
+    required by `vmap` rules to fold a batch axis into a single disjoint
+    (block-diagonal) graph, both when a single graph is replicated across
+    devices or when distinct homogeneous graphs are stacked.
     """
 
     def __init__(self, num_nodes: int, sender: Array, receiver: Array):
@@ -433,25 +434,33 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     def convolution_bwd_op(x, y, s, dm):
         return _batched_op(x, y, s, dm, sender_t, receiver_ptr_t, perm)
 
-    def conv(x, y, s):
-        return convolution(coef, x, y, s, sender, receiver, params)
-
     def _fwd(x, y, s, dm):
         dx, dy, ds = convolution_bwd_op(x, y, s, dm)
-        return (dx, dy, ds), (x, y, s, dm)
+        # Carry the graph adjacency through the residuals (as in the forward
+        # `convolution._fwd`): the double backward runs in a separate trace, so
+        # closing over `sender`/`receiver` -- or the transposed adjacency built
+        # from them -- would leak them under a batched graph. `_bwd` rebuilds
+        # everything in-trace from these residuals via fresh top-level calls.
+        return (dx, dy, ds), (x, y, s, dm, sender, receiver)
 
     def _bwd(res, cotangents):
         """Return (Dx, Dy, Ds, Ddm) cotangents from (Ddx, Ddy, Dds)."""
         (Ddx, Ddy, Dds) = cotangents
-        (x, y, s, dm) = res
+        (x, y, s, dm, sender, receiver) = res
+
+        def conv(x, y, s):
+            return convolution(coef, x, y, s, sender, receiver, params)
+
+        def conv_bwd(x, y, s):
+            return convolution_bwd(coef, x, y, s, sender, receiver, dm, params)
 
         # Second variation of messages: three forward passes
         Ddm = conv(Ddx, y, s) + conv(x, Ddy, s) + conv(x, y, Dds)
 
         # Primal cotangents
-        Dx_x, Dx_y, Dx_s = convolution_bwd_op(Ddx, y, s, dm)
-        Dy_x, Dy_y, Dy_s = convolution_bwd_op(x, Ddy, s, dm)
-        Ds_x, Ds_y, Ds_s = convolution_bwd_op(x, y, Dds, dm)
+        Dx_x, Dx_y, Dx_s = conv_bwd(Ddx, y, s)
+        Dy_x, Dy_y, Dy_s = conv_bwd(x, Ddy, s)
+        Ds_x, Ds_y, Ds_s = conv_bwd(x, y, Dds)
 
         Dx = Dy_x + Ds_x
         Dy = Dx_y + Ds_y
