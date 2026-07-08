@@ -34,7 +34,15 @@ class ConvolutionParams:
 
 @dataclass
 class GraphCSR:
-    """Compressed Sparse Row (CSR) graph representation."""
+    """Compressed Sparse Row (CSR) directed-graph adjacency.
+
+    Edges are grouped by receiver so the convolution kernel can reduce
+    messages per receiver without atomics. Beyond construction and
+    transposition, this class owns the index arithmetic the `vmap` rules use
+    to fold a batch axis into a single disjoint (block-diagonal) graph -- both
+    when the graph is shared across the batch (tiling) and when it varies per
+    batch element (concatenation).
+    """
 
     def __init__(self, num_nodes: int, sender: Array, receiver: Array):
         self.num_nodes = num_nodes
@@ -60,29 +68,47 @@ class GraphCSR:
             self.sender,
         )
 
+    @staticmethod
+    def fold_adjacency(axis_size, num_nodes, num_edges, sender, receiver_ptr, batched):
+        """Fold a batch axis of `(sender, receiver_ptr)` into one disjoint graph.
 
-def _tile_csr_graph(axis_size, num_nodes, num_edges, sender, receiver_ptr):
-    """Construct a block-diagonal CSR graph from a single repeated subgraph.
+        Each batch element becomes an independent connected component: senders
+        are shifted by `b * num_nodes` and receiver pointers by `b * num_edges`,
+        yielding a graph with `axis_size * num_nodes` nodes and
+        `axis_size * num_edges` edges.
 
-    When batching a graph convolution under `vmap`, the node and edge arrays
-    are concatenated along axis 0 (batch × num_nodes, batch × num_edges).
-    The adjacency must be tiled accordingly so that each batch element's
-    edges reference its own nodes rather than those of batch 0.
+        `batched` selects the source layout. When `True`, the graph varies per
+        element (`sender: (axis_size, num_edges)`) and elements are
+        concatenated. When `False`, a single shared graph (`sender:
+        (num_edges,)`) is broadcast first, which reduces to tiling it. Both
+        cases share the same offset-and-flatten once broadcast.
+        """
+        if not batched:
+            sender = jnp.broadcast_to(sender, (axis_size,) + sender.shape)
+            receiver_ptr = jnp.broadcast_to(
+                receiver_ptr, (axis_size,) + receiver_ptr.shape
+            )
+        node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
+        edge_offsets = (
+            jnp.arange(axis_size, dtype=receiver_ptr.dtype)[:, None] * num_edges
+        )
+        sender_folded = (sender + node_offsets).reshape(-1)
+        ptr_body = (receiver_ptr[:, :num_nodes] + edge_offsets).reshape(-1)
+        receiver_ptr_folded = jnp.append(ptr_body, axis_size * num_edges)
+        return sender_folded, receiver_ptr_folded
 
-    Returns `(sender_tiled, receiver_ptr_tiled)` for a graph with
-    `axis_size * num_nodes` nodes and `axis_size * num_edges` edges,
-    where each batch element forms an independent connected component.
-    """
-    edge_offsets = jnp.repeat(
-        jnp.arange(axis_size, dtype=sender.dtype) * num_nodes, num_edges
-    )
-    sender_tiled = jnp.tile(sender, axis_size) + edge_offsets
-    node_offsets = jnp.repeat(
-        jnp.arange(axis_size, dtype=receiver_ptr.dtype) * num_edges, num_nodes
-    )
-    ptr_body = jnp.tile(receiver_ptr[:num_nodes], axis_size) + node_offsets
-    receiver_ptr_tiled = jnp.append(ptr_body, axis_size * num_edges)
-    return sender_tiled, receiver_ptr_tiled
+    @staticmethod
+    def fold_permutation(axis_size, num_edges, perm, batched):
+        """Fold a batch axis of an edge permutation into one disjoint graph.
+
+        Offsets each element by `b * num_edges` so it indexes the correct
+        segment of the concatenated edge array. `batched` selects per-element
+        (`(axis_size, num_edges)`) vs shared (`(num_edges,)`, broadcast) layout.
+        """
+        if not batched:
+            perm = jnp.broadcast_to(perm, (axis_size,) + perm.shape)
+        edge_offsets = jnp.arange(axis_size, dtype=perm.dtype)[:, None] * num_edges
+        return (perm + edge_offsets).reshape(-1)
 
 
 class ConvolutionBatchingWarning(UserWarning):
@@ -120,46 +146,6 @@ def _warn_graph_batching():
     `grad(vmap(...))`.
     """
     warnings.warn(_GRAPH_VMAP_WARNING, ConvolutionBatchingWarning, stacklevel=2)
-
-
-def _concat_batched_csr(axis_size, num_nodes, num_edges, sender, receiver_ptr):
-    """Block-diagonal CSR from per-element `sender` and `receiver_ptr`.
-
-    The counterpart to `_tile_csr_graph` for a graph that already varies
-    across the batch: `sender` has shape `(axis_size, num_edges)` and
-    `receiver_ptr` shape `(axis_size, num_nodes + 1)`. Each element's senders
-    are shifted by `b * num_nodes` and its receiver pointers by `b * num_edges`,
-    then the elements are concatenated into one disjoint graph with
-    `axis_size * num_nodes` nodes and `axis_size * num_edges` edges.
-    """
-    node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
-    sender_cat = (sender + node_offsets).reshape(-1)
-    edge_offsets = jnp.arange(axis_size, dtype=receiver_ptr.dtype)[:, None] * num_edges
-    ptr_body = (receiver_ptr[:, :num_nodes] + edge_offsets).reshape(-1)
-    receiver_ptr_cat = jnp.append(ptr_body, axis_size * num_edges)
-    return sender_cat, receiver_ptr_cat
-
-
-def _concat_batched_permutation(axis_size, num_edges, perm):
-    """Block-diagonal edge permutation from a per-element `perm`.
-
-    `perm` has shape `(axis_size, num_edges)`; each element is offset by
-    `b * num_edges` so it maps into the correct segment of the concatenated
-    edge array.
-    """
-    offsets = jnp.arange(axis_size, dtype=perm.dtype)[:, None] * num_edges
-    return (perm + offsets).reshape(-1)
-
-
-def _tile_permutation(axis_size, num_edges, perm):
-    """Tile an edge permutation for batched execution.
-
-    Offsets each batch element's permutation indices by `b * num_edges`
-    so that the permutation maps into the correct segment of the
-    concatenated edge array.
-    """
-    offsets = jnp.repeat(jnp.arange(axis_size, dtype=perm.dtype) * num_edges, num_edges)
-    return jnp.tile(perm, axis_size) + offsets
 
 
 def convolution(
@@ -286,14 +272,11 @@ def convolution(
             if not (sender_b and receiver_ptr_b):
                 raise ValueError(_GRAPH_BATCH_INCONSISTENT)
             _warn_graph_batching()
-            sender_t, receiver_ptr_t = _concat_batched_csr(
-                axis_size, num_nodes, num_edges, sender, receiver_ptr
-            )
-        else:
-            # Shared (replicated) graph: tile the single graph block-diagonally.
-            sender_t, receiver_ptr_t = _tile_csr_graph(
-                axis_size, num_nodes, num_edges, sender, receiver_ptr
-            )
+        # `batched=False` tiles the shared (replicated) graph; both share the
+        # same block-diagonal fold.
+        sender_t, receiver_ptr_t = GraphCSR.fold_adjacency(
+            axis_size, num_nodes, num_edges, sender, receiver_ptr, batched=graph_b
+        )
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
@@ -424,16 +407,12 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
             if not (sender_b and receiver_ptr_b and perm_b):
                 raise ValueError(_GRAPH_BATCH_INCONSISTENT)
             _warn_graph_batching()
-            sender_tt, receiver_ptr_tt = _concat_batched_csr(
-                axis_size, num_nodes, num_edges, sender_t, receiver_ptr_t
-            )
-            perm_t = _concat_batched_permutation(axis_size, num_edges, perm)
-        else:
-            # Shared (replicated) graph: tile the single graph block-diagonally.
-            sender_tt, receiver_ptr_tt = _tile_csr_graph(
-                axis_size, num_nodes, num_edges, sender_t, receiver_ptr_t
-            )
-            perm_t = _tile_permutation(axis_size, num_edges, perm)
+        # `batched=False` tiles the shared (replicated) graph; both share the
+        # same block-diagonal fold.
+        sender_tt, receiver_ptr_tt = GraphCSR.fold_adjacency(
+            axis_size, num_nodes, num_edges, sender_t, receiver_ptr_t, batched=graph_b
+        )
+        perm_t = GraphCSR.fold_permutation(axis_size, num_edges, perm, batched=graph_b)
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
