@@ -85,6 +85,20 @@ def tensor_product(
 
     # Infer output channels
     mode = TPMode.parse(params.mode)
+
+    # The CUDA kernel doesn't implement Mode::MAP for LEADING_CHANNELS: a
+    # leading channel axis is already mapped independently per row, so MAP
+    # is equivalent to an OUTER tensor product with channels folded into
+    # rows.
+    if mode is TPMode.MAP and layout is Layout.LEADING_CHANNELS:
+        assert channels_x == channels_y
+        num_rows = x.shape[0]
+        x_flat = x.reshape((num_rows * channels_x, x.shape[-1]))
+        y_flat = y.reshape((num_rows * channels_y, y.shape[-1]))
+        params_outer = replace(params, mode=TPMode.OUTER)
+        z_flat = tensor_product(coef, x_flat, y_flat, params_outer)
+        return z_flat.reshape((num_rows, channels_x, num_out))
+
     if mode.name == "OUTER":
         if has_cx and has_cy:
             channels_z = [channels_x, channels_y]
