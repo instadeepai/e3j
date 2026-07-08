@@ -310,3 +310,68 @@ def test_hessian_convolution():
     H_ref = jax.jacrev(jax.grad(f_ref))(x)
 
     testing.assert_allclose(H_op, H_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_hvp_convolution_all_inputs():
+    """Hessian-vector products match reference across x, y and s.
+
+    mlip trains on Hessian labels, so the double backward must be correct for
+    every differentiable input -- not just x. This exercises the cross-input
+    second-order terms in `convolution_bwd._bwd` (Dx, Dy, Ds mixing) via a
+    reverse-over-reverse HVP, which `custom_vjp` supports (unlike the
+    forward-over-reverse `jax.hessian`, see `test_hessian_forward_mode_error`).
+    """
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    def f_op(inputs):
+        x, y, s = inputs
+        z = convolution(coef, x, y, s, sender, receiver, params)
+        return np.sum(z**2)
+
+    def f_ref(inputs):
+        x, y, s = inputs
+        z = convolution_reference(
+            idx, val, x, y, s, s_index, sender, receiver, params.num_out
+        )
+        return np.sum(z**2)
+
+    primals = (x, y, s)
+    kx, ky, ks = random.split(random.key(7), 3)
+    tangents = (
+        random.normal(kx, x.shape),
+        random.normal(ky, y.shape),
+        random.normal(ks, s.shape),
+    )
+
+    def hvp(f):
+        def directional(p):
+            grads = jax.grad(f)(p)
+            dots = jax.tree_util.tree_map(lambda g, t: np.vdot(g, t), grads, tangents)
+            return jax.tree_util.tree_reduce(lambda a, b: a + b, dots)
+
+        return jax.grad(directional)(primals)
+
+    Hv_op = jax.tree_util.tree_leaves(hvp(f_op))
+    Hv_ref = jax.tree_util.tree_leaves(hvp(f_ref))
+    for a, b in zip(Hv_op, Hv_ref):
+        testing.assert_allclose(a, b, atol=1e-4, rtol=1e-4)
+
+
+def test_hessian_forward_mode_error():
+    """`jax.hessian` (forward-over-reverse) is unsupported; use jacrev(grad).
+
+    The convolution is a `custom_vjp`, which defines reverse mode only. The
+    default `jax.hessian = jacfwd(jacrev)` needs forward-mode through it and
+    must fail cleanly, documenting that Hessian labels go through
+    `jax.jacrev(jax.grad(...))` instead.
+    """
+    coef, x, y, s, sender, receiver, params, *_ = generate_conv_data()
+
+    def f_op(x):
+        z = convolution(coef, x, y, s, sender, receiver, params)
+        return np.sum(z**2)
+
+    # eval_shape triggers the trace-time forward-mode guard deterministically,
+    # independent of platform / FFI kernel availability.
+    with pytest.raises(TypeError, match="forward-mode autodiff"):
+        jax.eval_shape(jax.hessian(f_op), x)
