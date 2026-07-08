@@ -4,8 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
-<<<<<<< conflict 1 of 1
-+++++++ qorquurs f100d6cd "Merge pull request #293 from instadeepai/chore/tpu-config" (rebase destination)
+## Unreleased
+
+### Added
+
+- CUDA convolution kernels (forward and backward), fusing the trilinear mixing
+  of node features, edge features and edge scalars, with gather/scatter operations
+  to avoid the expensive materialization of messages.
+
+### Changed
+
+- `PowerExpansion` now prunes intermediate tensor-product paths more accurately
+  by parity, avoiding the computation of blocks that cannot contribute to the
+  output.
+- The default global `config()` picks up platform-specific options on TPU too,
+  by looking up installed packages (`libtpu`). This avoids side effects of
+  JAX backends initialization.
+
 ## [0.1.0b4] — 2026-07-06
 
 ### Added
@@ -20,9 +35,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 - Binaries for `e3j_ops` now built as SASS for compute capabilities 8.0, 8.6, 8.9,
   9.0, 9.0a, 10.0 and as 10.0+ forward compatible PTX, mostly improving support for
   earlier 8.x compute capabilities.
-- `PowerExpansion` now prunes by parities the intermediate tensor-product filters more
-  aggressively, avoiding the computation of blocks that cannot contribute to the
-  output.
 
 ## [0.1.0b3] — 2026-06-10
 
