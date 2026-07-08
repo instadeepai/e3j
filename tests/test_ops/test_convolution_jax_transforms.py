@@ -25,7 +25,11 @@ from jax.experimental.topologies import get_topology_desc
 
 import e3j
 from e3j.ops.coef import Coef4D
-from e3j.ops.convolution import ConvolutionParams, convolution
+from e3j.ops.convolution import (
+    ConvolutionBatchingWarning,
+    ConvolutionParams,
+    convolution,
+)
 from e3j.utils.sparse import narrow_index_dtype
 
 e3j.config(debug_level=0)
@@ -375,3 +379,79 @@ def test_hessian_forward_mode_error():
     # independent of platform / FFI kernel availability.
     with pytest.raises(TypeError, match="forward-mode autodiff"):
         jax.eval_shape(jax.hessian(f_op), x)
+
+
+def test_double_backward_batched_graph():
+    """Double backward over a stacked (vmapped) graph matches reference.
+
+    Regression for a tracer leak in `convolution_bwd._bwd`: mlip trains on
+    forces, so parameter gradients differentiate through `grad(energy)` -- the
+    convolution double backward. With a batch axis over the graph, the double
+    backward used to close over `sender`/`receiver` and leak them across the
+    backward trace. This stacks distinct graphs and vmaps a force-style
+    `grad(grad(...))`, exercising that path end to end against the reference.
+    """
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    batch = 3
+    keys = random.split(random.key(0), batch)
+    graphs = [make_graph(NUM_NODES, NUM_EDGES, k) for k in keys]
+    senders = np.stack([g[0] for g in graphs])
+    receivers = np.stack([g[1] for g in graphs])
+    xs = random.normal(random.key(1), (batch, *x.shape))
+    ys = random.normal(random.key(2), (batch, *y.shape))
+    ss = random.normal(random.key(3), (batch, *s.shape))
+
+    def force_loss(conv_fn):
+        def scalar(x, y, s, sender, receiver):
+            # "force" = grad of a scalar energy wrt node features x
+            def energy(x):
+                return np.sum(conv_fn(x, y, s, sender, receiver) ** 2)
+
+            return np.sum(jax.grad(energy)(x) ** 2)
+
+        return scalar
+
+    def op_conv(x, y, s, sender, receiver):
+        return convolution(coef, x, y, s, sender, receiver, params)
+
+    def ref_conv(x, y, s, sender, receiver):
+        return convolution_reference(
+            idx, val, x, y, s, s_index, sender, receiver, params.num_out
+        )
+
+    grad_op = jax.vmap(jax.grad(force_loss(op_conv), argnums=(0, 1, 2)))
+    grad_ref = jax.vmap(jax.grad(force_loss(ref_conv), argnums=(0, 1, 2)))
+
+    # The stacked graph trips the (expected) batching warning on the op path.
+    with pytest.warns(ConvolutionBatchingWarning):
+        g_op = grad_op(xs, ys, ss, senders, receivers)
+    g_ref = grad_ref(xs, ys, ss, senders, receivers)
+
+    for a, b in zip(g_op, g_ref):
+        testing.assert_allclose(a, b, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=NotImplementedError,
+    reason=(
+        "Hessian composed with vmap nests two vmap levels (jacrev uses vmap "
+        "internally), exposing custom_partitioning, which has no batching rule. "
+        "For SPMD Hessian use a sharded single graph (jit + custom_partitioning) "
+        "or shard_map, not vmap(jacrev(grad(...)))."
+    ),
+)
+def test_hessian_under_vmap_unsupported():
+    """`vmap(jacrev(grad(...)))` is unsupported by design (nested vmap).
+
+    Documents the limitation and alerts us (strict xfail) if a future JAX
+    grows a custom_partitioning batching rule that lifts it.
+    """
+    coef, x, y, s, sender, receiver, params, *_ = generate_conv_data()
+
+    def f_op(x):
+        return np.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
+
+    xs = np.broadcast_to(x, (2, *x.shape))
+    jax.eval_shape(jax.vmap(jax.jacrev(jax.grad(f_op))), xs)
