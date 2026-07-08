@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass
 
 import jax
@@ -82,6 +83,72 @@ def _tile_csr_graph(axis_size, num_nodes, num_edges, sender, receiver_ptr):
     ptr_body = jnp.tile(receiver_ptr[:num_nodes], axis_size) + node_offsets
     receiver_ptr_tiled = jnp.append(ptr_body, axis_size * num_edges)
     return sender_tiled, receiver_ptr_tiled
+
+
+class ConvolutionBatchingWarning(UserWarning):
+    """Emitted when convolution is vmapped over the graph adjacency.
+
+    Silence with `warnings.filterwarnings("ignore", category=...)`, or turn
+    into an error with `-W error` / `warnings.simplefilter("error", ...)`.
+    """
+
+
+_GRAPH_VMAP_WARNING = (
+    "convolution is being vmapped over the graph adjacency (`sender`/"
+    "`receiver`). Each batch element's graph is folded into a single disjoint "
+    "graph by sparse concatenation -- numerically equivalent to `Graph.batch()`"
+    " but paying for padding across the batch. This is an anti-pattern for "
+    "production training: prefer building one pre-batched graph with "
+    "`Graph.batch()`. Only a leading axis over node/edge *features* with a "
+    "shared (replicated) graph is free of this cost. Silence by filtering "
+    "`ConvolutionBatchingWarning`."
+)
+
+
+_GRAPH_BATCH_INCONSISTENT = (
+    "inconsistent graph batching under vmap: the graph adjacency arrays "
+    "(sender, receiver_ptr, and the edge permutation in the backward pass) "
+    "must share the same batch axis, but only some of them were batched."
+)
+
+
+def _warn_graph_batching():
+    """Emit a single `ConvolutionBatchingWarning` for graph-vmap.
+
+    Routed through one call site so `warnings` deduplication collapses the
+    forward and backward rules to a single warning per trace under
+    `grad(vmap(...))`.
+    """
+    warnings.warn(_GRAPH_VMAP_WARNING, ConvolutionBatchingWarning, stacklevel=2)
+
+
+def _concat_batched_csr(axis_size, num_nodes, num_edges, sender, receiver_ptr):
+    """Block-diagonal CSR from per-element `sender` and `receiver_ptr`.
+
+    The counterpart to `_tile_csr_graph` for a graph that already varies
+    across the batch: `sender` has shape `(axis_size, num_edges)` and
+    `receiver_ptr` shape `(axis_size, num_nodes + 1)`. Each element's senders
+    are shifted by `b * num_nodes` and its receiver pointers by `b * num_edges`,
+    then the elements are concatenated into one disjoint graph with
+    `axis_size * num_nodes` nodes and `axis_size * num_edges` edges.
+    """
+    node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
+    sender_cat = (sender + node_offsets).reshape(-1)
+    edge_offsets = jnp.arange(axis_size, dtype=receiver_ptr.dtype)[:, None] * num_edges
+    ptr_body = (receiver_ptr[:, :num_nodes] + edge_offsets).reshape(-1)
+    receiver_ptr_cat = jnp.append(ptr_body, axis_size * num_edges)
+    return sender_cat, receiver_ptr_cat
+
+
+def _concat_batched_permutation(axis_size, num_edges, perm):
+    """Block-diagonal edge permutation from a per-element `perm`.
+
+    `perm` has shape `(axis_size, num_edges)`; each element is offset by
+    `b * num_edges` so it maps into the correct segment of the concatenated
+    edge array.
+    """
+    offsets = jnp.arange(axis_size, dtype=perm.dtype)[:, None] * num_edges
+    return (perm + offsets).reshape(-1)
 
 
 def _tile_permutation(axis_size, num_edges, perm):
@@ -193,25 +260,40 @@ def convolution(
         need_replication_factors=("u", "v", "p", "r"),
     )
 
-    # custom_vmap: batchable arguments only (x, y, s),
-    # closes over coef, sender, receiver_ptr.
+    # custom_vmap: batchable feature arguments (x, y, s) plus the graph
+    # adjacency (sender, receiver_ptr). The graph is passed explicitly rather
+    # than closed over so the rule sees its batch status: a batched graph is
+    # folded into one disjoint graph with a warning (see `_warn_graph_batching`),
+    # while an unbatched (replicated) graph takes the feature-batching path.
+    # Only `coef` stays closed over.
 
     @jax.custom_batching.custom_vmap
-    def _batched_op(x, y, s):
+    def _batched_op(x, y, s, sender, receiver_ptr):
         return _sharded_op(coef, x, y, s, sender, receiver_ptr)
 
     @_batched_op.def_vmap
-    def _vmap_rule(axis_size, in_batched, x, y, s):
-        x_b, y_b, s_b = in_batched
+    def _vmap_rule(axis_size, in_batched, x, y, s, sender, receiver_ptr):
+        x_b, y_b, s_b, sender_b, receiver_ptr_b = in_batched
+        graph_b = sender_b or receiver_ptr_b
         if not x_b:
             x = jnp.broadcast_to(x[None], (axis_size,) + x.shape)
         if not y_b:
             y = jnp.broadcast_to(y[None], (axis_size,) + y.shape)
         if not s_b:
             s = jnp.broadcast_to(s[None], (axis_size,) + s.shape)
-        sender_t, receiver_ptr_t = _tile_csr_graph(
-            axis_size, num_nodes, num_edges, sender, receiver_ptr
-        )
+        if graph_b:
+            # Batched graph: fold per-element graphs into one disjoint graph.
+            if not (sender_b and receiver_ptr_b):
+                raise ValueError(_GRAPH_BATCH_INCONSISTENT)
+            _warn_graph_batching()
+            sender_t, receiver_ptr_t = _concat_batched_csr(
+                axis_size, num_nodes, num_edges, sender, receiver_ptr
+            )
+        else:
+            # Shared (replicated) graph: tile the single graph block-diagonally.
+            sender_t, receiver_ptr_t = _tile_csr_graph(
+                axis_size, num_nodes, num_edges, sender, receiver_ptr
+            )
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
@@ -222,14 +304,18 @@ def convolution(
 
     @custom_vjp
     def convolution_op(x, y, s):
-        return _batched_op(x, y, s)
+        return _batched_op(x, y, s, sender, receiver_ptr)
 
     def _fwd(x, y, s):
         z = convolution_op(x, y, s)
-        return z, (x, y, s)
+        # Carry the graph adjacency through the residuals rather than closing
+        # over it: under a batched graph (vmap over sender/receiver) the closed-
+        # over tracers would escape the forward trace and leak into the
+        # separately-traced backward. Residuals are batched by JAX correctly.
+        return z, (x, y, s, sender, receiver)
 
     def _bwd(res, dm):
-        x, y, s = res
+        x, y, s, sender, receiver = res
         return convolution_bwd(coef, x, y, s, sender, receiver, dm, params)
 
     convolution_op.defvjp(_fwd, _bwd)
@@ -312,15 +398,19 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
         need_replication_factors=("o", "p", "q", "t", "u", "v"),
     )
 
-    # custom_vmap: batchable arguments only (x, y, s, dm).
+    # custom_vmap: batchable feature/cotangent arguments (x, y, s, dm) plus the
+    # transposed graph adjacency (sender_t, receiver_ptr_t, perm). As in the
+    # forward pass, the graph is passed explicitly so a batched graph is
+    # rejected rather than silently mis-tiled; only `coef_bwd` stays closed over.
 
     @jax.custom_batching.custom_vmap
-    def _batched_op(x, y, s, dm):
+    def _batched_op(x, y, s, dm, sender_t, receiver_ptr_t, perm):
         return _sharded_op(coef_bwd, x, y, s, dm, sender_t, receiver_ptr_t, perm)
 
     @_batched_op.def_vmap
-    def _vmap_rule(axis_size, in_batched, x, y, s, dm):
-        x_b, y_b, s_b, dm_b = in_batched
+    def _vmap_rule(axis_size, in_batched, x, y, s, dm, sender_t, receiver_ptr_t, perm):
+        x_b, y_b, s_b, dm_b, sender_b, receiver_ptr_b, perm_b = in_batched
+        graph_b = sender_b or receiver_ptr_b or perm_b
         if not x_b:
             x = jnp.broadcast_to(x[None], (axis_size,) + x.shape)
         if not y_b:
@@ -329,10 +419,21 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
             s = jnp.broadcast_to(s[None], (axis_size,) + s.shape)
         if not dm_b:
             dm = jnp.broadcast_to(dm[None], (axis_size,) + dm.shape)
-        sender_tt, receiver_ptr_tt = _tile_csr_graph(
-            axis_size, num_nodes, num_edges, sender_t, receiver_ptr_t
-        )
-        perm_t = _tile_permutation(axis_size, num_edges, perm)
+        if graph_b:
+            # Batched graph: fold per-element graphs into one disjoint graph.
+            if not (sender_b and receiver_ptr_b and perm_b):
+                raise ValueError(_GRAPH_BATCH_INCONSISTENT)
+            _warn_graph_batching()
+            sender_tt, receiver_ptr_tt = _concat_batched_csr(
+                axis_size, num_nodes, num_edges, sender_t, receiver_ptr_t
+            )
+            perm_t = _concat_batched_permutation(axis_size, num_edges, perm)
+        else:
+            # Shared (replicated) graph: tile the single graph block-diagonally.
+            sender_tt, receiver_ptr_tt = _tile_csr_graph(
+                axis_size, num_nodes, num_edges, sender_t, receiver_ptr_t
+            )
+            perm_t = _tile_permutation(axis_size, num_edges, perm)
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
@@ -351,7 +452,7 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
 
     @custom_vjp
     def convolution_bwd_op(x, y, s, dm):
-        return _batched_op(x, y, s, dm)
+        return _batched_op(x, y, s, dm, sender_t, receiver_ptr_t, perm)
 
     def conv(x, y, s):
         return convolution(coef, x, y, s, sender, receiver, params)
