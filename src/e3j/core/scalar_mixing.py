@@ -26,9 +26,28 @@ from e3j.utils.sparse import sparse_bcoo
 
 @dataclass
 class ScalarMixing:
-    """Rescale equivariant features by as many scalars.
+    r"""Rescale equivariant features by as many scalars.
 
-    This performs the same operation as `scalar * irreps_array` in e3nn.
+    Computes output features $x'$ lying in the same space as input features $x$,
+
+    .. math::
+
+        x'_{nlm} = s_{nl} \cdot x_{nlm},
+
+    where $s$ denotes an array of `num_irreps` scalars, $x$ an array of `num_irreps`
+    irreducible features and $n,l,m$ denote channel, degree and spin respectively.
+
+    .. note::
+
+        This is the same operation as `scalars * irreps_array` in
+        `e3nn <https://e3nn-jax.readthedocs.io/en/latest/#>`_.
+        As a bilinear coupling, it is a particular case of an
+        equivariant tensor product with diagonal coefficients.
+
+    Args:
+        source: The input space for the equivariant features $x$.
+        layout: The channel axis :class:`~e3j.utils.options.Layout`,
+            equal to `config().layout` by default.
     """
 
     source: O3Space
@@ -53,18 +72,8 @@ class ScalarMixing:
             total_repeat_length=self.source.dim,
         )
 
-    @property
-    def coef(self) -> sparse.BCOO:
-        """Return coefficients for an equivalent tensor product operation."""
-        n_feats, n_scalars = self.source.dim, self.num_irreps
-        values = np.ones(n_feats)
-        idx_feats = np.arange(n_feats)
-        idx_scalars = self.mix_indices[idx_feats]
-        indices = np.stack((idx_feats, idx_scalars, idx_feats), axis=-1)
-        shape = (n_feats, n_scalars, n_feats)
-        return sparse_bcoo(values, indices, shape)
-
     def __call__(self, scalars: Array, features: Array) -> Array:
+        """Mix scalars with equivariant features."""
         layout = Layout.parse(self.layout)
         scalar_shape: tuple[int, ...] = ()
 
