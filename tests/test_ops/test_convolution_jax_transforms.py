@@ -495,6 +495,63 @@ def test_hvp_convolution_all_inputs():
         testing.assert_allclose(a, b, atol=1e-4, rtol=1e-4)
 
 
+def test_third_order_convolution_all_inputs():
+    """Third derivative (reverse^3) matches reference and leaks no tracers.
+
+    The messages are trilinear in (x, y, s), so `sum(z**2)` has non-vanishing
+    mixed third derivatives. Composing three `jax.grad` passes nests three
+    reverse-mode traces through the convolution `custom_vjp`; each level
+    re-threads `sender`/`receiver` through its residuals rather than closing
+    over them. This guards against tracer leaks one order beyond the double
+    backward exercised by `test_hvp_convolution_all_inputs`.
+    """
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    def f_op(inputs):
+        x, y, s = inputs
+        z = convolution(coef, x, y, s, sender, receiver, params)
+        return np.sum(z**2)
+
+    def f_ref(inputs):
+        x, y, s = inputs
+        z = convolution_reference(
+            idx, val, x, y, s, s_index, sender, receiver, params.num_out
+        )
+        return np.sum(z**2)
+
+    primals = (x, y, s)
+    k1, k2, k3 = random.split(random.key(11), 3)
+
+    def tangents_like(key):
+        kx, ky, ks = random.split(key, 3)
+        return (
+            random.normal(kx, x.shape),
+            random.normal(ky, y.shape),
+            random.normal(ks, s.shape),
+        )
+
+    t1, t2, t3 = (tangents_like(k) for k in (k1, k2, k3))
+
+    def directional(f, tangents):
+        """Contract `grad(f)` with `tangents` into a scalar."""
+
+        def d(p):
+            grads = jax.grad(f)(p)
+            dots = jax.tree_util.tree_map(lambda g, t: np.vdot(g, t), grads, tangents)
+            return jax.tree_util.tree_reduce(lambda a, b: a + b, dots)
+
+        return d
+
+    # Third-order directional derivative: reverse-over-reverse-over-reverse.
+    def d3(f):
+        return directional(directional(directional(f, t1), t2), t3)
+
+    out_op = d3(f_op)(primals)
+    out_ref = d3(f_ref)(primals)
+
+    testing.assert_allclose(out_op, out_ref, atol=1e-3, rtol=1e-3)
+
+
 def test_hessian_forward_mode_error():
     """`jax.hessian` (forward-over-reverse) is unsupported; use jacrev(grad).
 
