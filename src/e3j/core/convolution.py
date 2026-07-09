@@ -15,21 +15,28 @@ from e3j.utils.sparse import sparse_bcoo
 
 
 class Convolution:
-    """Equivariant message-passing convolution.
+    r"""Equivariant message-passing convolution.
 
-    This block computes the following operation:
+    Computes the aggregated message on receiver nodes given by:
 
-        mⱼ = ∑ᵢ (xᵢ⊗ yᵢⱼ) ⊙ sᵢⱼ
+    .. math::
 
-    Where the sum runs over neighbors i of the receiver node j, ⊗ denotes a
-    tensor product operation and ⊙ denotes a scalar mixing.
+        m_b = \frac 1 N \sum_a (x_a \otimes y_{ab}) \odot s_{ab}
+
+    where the sum runs over neighbors $a$ of the receiver node $b$,
+    $\otimes$ denotes a tensor product operation, $\odot$ denotes
+    a scalar mixing, and $N$ the average number of neighbors.
+
+    The plain JAX implementation consists of the following operations:
 
     1. Gather node features by senders,
-    2. Multiply sender features with edge features (typically harmonic embeddings),
+    2. Compute the tensor product of sender features with edge features
+       (typically harmonic embeddings),
     3. Mix tensor product outputs with edge scalars (typically MLP of RBF encodings),
     4. Scatter-add messages on receiver nodes.
 
-    Optionally, the sum of messages is divided by `avg_num_neighbors`.
+
+    Optionally, the sum of messages is rescaled by `avg_num_neighbors`.
 
     Note:
         When using the CUDA convolution kernel, edges must be sorted by receiver
