@@ -42,6 +42,12 @@ extensions = [
 autosummary_generate = True
 html_favicon = "icon.ico"
 
+# Merge the __init__ docstring (with its napoleon `Args:` section) into the
+# class-level documentation, right under the class signature. This avoids the
+# redundancy of listing constructor parameters both in the class signature and
+# again in a separately-rendered __init__ method.
+autoclass_content = "both"
+
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
@@ -64,9 +70,10 @@ mathjax3_config = {
 }
 
 
-# -- Prevent sphinx from skipping __init__ and __call__
+# -- Prevent sphinx from skipping __call__ (the __init__ docstring is merged
+#    into the class body via autoclass_content = "both")
 def skip(app, what, name, obj, would_skip, options):
-    if name == "__init__" or name == "__call__":
+    if name == "__call__":
         return False
     return would_skip
 
