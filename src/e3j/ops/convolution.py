@@ -193,11 +193,12 @@ def convolution(
     # Differentiable arguments only: (x, y, s).
 
     @custom_vjp
-    def convolution_op(x, y, s, sender, receiver):
+    def convolution_op(x, y, s):
         return _batched_op(x, y, s, sender, receiver)
 
-    def _fwd(x, y, s, sender, receiver):
-        z = convolution_op(x, y, s, sender, receiver)
+    def _fwd(x, y, s):
+        z = convolution_op(x, y, s)
+        # Store graph adjacency in residuals to avoid tracer leaks in _bwd.
         return z, (x, y, s, sender, receiver)
 
     def _bwd(res, dm):
@@ -206,7 +207,7 @@ def convolution(
 
     convolution_op.defvjp(_fwd, _bwd)
 
-    return convolution_op(x, y, s, sender, receiver)
+    return convolution_op(x, y, s)
 
 
 def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
@@ -235,7 +236,7 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     # ---- custom_partitioning ----
 
     @jax.experimental.custom_partitioning.custom_partitioning
-    def _sharded_op(coef_bwd, x, y, s, sender, receiver, dm):
+    def _sharded_op(coef_bwd, x, y, s, dm, sender, receiver):
         num_nodes = x.shape[0]
         sender_local = sender % num_nodes
         receiver_local = receiver % num_nodes
@@ -245,28 +246,24 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
         sender_local_t = graph_local_t.sender
         receiver_local_t_ptr = graph_local_t.receiver_ptr
 
-        return (
-            *ffi_call(
-                "convolution_bwd",
-                (
-                    jax.ShapeDtypeStruct(x.shape, x.dtype),
-                    jax.ShapeDtypeStruct(y.shape, y.dtype),
-                    jax.ShapeDtypeStruct(s.shape, s.dtype),
-                ),
-            )(
-                coef_bwd,
-                x,
-                y,
-                s,
-                dm,
-                sender_local_t,
-                receiver_local_t_ptr,
-                perm,
-                num_nodes=int32(num_nodes),
-                debug=int32(config().debug_level),
+        return ffi_call(
+            "convolution_bwd",
+            (
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
+                jax.ShapeDtypeStruct(y.shape, y.dtype),
+                jax.ShapeDtypeStruct(s.shape, s.dtype),
             ),
-            None,
-            None,
+        )(
+            coef_bwd,
+            x,
+            y,
+            s,
+            dm,
+            sender_local_t,
+            receiver_local_t_ptr,
+            perm,
+            num_nodes=int32(num_nodes),
+            debug=int32(config().debug_level),
         )
 
     def _partition(mesh, arg_shapes, result_shape):
@@ -294,11 +291,11 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     # ---- custom_vmap ----
 
     @jax.custom_batching.custom_vmap
-    def _batched_op(x, y, s, sender, receiver, dm):
-        return _sharded_op(coef_bwd, x, y, s, sender, receiver, dm)
+    def _batched_op(x, y, s, dm, sender, receiver):
+        return _sharded_op(coef_bwd, x, y, s, dm, sender, receiver)
 
     @_batched_op.def_vmap
-    def _vmap_rule(axis_size, in_batched, x, y, s, sender, receiver, dm):
+    def _vmap_rule(axis_size, in_batched, x, y, s, dm, sender, receiver):
         x_b, y_b, s_b, dm_b, sender_b, receiver_b = in_batched
         graph_b = sender_b or receiver_b
         if not x_b:
@@ -334,11 +331,11 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     # ---- custom_vjp ----
 
     @custom_vjp
-    def convolution_bwd_op(x, y, s, dm, sender, receiver):
+    def convolution_bwd_op(x, y, s, dm):
         return _batched_op(x, y, s, dm, sender, receiver)
 
-    def _fwd(x, y, s, dm, sender, receiver):
-        dx, dy, ds = convolution_bwd_op(x, y, s, dm, sender, receiver)
+    def _fwd(x, y, s, dm):
+        dx, dy, ds = convolution_bwd_op(x, y, s, dm)
         # Store the graph adjacency in residuals to avoid tracer leaks.
         return (dx, dy, ds), (x, y, s, dm, sender, receiver)
 
@@ -369,7 +366,7 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
 
     convolution_bwd_op.defvjp(_fwd, _bwd)
 
-    return convolution_bwd_op(x, y, s, sender, receiver, dm)
+    return convolution_bwd_op(x, y, s, dm)
 
 
 convolution.Params = CUDAConvolutionParams
