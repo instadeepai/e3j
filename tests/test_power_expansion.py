@@ -72,8 +72,9 @@ class _TestPowerExpansion:
     def test_output(self, module, inputs):
         out = module(*inputs)
         target = module.target
+        lm_axis = -2 if self.layout == "TRAILING_CHANNELS" else -1
         for x_nu, src_nu in zip(out, target):
-            assert x_nu.shape[-1] == src_nu.dim
+            assert x_nu.shape[lm_axis] == src_nu.dim
         # Powers 1, ..., nu (inclusive)
         assert len(out) == self.exponent
 
