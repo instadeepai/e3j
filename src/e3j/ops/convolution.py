@@ -96,7 +96,6 @@ def convolution(
     """
     num_nodes = x.shape[0]
     num_edges = sender.shape[0]
-    receiver_ptr = GraphCSR(num_nodes, sender, receiver).receiver_ptr
 
     channels_x = x.shape[-1] if x.ndim > 2 else 1
     num_out = params.num_out
@@ -110,10 +109,12 @@ def convolution(
     # ---- custom_partitioning ----
     #
     # All array arguments explicit, only close over static problem sizes.
-
     @jax.experimental.custom_partitioning.custom_partitioning
-    def _sharded_op(coef, x, y, s, sender, receiver_ptr):
+    def _sharded_op(coef, x, y, s, sender, receiver):
         n = x.shape[0]
+        sender_local = sender % n
+        receiver_local = receiver % n
+        receiver_local_ptr = GraphCSR(n, sender_local, receiver_local).receiver_ptr
         shape_out = (n, num_out, channels_x)
         return ffi_call(
             "convolution",
@@ -123,8 +124,8 @@ def convolution(
             x,
             y,
             s,
-            sender,
-            receiver_ptr,
+            sender_local,
+            receiver_local_ptr,
             num_nodes=int32(n),
             debug=int32(config().debug_level),
         )
@@ -141,12 +142,13 @@ def convolution(
     s_rule = "ns cx"
     out_rule = "nz cx"
     sharding_rule = (
-        f"u v, nodes {x_rule}, edges ny, edges {s_rule}, p, r" f" -> nodes {out_rule}"
+        f"u v, nodes {x_rule}, edges ny, edges {s_rule}, edges, edges"
+        f" -> nodes {out_rule}"
     )
     _sharded_op.def_partition(
         partition=_partition,
         sharding_rule=sharding_rule,
-        need_replication_factors=("u", "v", "p", "r"),
+        need_replication_factors=("u", "v"),
     )
 
     # ---- custom_vmap ----
@@ -156,13 +158,13 @@ def convolution(
     # Only coefficients are closed over.
 
     @jax.custom_batching.custom_vmap
-    def _batched_op(x, y, s, sender, receiver_ptr):
-        return _sharded_op(coef, x, y, s, sender, receiver_ptr)
+    def _batched_op(x, y, s, sender, receiver):
+        return _sharded_op(coef, x, y, s, sender, receiver)
 
     @_batched_op.def_vmap
-    def _vmap_rule(axis_size, in_batched, x, y, s, sender, receiver_ptr):
-        x_b, y_b, s_b, sender_b, receiver_ptr_b = in_batched
-        graph_b = sender_b or receiver_ptr_b
+    def _vmap_rule(axis_size, in_batched, x, y, s, sender, receiver):
+        x_b, y_b, s_b, sender_b, receiver_b = in_batched
+        graph_b = sender_b or receiver_b
         if not x_b:
             x = jnp.broadcast_to(x[None], (axis_size,) + x.shape)
         if not y_b:
@@ -171,18 +173,19 @@ def convolution(
             s = jnp.broadcast_to(s[None], (axis_size,) + s.shape)
 
         if graph_b:
-            if not (sender_b and receiver_ptr_b):
+            if not (sender_b and receiver_b):
                 raise ValueError("Graph adjacency inconsistently batched for vmap.")
             _warn_graph_batching()
 
         # batched=False tiles the shared graph; batched=True concatenates.
-        sender_t, receiver_ptr_t = GraphCSR.fold_adjacency(
-            axis_size, num_nodes, num_edges, sender, receiver_ptr, batched=graph_b
-        )
+        node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
+        sender = (sender + node_offsets).reshape(-1)
+        receiver = (receiver + node_offsets).reshape(-1)
+
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
-        out = _sharded_op(coef, x, y, s, sender_t, receiver_ptr_t)
+        out = _sharded_op(coef, x, y, s, sender, receiver)
         return out.reshape((axis_size, num_nodes) + out.shape[1:]), True
 
     # ---- custom_vjp ----
@@ -190,12 +193,11 @@ def convolution(
     # Differentiable arguments only: (x, y, s).
 
     @custom_vjp
-    def convolution_op(x, y, s):
-        return _batched_op(x, y, s, sender, receiver_ptr)
+    def convolution_op(x, y, s, sender, receiver):
+        return _batched_op(x, y, s, sender, receiver)
 
-    def _fwd(x, y, s):
-        z = convolution_op(x, y, s)
-        # Store graph adjacency in residuals to avoid tracer leaks in _bwd.
+    def _fwd(x, y, s, sender, receiver):
+        z = convolution_op(x, y, s, sender, receiver)
         return z, (x, y, s, sender, receiver)
 
     def _bwd(res, dm):
@@ -204,7 +206,7 @@ def convolution(
 
     convolution_op.defvjp(_fwd, _bwd)
 
-    return convolution_op(x, y, s)
+    return convolution_op(x, y, s, sender, receiver)
 
 
 def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
@@ -217,12 +219,6 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     num_nodes = x.shape[0]
     num_edges = sender.shape[0]
     has_cx = x.ndim > 2
-
-    # Transpose CSR adjacency: group by sender instead of receiver.
-    graph = GraphCSR(num_nodes, sender, receiver)
-    perm, graph_t, _ = graph.transpose()
-    sender_t = graph_t.sender
-    receiver_ptr_t = graph_t.receiver_ptr
 
     with jax.ensure_compile_time_eval():
         # Transpose coefficients for backward kernel, passed as a triple
@@ -239,25 +235,38 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     # ---- custom_partitioning ----
 
     @jax.experimental.custom_partitioning.custom_partitioning
-    def _sharded_op(coef_bwd, x, y, s, dm, sender_t, receiver_ptr_t, perm):
-        return ffi_call(
-            "convolution_bwd",
-            (
-                jax.ShapeDtypeStruct(x.shape, x.dtype),
-                jax.ShapeDtypeStruct(y.shape, y.dtype),
-                jax.ShapeDtypeStruct(s.shape, s.dtype),
+    def _sharded_op(coef_bwd, x, y, s, sender, receiver, dm):
+        num_nodes = x.shape[0]
+        sender_local = sender % num_nodes
+        receiver_local = receiver % num_nodes
+        perm, graph_local_t, _ = GraphCSR(
+            num_nodes, sender_local, receiver_local
+        ).transpose()
+        sender_local_t = graph_local_t.sender
+        receiver_local_t_ptr = graph_local_t.receiver_ptr
+
+        return (
+            *ffi_call(
+                "convolution_bwd",
+                (
+                    jax.ShapeDtypeStruct(x.shape, x.dtype),
+                    jax.ShapeDtypeStruct(y.shape, y.dtype),
+                    jax.ShapeDtypeStruct(s.shape, s.dtype),
+                ),
+            )(
+                coef_bwd,
+                x,
+                y,
+                s,
+                dm,
+                sender_local_t,
+                receiver_local_t_ptr,
+                perm,
+                num_nodes=int32(num_nodes),
+                debug=int32(config().debug_level),
             ),
-        )(
-            coef_bwd,
-            x,
-            y,
-            s,
-            dm,
-            sender_t,
-            receiver_ptr_t,
-            perm,
-            num_nodes=int32(x.shape[0]),
-            debug=int32(config().debug_level),
+            None,
+            None,
         )
 
     def _partition(mesh, arg_shapes, result_shape):
@@ -274,24 +283,24 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     dm_rule = "nz cx"
     sharding_rule = (
         f"o p q, nodes {x_rule}, edges ny, edges {s_rule}, nodes {dm_rule},"
-        f" t, u, v -> nodes {x_rule}, edges ny, edges {s_rule}"
+        f" edges, edges -> nodes {x_rule}, edges ny, edges {s_rule}"
     )
     _sharded_op.def_partition(
         partition=_partition,
         sharding_rule=sharding_rule,
-        need_replication_factors=("o", "p", "q", "t", "u", "v"),
+        need_replication_factors=("o", "p", "q"),
     )
 
     # ---- custom_vmap ----
 
     @jax.custom_batching.custom_vmap
-    def _batched_op(x, y, s, dm, sender_t, receiver_ptr_t, perm):
-        return _sharded_op(coef_bwd, x, y, s, dm, sender_t, receiver_ptr_t, perm)
+    def _batched_op(x, y, s, sender, receiver, dm):
+        return _sharded_op(coef_bwd, x, y, s, sender, receiver, dm)
 
     @_batched_op.def_vmap
-    def _vmap_rule(axis_size, in_batched, x, y, s, dm, sender_t, receiver_ptr_t, perm):
-        x_b, y_b, s_b, dm_b, sender_b, receiver_ptr_b, perm_b = in_batched
-        graph_b = sender_b or receiver_ptr_b or perm_b
+    def _vmap_rule(axis_size, in_batched, x, y, s, sender, receiver, dm):
+        x_b, y_b, s_b, dm_b, sender_b, receiver_b = in_batched
+        graph_b = sender_b or receiver_b
         if not x_b:
             x = jnp.broadcast_to(x[None], (axis_size,) + x.shape)
         if not y_b:
@@ -301,23 +310,21 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
         if not dm_b:
             dm = jnp.broadcast_to(dm[None], (axis_size,) + dm.shape)
         if graph_b:
-            if not (sender_b and receiver_ptr_b and perm_b):
+            if not (sender_b and receiver_b):
                 raise ValueError("Graph adjacency inconsistently batched for vmap.")
             _warn_graph_batching()
 
         # batched=False tiles the shared graph; batched=True concatenates.
-        sender_tt, receiver_ptr_tt = GraphCSR.fold_adjacency(
-            axis_size, num_nodes, num_edges, sender_t, receiver_ptr_t, batched=graph_b
-        )
-        perm_t = GraphCSR.fold_permutation(axis_size, num_edges, perm, batched=graph_b)
+        node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
+        sender = (sender + node_offsets).reshape(-1)
+        receiver = (receiver + node_offsets).reshape(-1)
+
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
         dm = dm.reshape((axis_size * num_nodes,) + dm.shape[2:])
 
-        dx, dy, ds = _sharded_op(
-            coef_bwd, x, y, s, dm, sender_tt, receiver_ptr_tt, perm_t
-        )
+        dx, dy, ds = _sharded_op(coef_bwd, x, y, s, dm, sender, receiver)
 
         dx = dx.reshape((axis_size, num_nodes) + dx.shape[1:])
         dy = dy.reshape((axis_size, num_edges) + dy.shape[1:])
@@ -327,11 +334,11 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     # ---- custom_vjp ----
 
     @custom_vjp
-    def convolution_bwd_op(x, y, s, dm):
-        return _batched_op(x, y, s, dm, sender_t, receiver_ptr_t, perm)
+    def convolution_bwd_op(x, y, s, dm, sender, receiver):
+        return _batched_op(x, y, s, dm, sender, receiver)
 
-    def _fwd(x, y, s, dm):
-        dx, dy, ds = convolution_bwd_op(x, y, s, dm)
+    def _fwd(x, y, s, dm, sender, receiver):
+        dx, dy, ds = convolution_bwd_op(x, y, s, dm, sender, receiver)
         # Store the graph adjacency in residuals to avoid tracer leaks.
         return (dx, dy, ds), (x, y, s, dm, sender, receiver)
 
@@ -362,7 +369,7 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
 
     convolution_bwd_op.defvjp(_fwd, _bwd)
 
-    return convolution_bwd_op(x, y, s, dm)
+    return convolution_bwd_op(x, y, s, sender, receiver, dm)
 
 
 convolution.Params = CUDAConvolutionParams

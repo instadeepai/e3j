@@ -117,71 +117,50 @@ def test_jit_convolution_vmap():
     testing.assert_allclose(out_vmap[1], out_single, atol=1e-5)
 
 
-@pytest.mark.parametrize("batched", [False, True], ids=["replicated", "distinct"])
-def test_vmap_convolution_execute_multi_devices(batched):
-    """Run vmapped convolution and check values against a per-graph reference.
-
-    Feeds *distinct* features to every batch element and compares each output
-    slice to the unfused reference on that slice's own graph. Distinct inputs
-    are what make a bad `GraphCSR.fold_adjacency` offset observable: if one
-    element's nodes or edges leak into another's block, the numbers diverge
-    from the reference. Two folds are exercised:
-
-    - "replicated": one graph closed over and tiled across the batch
-      (`batched=False`), with the batch sharded over a mesh of `jax.devices()`
-      to drive the SPMD path. No warning.
-    - "distinct": distinct graphs stacked and vmapped over the adjacency
-      (`batched=True`), which must warn.
-    """
+@pytest.mark.multi_devices
+def test_vmap_convolution_execute_multi_devices():
+    "Check that running on multiple device give the same result as each run individualy."
     coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
 
-    if batched:
-        batch = 3
-        keys = random.split(random.key(5), batch)
-        graphs = [make_graph(NUM_NODES, NUM_EDGES, k) for k in keys]
-        senders = np.stack([g[0] for g in graphs])
-        receivers = np.stack([g[1] for g in graphs])
-    else:
-        # Batch must be a multiple of the device count for even sharding.
-        batch = 2 * jax.device_count()
-        senders = np.broadcast_to(sender, (batch, *sender.shape))
-        receivers = np.broadcast_to(receiver, (batch, *receiver.shape))
+    batch = 3 * jax.device_count()
+    keys = random.split(random.key(5), batch)
+    graphs = [make_graph(NUM_NODES, NUM_EDGES, k) for k in keys]
+    senders = np.stack([g[0] for g in graphs])
+    receivers = np.stack([g[1] for g in graphs])
 
     kx, ky, ks = random.split(random.key(11), 3)
     xs = random.normal(kx, (batch, *x.shape))
     ys = random.normal(ky, (batch, *y.shape))
     ss = random.normal(ks, (batch, *s.shape))
 
-    if batched:
+    def conv(x, y, s, sender, receiver):
+        return convolution(coef, x, y, s, sender, receiver, params)
 
-        def conv(x, y, s, sender, receiver):
-            return convolution(coef, x, y, s, sender, receiver, params)
+    mesh = jax.sharding.Mesh(jax.devices(), ("batch",))
+    with mesh:
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("batch"))
 
-        with pytest.warns(ConvolutionBatchingWarning):
-            out = jax.vmap(conv)(xs, ys, ss, senders, receivers)
-    else:
-
-        def conv(x, y, s):
-            return convolution(coef, x, y, s, sender, receiver, params)
-
-        mesh = jax.make_mesh((jax.device_count(),), ("batch",))
-        P = jax.sharding.PartitionSpec
-        x_sharding = jax.sharding.NamedSharding(mesh, P("batch", None, None))
-        y_sharding = jax.sharding.NamedSharding(mesh, P("batch", None))
-        s_sharding = jax.sharding.NamedSharding(mesh, P("batch", None, None))
         jitted_fn = jax.jit(
             jax.vmap(conv),
-            in_shardings=(x_sharding, y_sharding, s_sharding),
-            out_shardings=x_sharding,
+            in_shardings=(sharding, sharding, sharding, sharding, sharding),
+            out_shardings=sharding,
         )
-        out = jitted_fn(xs, ys, ss)
+        out = jitted_fn(*jax.device_put((xs, ys, ss, senders, receivers), sharding))
 
-    assert out.shape == (batch, NUM_NODES, NUM_OUT, CHANNELS_X)
-    for b in range(batch):
-        ref = convolution_reference(
-            idx, val, xs[b], ys[b], ss[b], s_index, senders[b], receivers[b], NUM_OUT
-        )
-        testing.assert_allclose(out[b], ref, atol=1e-4, rtol=1e-4)
+        assert out.shape == (batch, NUM_NODES, NUM_OUT, CHANNELS_X)
+        for b in range(batch):
+            ref = convolution_reference(
+                idx,
+                val,
+                xs[b],
+                ys[b],
+                ss[b],
+                s_index,
+                senders[b],
+                receivers[b],
+                NUM_OUT,
+            )
+            testing.assert_allclose(out[b], ref, atol=1e-4, rtol=1e-4)
 
 
 # --- sharding ---
@@ -264,8 +243,10 @@ def test_vmap_fwd_convolution_multi_devices():
 
     # The batch (4) is sharded over 2 devices and the custom_vmap rule folds the
     # 2 per-shard elements into the kernel row axis: node arrays get 2 * 4 = 8
-    # rows, edge arrays 2 * 12 = 24. The CSR adjacency is replicated, hence tiled
-    # for the full batch: sender 4 * 12 = 48, receiver_ptr 4 * 4 + 1 = 17.
+    # rows, edge arrays 2 * 12 = 24. The adjacency is passed COO and sharded
+    # edge-wise like the edge features (sender 24), and the shard-local CSR
+    # pointer is rebuilt from those local edges (receiver_ptr 2 * 4 + 1 = 9), so
+    # each device convolves only its own block of the batched graph.
     #
     # Dimension legend (also used by the backward test):
     #   8  = sharded nodes, 24 = sharded edges, 4 = NUM_OUT/X/Y, 32 = CHANNELS_X
@@ -278,8 +259,8 @@ def test_vmap_fwd_convolution_multi_devices():
         r"f32\[8,4,32\]\{2,1,0\}, "  # x (node features)
         r"f32\[24,4\]\{1,0\}, "  # y (edge embeddings)
         r"f32\[24,2,32\]\{2,1,0\}, "  # s (edge scalars)
-        r"s32\[48\]\{0\}, "  # sender (CSR, replicated)
-        r"s32\[17\]\{0\}\}",  # receiver_ptr (CSR, replicated)
+        r"s32\[24\]\{0\}, "  # sender (COO, sharded edge-wise)
+        r"s32\[9\]\{0\}\}",  # receiver_ptr (shard-local CSR)
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(hlo))) == 1, (
@@ -332,8 +313,10 @@ def test_vmap_grad_convolution_multi_devices():
     hlo = compiled.as_text()
 
     # Same shard/batch folding as the forward test; see its dimension legend.
-    # Extras here: coef_bwd stacks the 3 transposed COO orderings (dx, dy, ds),
-    # and perm (the edge sort) joins the replicated CSR adjacency operands.
+    # The adjacency is sharded COO edge-wise (sender/receiver 24 each), and the
+    # transposed shard-local CSR is rebuilt inside the kernel region: sender_t
+    # 24 (edges), receiver_ptr_t 9 (nodes + 1), perm 24 (edge sort). Extra:
+    # coef_bwd stacks the 3 transposed COO orderings (dx, dy, ds).
     regex = re.compile(
         # outputs: (dx, dy, ds)
         r"\(f32\[8,4,32\]\{2,1,0\}, f32\[24,4\]\{1,0\}, f32\[24,2,32\]\{2,1,0\}\)"
@@ -345,15 +328,99 @@ def test_vmap_grad_convolution_multi_devices():
         r"f32\[24,4\]\{1,0\}, "  # y
         r"f32\[24,2,32\]\{2,1,0\}, "  # s
         r"f32\[8,4,32\]\{2,1,0\}, "  # dm (output cotangent)
-        r"s32\[48\]\{0\}, "  # sender_t (transposed CSR)
-        r"s32\[17\]\{0\}, "  # receiver_ptr_t
-        r"s32\[48\]\{0\}\}",  # perm (edge permutation)
+        r"s32\[24\]\{0\}, "  # sender_t (shard-local transposed CSR)
+        r"s32\[9\]\{0\}, "  # receiver_ptr_t
+        r"s32\[24\]\{0\}\}",  # perm (edge permutation)
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(hlo))) == 1, (
         f"Expected exactly one convolution_bwd custom call, found "
         f"{len(list(regex.finditer(hlo)))}.\n\nHLO:\n{hlo}"
     )
+
+
+# --- sharding (numerical, real multi-device) ---
+#
+# The HLO tests above pin the *shape* of the sharded custom call but never
+# execute it. These run the real kernels on >= 2 devices and check that data
+# parallelism over a batch of *distinct* graphs matches single-device vmap
+# exactly. They are the regression guard for the cross-shard adjacency bleed
+# that a replicated global CSR caused (every shard but the first reused the
+# first shard's adjacency), which shape-only checks cannot catch.
+
+
+def _batched_conv_data(batch, key):
+    """A batch of `batch` distinct random graphs sharing packed coefficients."""
+    coef, x0, y0, s0, *_rest, params, _idx, _val, _s_index = generate_conv_data()
+    xs, ys, ss, senders, receivers = [], [], [], [], []
+    for k in random.split(key, batch):
+        kg, kx, ky, ks = random.split(k, 4)
+        sender, receiver = make_graph(NUM_NODES, NUM_EDGES, kg)
+        senders.append(sender)
+        receivers.append(receiver)
+        xs.append(random.normal(kx, x0.shape))
+        ys.append(random.normal(ky, y0.shape))
+        ss.append(random.normal(ks, s0.shape))
+    stack = lambda arrs: np.stack(arrs)
+    return (
+        coef,
+        stack(xs),
+        stack(ys),
+        stack(ss),
+        stack(senders),
+        stack(receivers),
+        params,
+    )
+
+
+@pytest.mark.skipif(jax.device_count() < 2, reason="requires >= 2 devices")
+def test_vmap_fwd_convolution_multi_devices_numerical():
+    """Sharded forward equals single-device vmap over distinct graphs."""
+    coef, x, y, s, sender, receiver, params = _batched_conv_data(
+        batch=2 * jax.device_count(), key=random.key(0)
+    )
+
+    def conv(x, y, s, sender, receiver):
+        return convolution(coef, x, y, s, sender, receiver, params)
+
+    batched = jax.vmap(conv)
+    out_ref = batched(x, y, s, sender, receiver)
+
+    mesh = jax.sharding.Mesh(jax.devices(), ("dp",))
+    sh = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("dp"))
+    out_sharded = jax.jit(batched, in_shardings=(sh,) * 5, out_shardings=sh)(
+        x, y, s, sender, receiver
+    )
+
+    # Each graph is convolved by one kernel launch on its own shard, so the
+    # match is bit-exact rather than merely close.
+    testing.assert_array_equal(jax.device_get(out_sharded), jax.device_get(out_ref))
+
+
+@pytest.mark.skipif(jax.device_count() < 2, reason="requires >= 2 devices")
+def test_vmap_grad_convolution_multi_devices_numerical():
+    """Sharded gradients equal single-device vmap gradients over distinct graphs."""
+    coef, x, y, s, sender, receiver, params = _batched_conv_data(
+        batch=2 * jax.device_count(), key=random.key(1)
+    )
+
+    def loss(x, y, s, sender, receiver):
+        z = jax.vmap(lambda *a: convolution(coef, *a, params))(
+            x, y, s, sender, receiver
+        )
+        return np.sum(z**2)
+
+    grad_fn = jax.grad(loss, argnums=(0, 1, 2))
+    g_ref = grad_fn(x, y, s, sender, receiver)
+
+    mesh = jax.sharding.Mesh(jax.devices(), ("dp",))
+    sh = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("dp"))
+    g_sharded = jax.jit(grad_fn, in_shardings=(sh,) * 5, out_shardings=(sh, sh, sh))(
+        x, y, s, sender, receiver
+    )
+
+    for ref, shard in zip(g_ref, g_sharded):
+        testing.assert_array_equal(jax.device_get(shard), jax.device_get(ref))
 
 
 # --- Hessian (jacrev ∘ grad) ---
