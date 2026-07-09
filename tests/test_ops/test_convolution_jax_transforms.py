@@ -27,7 +27,7 @@ import e3j
 from e3j.ops.coef import Coef4D
 from e3j.ops.convolution import (
     ConvolutionBatchingWarning,
-    ConvolutionParams,
+    CUDAConvolutionParams,
     convolution,
 )
 from e3j.utils.sparse import narrow_index_dtype
@@ -87,7 +87,7 @@ def generate_conv_data():
     s_index = np.sort(random.randint(next(keys), (NUM_OUT,), 0, NUM_SCALARS))
     idx4 = np.stack([idx_0, idx_1, idx_2, s_index[idx_0]])
     coef = pack_coef4d(val, idx4)
-    params = ConvolutionParams(num_out=NUM_OUT, num_scalars=NUM_SCALARS)
+    params = CUDAConvolutionParams(num_out=NUM_OUT, num_scalars=NUM_SCALARS)
 
     sender, receiver = make_graph(NUM_NODES, NUM_EDGES, next(keys))
 
@@ -115,6 +115,73 @@ def test_jit_convolution_vmap():
     assert out_vmap.shape == (2,) + out_single.shape
     testing.assert_allclose(out_vmap[0], out_single, atol=1e-5)
     testing.assert_allclose(out_vmap[1], out_single, atol=1e-5)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["replicated", "distinct"])
+def test_vmap_convolution_execute_multi_devices(batched):
+    """Run vmapped convolution and check values against a per-graph reference.
+
+    Feeds *distinct* features to every batch element and compares each output
+    slice to the unfused reference on that slice's own graph. Distinct inputs
+    are what make a bad `GraphCSR.fold_adjacency` offset observable: if one
+    element's nodes or edges leak into another's block, the numbers diverge
+    from the reference. Two folds are exercised:
+
+    - "replicated": one graph closed over and tiled across the batch
+      (`batched=False`), with the batch sharded over a mesh of `jax.devices()`
+      to drive the SPMD path. No warning.
+    - "distinct": distinct graphs stacked and vmapped over the adjacency
+      (`batched=True`), which must warn.
+    """
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    if batched:
+        batch = 3
+        keys = random.split(random.key(5), batch)
+        graphs = [make_graph(NUM_NODES, NUM_EDGES, k) for k in keys]
+        senders = np.stack([g[0] for g in graphs])
+        receivers = np.stack([g[1] for g in graphs])
+    else:
+        # Batch must be a multiple of the device count for even sharding.
+        batch = 2 * jax.device_count()
+        senders = np.broadcast_to(sender, (batch, *sender.shape))
+        receivers = np.broadcast_to(receiver, (batch, *receiver.shape))
+
+    kx, ky, ks = random.split(random.key(11), 3)
+    xs = random.normal(kx, (batch, *x.shape))
+    ys = random.normal(ky, (batch, *y.shape))
+    ss = random.normal(ks, (batch, *s.shape))
+
+    if batched:
+
+        def conv(x, y, s, sender, receiver):
+            return convolution(coef, x, y, s, sender, receiver, params)
+
+        with pytest.warns(ConvolutionBatchingWarning):
+            out = jax.vmap(conv)(xs, ys, ss, senders, receivers)
+    else:
+
+        def conv(x, y, s):
+            return convolution(coef, x, y, s, sender, receiver, params)
+
+        mesh = jax.make_mesh((jax.device_count(),), ("batch",))
+        P = jax.sharding.PartitionSpec
+        x_sharding = jax.sharding.NamedSharding(mesh, P("batch", None, None))
+        y_sharding = jax.sharding.NamedSharding(mesh, P("batch", None))
+        s_sharding = jax.sharding.NamedSharding(mesh, P("batch", None, None))
+        jitted_fn = jax.jit(
+            jax.vmap(conv),
+            in_shardings=(x_sharding, y_sharding, s_sharding),
+            out_shardings=x_sharding,
+        )
+        out = jitted_fn(xs, ys, ss)
+
+    assert out.shape == (batch, NUM_NODES, NUM_OUT, CHANNELS_X)
+    for b in range(batch):
+        ref = convolution_reference(
+            idx, val, xs[b], ys[b], ss[b], s_index, senders[b], receivers[b], NUM_OUT
+        )
+        testing.assert_allclose(out[b], ref, atol=1e-4, rtol=1e-4)
 
 
 # --- sharding ---
