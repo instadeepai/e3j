@@ -6,7 +6,7 @@ from e3j import utils
 from e3j.core.scalar_mixing import ScalarMixing
 from e3j.core.tensor_product import TensorProduct
 from e3j.ops.coef import Coef4D
-from e3j.ops.convolution import ConvolutionParams, convolution
+from e3j.ops.convolution import CUDAConvolutionParams, convolution
 from e3j.spaces import O3Space
 from e3j.utils import options
 from e3j.utils.cache import cache
@@ -161,7 +161,7 @@ class Convolution:
         with jax.ensure_compile_time_eval():
             coef4D_packed = self.coef.pack_jax()
 
-        params = ConvolutionParams(
+        params = CUDAConvolutionParams(
             num_out=self.target.dim,
             num_scalars=self._mix.num_irreps,
         )

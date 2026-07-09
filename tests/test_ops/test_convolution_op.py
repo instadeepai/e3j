@@ -21,7 +21,7 @@ from jax import Array
 
 import e3j
 from e3j.ops.coef import Coef4D
-from e3j.ops.convolution import ConvolutionParams, convolution
+from e3j.ops.convolution import CUDAConvolutionParams, convolution
 from e3j.utils.sparse import narrow_index_dtype
 
 e3j.config(debug_level=0)
@@ -126,7 +126,7 @@ class _TestConvolutionOp:
             (np.arange(ns), random.randint(next(keys), (nz - ns,), 0, ns))
         )
         s_index = np.sort(s_index)
-        params = ConvolutionParams(num_out=nz, num_scalars=ns)
+        params = CUDAConvolutionParams(num_out=nz, num_scalars=ns)
 
         return idx, val, s_index, params
 

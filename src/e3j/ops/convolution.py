@@ -28,7 +28,7 @@ from e3j.utils import config, is_pow2
 
 
 @dataclass
-class ConvolutionParams:
+class CUDAConvolutionParams:
     num_out: int
     num_scalars: int
 
@@ -59,7 +59,7 @@ def convolution(
     s: Array,
     sender: Array,
     receiver: Array,
-    params: ConvolutionParams,
+    params: CUDAConvolutionParams,
 ) -> Array:
     """Primitive bound to the CUDA convolution kernel.
 
@@ -365,4 +365,4 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     return convolution_bwd_op(x, y, s, dm)
 
 
-convolution.Params = ConvolutionParams
+convolution.Params = CUDAConvolutionParams
