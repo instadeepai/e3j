@@ -8,9 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 
 ### Added
 
+- Message-passing `e3j.core.Convolution` exposing the public API for a trilinear
+  mixing of node features, edge features (typically harmonic embeddings of edge
+  vectors) and edge scalars (typically MLP transforms of RBF-encoded interatomic
+  distances), common in many MLIPs.
 - CUDA convolution kernels (forward and backward), fusing the trilinear mixing
-  of node features, edge features and edge scalars, with gather/scatter operations
-  to avoid the expensive materialization of messages.
+  with gather/scatter operations to avoid materializing messages. The associated
+  JAX primitive is infinitely differentiable and SPMD compatible.
 
 ### Changed
 
