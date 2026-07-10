@@ -94,8 +94,6 @@ def convolution(
     Returns:
         Output node features, shape (num_nodes, num_out, channels_x).
     """
-    num_nodes = x.shape[0]
-    num_edges = sender.shape[0]
 
     channels_x = x.shape[-1] if x.ndim > 2 else 1
     num_out = params.num_out
@@ -177,6 +175,10 @@ def convolution(
                 raise ValueError("Graph adjacency inconsistently batched for vmap.")
             _warn_graph_batching()
 
+        # Read graph dimensions from data to support multiple vmap layers.
+        num_nodes = x.shape[1]
+        num_edges = y.shape[1]
+
         # batched=False tiles the shared graph; batched=True concatenates.
         node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
         sender = (sender + node_offsets).reshape(-1)
@@ -185,7 +187,8 @@ def convolution(
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
-        out = _sharded_op(coef, x, y, s, sender, receiver)
+        # Recursive call supports multiple vmap layers; base case runs _sharded_op.
+        out = _batched_op(x, y, s, sender, receiver)
         return out.reshape((axis_size, num_nodes) + out.shape[1:]), True
 
     # ---- custom_vjp ----
@@ -217,8 +220,6 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
     by calling the fused backward kernel with transposed coefficients
     and transposed CSR adjacency.
     """
-    num_nodes = x.shape[0]
-    num_edges = sender.shape[0]
     has_cx = x.ndim > 2
 
     with jax.ensure_compile_time_eval():
@@ -311,6 +312,10 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
                 raise ValueError("Graph adjacency inconsistently batched for vmap.")
             _warn_graph_batching()
 
+        # Read graph dimensions from data to support multiple vmap layers.
+        num_nodes = x.shape[1]
+        num_edges = y.shape[1]
+
         # batched=False tiles the shared graph; batched=True concatenates.
         node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
         sender = (sender + node_offsets).reshape(-1)
@@ -321,7 +326,8 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
         s = s.reshape((axis_size * num_edges,) + s.shape[2:])
         dm = dm.reshape((axis_size * num_nodes,) + dm.shape[2:])
 
-        dx, dy, ds = _sharded_op(coef_bwd, x, y, s, dm, sender, receiver)
+        # Recursive call supports multiple vmap layers; base case runs _sharded_op.
+        dx, dy, ds = _batched_op(x, y, s, dm, sender, receiver)
 
         dx = dx.reshape((axis_size, num_nodes) + dx.shape[1:])
         dy = dy.reshape((axis_size, num_edges) + dy.shape[1:])
