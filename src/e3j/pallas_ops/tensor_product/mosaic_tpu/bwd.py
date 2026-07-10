@@ -67,23 +67,23 @@ class _BwdTrailingChannelKernel(BwdKernel):
     Layout / shapes
     ---------------
     The TRAILING_CHANNELS layout puts the channel axis last, so the natural unit
-    of work is a `(channel,)` vector lying along the TPU lane axis.
+    of work is a `(num_channels,)` vector lying along the TPU lane axis.
 
     Inputs from HBM after `pad_for_tpu`:
 
-    - `x`: `(batch, x_dim, channel)`.
-    - `y`: subclass-defined `(batch, y_dim)` for OUTER and `(batch, y_dim, channel)` for  MAP.
-    - `dz`: passed in as `(batch, z_dim, channel)` but we expect the layout in memory to be
-        `(z_dim, batch, channel)` because z is returned with this layout in fwd. So asume we can
-        transpose it to have shape `(z_dim, batch, channel)` with a free bitcast.
+    - `x`: `(batch, x_dim, num_channels)`.
+    - `y`: subclass-defined `(batch, y_dim)` for OUTER and `(batch, y_dim, num_channels)` for  MAP.
+    - `dz`: passed in as `(batch, z_dim, num_channels)` but we expect the layout in memory to be
+        `(z_dim, batch, num_channels)` because z is returned with this layout in fwd. So asume we can
+        transpose it to have shape `(z_dim, batch, num_channels)` with a free bitcast.
 
     Outputs:
 
-    - `dx`: `(batch, x_dim, channel)`
+    - `dx`: `(batch, x_dim, num_channels)`
     - `dy`: subclass-defined (`dy_kernel_shape`) — OUTER `(batch, y_dim)`,
-      MAP `(batch, y_dim, channel)`.
+      MAP `(batch, y_dim, num_channels)`.
 
-    `x`/`dz`/`y` are padded so `x_dim` / `channel` are tile multiples, the
+    `x`/`dz`/`y` are padded so `x_dim` / `num_channels` are tile multiples, the
     padding is sliced off the returned `dx` and `dy`.
 
     Algorithm
@@ -98,22 +98,22 @@ class _BwdTrailingChannelKernel(BwdKernel):
     output tiles so the next tile's DMA overlaps the current tile's compute.
 
     Per pipeline step (body), working in VMEM:
-      1. Transpose the x tile from `(batch_block, x_dim, channel)` to `(x_dim, batch_block, channel)`
-         so an `x[xi]` slice is a contiguous `(batch_block, channel)` operand
+      1. Transpose the x tile from `(batch_block_size, x_dim, num_channels)` to `(x_dim, batch_block_size, num_channels)`
+         so an `x[xi]` slice is a contiguous `(batch_block_size, num_channels)` operand
          making it the leading axis avoids a strided gather on every contribution.
-      2. Preload each used `yi` into a `(batch_block, channel)` operand once
+      2. Preload each used `yi` into a `(batch_block_size, num_channels)` operand once
          (OUTER broadcasts the per-channel scalar across the channel axis, MAP slices it),
          so a `yi` reused across several `xi` is only materialized one time.
-      3. Allocate fp32 `(batch_block, channel)` accumulators: one `dy_acc[yi]` per
+      3. Allocate fp32 `(batch_block_size, num_channels)` accumulators: one `dy_acc[yi]` per
          used `yi` (`yi_used = range(y_dim)`) and a `dx_rows` list with one
          entry per `xi`.
       4. For each `xi` and each contribution `(zi, yi, v)`, compute the shared
          term `vdz = v * dz[zi]` once, then accumulate `y[yi] * vdz` into the
          `xi` row of `dx` and `x[xi] * vdz` into `dy_acc[yi]`.
-      5. Stack the `dx` rows to `(x_dim, batch_block, channel)` and transpose once
-         back to the output's `(batch_block, x_dim, channel)` layout before storing.
+      5. Stack the `dx` rows to `(x_dim, batch_block_size, num_channels)` and transpose once
+         back to the output's `(batch_block_size, x_dim, num_channels)` layout before storing.
       6. Store each `dy_acc[yi]` via `write_dy` — OUTER reduces over the channel axis to
-         a per-channel scalar, MAP writes the full `(batch_block, channel)` vector.
+         a per-channel scalar, MAP writes the full `(batch_block_size, num_channels)` vector.
     """
 
     # Only used for channel=32 as it was slowing down for channel=64
