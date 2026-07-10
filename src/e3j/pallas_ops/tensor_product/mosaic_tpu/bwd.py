@@ -149,7 +149,6 @@ class _BwdTrailingChannelKernel(BwdKernel):
             and (batch_size // n_batch_packed_in_mul) % num_kernel == 0
         )
         n_batch_packed_in_mul = n_batch_packed_in_mul if packing else 1
-        real_mul = mul
         if packing:
             packed_batch_size = batch_size // n_batch_packed_in_mul
             x = self._pack_rows(
@@ -206,7 +205,6 @@ class _BwdTrailingChannelKernel(BwdKernel):
                     batch_block_size,
                     num_multiplicities_padded,
                     n_batch_packed_in_mul,
-                    real_mul,
                 )
                 zero = jnp.zeros(
                     (batch_block_size, num_multiplicities_padded), jnp.float32
@@ -234,9 +232,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
                 )
 
                 for yi in yi_used:
-                    self.write_dy(
-                        dy_vmem, yi, dy_acc[yi], n_batch_packed_in_mul, real_mul
-                    )
+                    self.write_dy(dy_vmem, yi, dy_acc[yi], n_batch_packed_in_mul)
 
             pltpu.emit_pipeline(
                 body,
@@ -410,11 +406,10 @@ class _BwdTrailingChannelKernel(BwdKernel):
         batch_block_size: int,
         num_multiplicities: int,
         n_batch_packed_in_mul: int,
-        real_mul: int,
     ) -> dict[int, jax.Array]:
         """Materialize a ``yi -> (batch_block_size, mul)`` operand for each used y component.
 
-        ``k``/``real_mul`` describe the active lane packing (``k == 1`` when off).
+        ``n_batch_packed_in_mul`` describes the active lane packing (``== 1`` when off).
         """
 
     @abstractmethod
@@ -424,11 +419,10 @@ class _BwdTrailingChannelKernel(BwdKernel):
         yi: int,
         dy_acc: jax.Array,
         n_batch_packed_in_mul: int,
-        real_mul: int,
     ) -> None:
         """Store the accumulated ``(batch_block_size, mul)`` ``dy_acc`` for component ``yi``.
 
-        ``k``/``real_mul`` describe the active lane packing (``k == 1`` when off).
+        ``n_batch_packed_in_mul`` describes the active lane packing (``== 1`` when off).
         """
 
     @abstractmethod
@@ -485,9 +479,9 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
         batch_block_size: int,
         num_multiplicities: int,
         n_batch_packed_in_mul: int,
-        real_mul: int,
     ) -> dict[int, jax.Array]:
         if n_batch_packed_in_mul > 1:
+            real_mul = num_multiplicities // n_batch_packed_in_mul
 
             def _broadcast(yi: int) -> jax.Array:
                 seg = y_vmem[
@@ -514,10 +508,10 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
         yi: int,
         dy_acc: jax.Array,
         n_batch_packed_in_mul: int,
-        real_mul: int,
     ) -> None:
         # OUTER's dy is (batch, y_dim): reduce dy_acc over the mul axis.
         if n_batch_packed_in_mul > 1:
+            real_mul = dy_acc.shape[-1] // n_batch_packed_in_mul
             # Reduce per k
             for j in range(n_batch_packed_in_mul):
                 seg = dy_acc[
@@ -584,7 +578,6 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         batch_block_size: int,
         num_multiplicities: int,
         n_batch_packed_in_mul: int,
-        real_mul: int,
     ) -> dict[int, jax.Array]:
         return {yi: y_vmem[:, yi, :] for yi in yis}
 
@@ -594,7 +587,6 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         yi: int,
         dy_acc: jax.Array,
         n_batch_packed_in_mul: int,
-        real_mul: int,
     ) -> None:
         dy_vmem[:, yi, :] = dy_acc.astype(dy_vmem.dtype)
 
