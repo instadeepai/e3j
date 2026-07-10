@@ -324,6 +324,48 @@ def test_vmap_matches_loop(in1, in2, out, batch: int = 128, mul: int = 128):
     testing.assert_allclose(dy, exp_dy, rtol=RTOL, atol=ATOL)
 
 
+@pytest.mark.multi_devices
+@pytest.mark.parametrize(("in1", "in2", "out"), SHARD_CASES, ids=SHARD_CASES_IDS)
+def test_vmap_execute_multi_devices_mul_packing(
+    in1, in2, out, batch: int = 128, mul: int = 32
+):
+    """Real sharded execution across `jax.devices()` matches a per-item loop.
+
+    `mul=32` makes `k = 128 // mul == 4`, clearing both fwd's and bwd's
+    `k >= 4` multiplicity-packing gate (`mul=64` would give `k=2` and stay
+    unpacked), so this exercises the packed lane layout through the
+    data-parallel `custom_vmap` -> `shard_map` rule for real, rather than the
+    device-free compile-only checks below.
+    """
+    v = jax.device_count()
+    mesh = Mesh(np.asarray(jax.devices()), ("batch",))
+    kx, ky = jax.random.split(jax.random.key(0))
+
+    params = _build_params(in1, in2, out)
+    xs = jax.random.normal(kx, (v, batch, params.x_space.dim, mul))
+    ys = jax.random.normal(ky, (v, batch, params.y_space.dim))
+
+    def tp(x, y):
+        return tensor_product_pallas_mosaic_tpu(x, y, params)
+
+    with jax.sharding.set_mesh(mesh):
+        out_vmap = jax.jit(jax.vmap(tp))(xs, ys)
+    expected = jnp.stack([tp(xs[i], ys[i]) for i in range(v)])
+    testing.assert_allclose(out_vmap, expected, rtol=RTOL, atol=ATOL)
+
+    loss = lambda x, y: jnp.sum(jax.vmap(tp)(x, y))  # noqa: E731
+    with jax.sharding.set_mesh(mesh):
+        dx, dy = jax.jit(jax.grad(loss, argnums=(0, 1)))(xs, ys)
+    grads = [
+        jax.grad(lambda x, y: jnp.sum(tp(x, y)), argnums=(0, 1))(xs[i], ys[i])
+        for i in range(v)
+    ]
+    exp_dx = jnp.stack([g[0] for g in grads])
+    exp_dy = jnp.stack([g[1] for g in grads])
+    testing.assert_allclose(dx, exp_dx, rtol=RTOL, atol=ATOL)
+    testing.assert_allclose(dy, exp_dy, rtol=RTOL, atol=ATOL)
+
+
 def _num_partitions(compiled) -> int:
     match = re.search(r"num_partitions=(\d+)", compiled.as_text())
     assert match is not None, "num_partitions missing from compiled HLO"
@@ -360,12 +402,25 @@ def _virtual_tpu_mesh(axis: str = "batch") -> Mesh:
     return Mesh(np.asarray(topology.devices), (axis,))
 
 
+def _packed_shard_dims(batch: int, mul: int) -> tuple[int, int]:
+    """(batch, mul) as seen by the sharded `tpu_custom_call`, once the fwd/bwd
+    `packing` gate folds `k = 128 // mul` batch rows into the lane axis
+    (`_FwdTrailingChannelKernel._pack_x` / `_BwdTrailingChannelKernel._pack_rows`).
+    Mirrors the gate so callers can assert on either the packed or unpacked shape."""
+    k = 128 // mul if mul < 128 and 128 % mul == 0 else 1
+    if k < 4:  # below the `k >= 4` gate: packing stays off
+        return batch, mul
+    return batch // k, mul * k
+
+
+@pytest.mark.parametrize("mul", [32, 128], ids=["mul32_packed", "mul128_unpacked"])
 @pytest.mark.parametrize(("in1", "in2", "out"), SHARD_CASES, ids=SHARD_CASES_IDS)
-def test_vmap_precompiles_device_free(in1, in2, out, batch: int = 128, mul: int = 128):
+def test_vmap_precompiles_device_free(in1, in2, out, mul, batch: int = 128):
     """The dp-vmap forward and backward lower and compile against a virtual
     multi-device topology (no live TPU), sharding the merged batch axis across
     the whole mesh. The compiled HLO is checked to run the Mosaic forward and
-    backward kernels on the per-shard batch size."""
+    backward kernels on the per-shard batch size, including the packed lane
+    layout when `mul=32` clears the multiplicity-packing gate."""
     mesh = _virtual_tpu_mesh()
     v = mesh.size
     params = _build_params(in1, in2, out)
@@ -386,5 +441,6 @@ def test_vmap_precompiles_device_free(in1, in2, out, batch: int = 128, mul: int 
 
     assert _num_partitions(fwd) == v
     assert _num_partitions(grad) == v
-    _assert_input_sharded(fwd, batch, mul)
-    _assert_grad_sharded(grad, batch, mul)
+    shard_batch, shard_mul = _packed_shard_dims(batch, mul)
+    _assert_input_sharded(fwd, shard_batch, shard_mul)
+    _assert_grad_sharded(grad, shard_batch, shard_mul)
