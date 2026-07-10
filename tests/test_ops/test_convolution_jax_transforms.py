@@ -625,26 +625,29 @@ def test_double_backward_batched_graph():
         testing.assert_allclose(a, b, atol=2e-4, rtol=3e-4)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=NotImplementedError,
-    reason=(
-        "Hessian composed with vmap nests two vmap levels (jacrev uses vmap "
-        "internally), exposing custom_partitioning, which has no batching rule. "
-        "For SPMD Hessian use a sharded single graph (jit + custom_partitioning) "
-        "or shard_map, not vmap(jacrev(grad(...)))."
-    ),
-)
-def test_hessian_under_vmap_unsupported():
-    """`vmap(jacrev(grad(...)))` is unsupported by design (nested vmap).
+def test_hessian_under_vmap():
+    """`vmap(jacrev(grad(...)))` matches per-element reference Hessians.
 
-    Documents the limitation and alerts us (strict xfail) if a future JAX
-    grows a custom_partitioning batching rule that lifts it.
+    jacrev uses vmap internally, so this nests two vmap levels around the
+    convolution. The `custom_vmap` rule peels one axis per level and defers to
+    the unbatched base case (which shards via custom_partitioning), so nested
+    vmap composes without a custom_partitioning batching rule.
     """
-    coef, x, y, s, sender, receiver, params, *_ = generate_conv_data()
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    batch = 3
+    xs = random.normal(random.key(3), (batch, *x.shape))
 
     def f_op(x):
         return np.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
 
-    xs = np.broadcast_to(x, (2, *x.shape))
-    jax.eval_shape(jax.vmap(jax.jacrev(jax.grad(f_op))), xs)
+    def f_ref(x):
+        z = convolution_reference(
+            idx, val, x, y, s, s_index, sender, receiver, params.num_out
+        )
+        return np.sum(z**2)
+
+    H_op = jax.vmap(jax.jacrev(jax.grad(f_op)))(xs)
+    H_ref = np.stack([jax.jacrev(jax.grad(f_ref))(xb) for xb in xs])
+
+    testing.assert_allclose(H_op, H_ref, atol=1e-4, rtol=1e-4)
