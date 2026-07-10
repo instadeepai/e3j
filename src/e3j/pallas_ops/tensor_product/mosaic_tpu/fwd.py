@@ -128,16 +128,18 @@ class _FwdTrailingChannelKernel(FwdKernel):
             and original_batch % n_batch_packed_in_channel == 0
             and (original_batch // n_batch_packed_in_channel) % num_kernel == 0
         )
-        self._n_batch_packed_in_channel = (
-            n_batch_packed_in_channel if packing else 1
-        )
+        self._n_batch_packed_in_channel = n_batch_packed_in_channel if packing else 1
         self._real_channels = channels
         if packing:
             x = self._pack_x(
-                x, n_batch_packed_in_channel, original_batch // n_batch_packed_in_channel
+                x,
+                n_batch_packed_in_channel,
+                original_batch // n_batch_packed_in_channel,
             )
             y = self.pack_y(
-                y, n_batch_packed_in_channel, original_batch // n_batch_packed_in_channel
+                y,
+                n_batch_packed_in_channel,
+                original_batch // n_batch_packed_in_channel,
             )
 
         x = pad_for_tpu(x)
@@ -266,9 +268,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
         x_dim, channels = x.shape[1], x.shape[2]
         x = x.reshape(packed_batch_size, n_batch_packed_in_channel, x_dim, channels)
         x = x.transpose(0, 2, 1, 3)
-        return x.reshape(
-            packed_batch_size, x_dim, n_batch_packed_in_channel * channels
-        )
+        return x.reshape(packed_batch_size, x_dim, n_batch_packed_in_channel * channels)
 
     @abstractmethod
     def pack_y(
@@ -354,7 +354,9 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
     def y_block_shape(
         self, y_shape: tuple[int, ...], batch_block_size: int, channels: int
     ) -> tuple[int, ...]:
-        if len(y_shape) == 3:  # packed: (packed_batch_size, y_dim, n_batch_packed_in_channel_padded)
+        if (
+            len(y_shape) == 3
+        ):  # packed: (packed_batch_size, y_dim, n_batch_packed_in_channel_padded)
             return (batch_block_size, y_shape[1], y_shape[2])
         return (batch_block_size, y_shape[1])
 
@@ -375,7 +377,9 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
         if n_batch_packed_in_channel > 1:
 
             def _broadcast(yi: int) -> jax.Array:
-                seg = y_vmem[:, yi, :n_batch_packed_in_channel]  # (batch_block_size, n_batch_packed_in_channel)
+                seg = y_vmem[
+                    :, yi, :n_batch_packed_in_channel
+                ]  # (batch_block_size, n_batch_packed_in_channel)
                 seg = jnp.broadcast_to(
                     seg[:, :, None],
                     (batch_block_size, n_batch_packed_in_channel, real_channels),

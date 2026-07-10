@@ -129,7 +129,9 @@ class _BwdTrailingChannelKernel(BwdKernel):
         bwd_config = params.bwd_config or PallasMosaicTPUTensorProductParamsBwdConfig()
 
         assert len(x.shape) == 3, f"x must be (batch, x_dim, channel), got {x.shape}"
-        assert len(dz.shape) == 3, f"dz must be (batch, out_dim, channel), got {dz.shape}"
+        assert (
+            len(dz.shape) == 3
+        ), f"dz must be (batch, out_dim, channel), got {dz.shape}"
         self._validate_y(x, y)
         assert x.shape[0] == dz.shape[0], "Batch sizes must match for x and dz"
         assert x.shape[0] == y.shape[0], "Batch sizes must match for x and y"
@@ -163,7 +165,9 @@ class _BwdTrailingChannelKernel(BwdKernel):
 
         x = pad_for_tpu(x)  # (kbatch, x_dim_padded, channel_padded)
         dz = pad_for_tpu(dz.transpose(1, 0, 2))  # (out_dim, kbatch, channel_padded)
-        y = pad_for_tpu(y)  # OUTER: (kbatch, y_dim_p); MAP: (kbatch, y_dim_p, channel_p)
+        y = pad_for_tpu(
+            y
+        )  # OUTER: (kbatch, y_dim_p); MAP: (kbatch, y_dim_p, channel_p)
 
         # After packing the kernel runs on the shrunk batch `packed_batch_size`.
         kernel_batch = x.shape[0]
@@ -208,9 +212,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
                     num_channels_padded,
                     n_batch_packed_in_channel,
                 )
-                zero = jnp.zeros(
-                    (batch_block_size, num_channels_padded), jnp.float32
-                )
+                zero = jnp.zeros((batch_block_size, num_channels_padded), jnp.float32)
                 # Per-yi (batch_block_size, channel) accumulators. In OUTER they're reduced over
                 # the channel axis before store; in MAP they're written out directly.
                 dy_acc = {yi: zero for yi in yi_used}
@@ -228,7 +230,9 @@ class _BwdTrailingChannelKernel(BwdKernel):
                         dy_acc[yi] = dy_acc[yi] + x_slice * vdz
                     dx_rows[xi] = acc_dx
 
-                dx_block = jnp.stack(dx_rows, axis=0)  # (x_dim, batch_block_size, channel)
+                dx_block = jnp.stack(
+                    dx_rows, axis=0
+                )  # (x_dim, batch_block_size, channel)
                 dx_vmem[...] = jax.lax.transpose(dx_block, (1, 0, 2)).astype(
                     dx_vmem.dtype
                 )
@@ -490,10 +494,14 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
 
             def _broadcast(yi: int) -> jax.Array:
                 seg = y_vmem[
-                    :, yi * n_batch_packed_in_channel : (yi + 1) * n_batch_packed_in_channel
+                    :,
+                    yi
+                    * n_batch_packed_in_channel : (yi + 1)
+                    * n_batch_packed_in_channel,
                 ]  # (batch_block_size, k)
                 seg = jnp.broadcast_to(
-                    seg[:, :, None], (batch_block_size, n_batch_packed_in_channel, real_channels)
+                    seg[:, :, None],
+                    (batch_block_size, n_batch_packed_in_channel, real_channels),
                 )
                 return seg.reshape(
                     batch_block_size, n_batch_packed_in_channel * real_channels
@@ -545,7 +553,9 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
         dy = dy.reshape(
             packed_batch_size, y_dim, n_batch_packed_in_channel
         )  # (packed_batch_size, y_dim, n_batch_packed_in_channel)
-        dy = dy.transpose(0, 2, 1)  # (packed_batch_size, n_batch_packed_in_channel, y_dim)
+        dy = dy.transpose(
+            0, 2, 1
+        )  # (packed_batch_size, n_batch_packed_in_channel, y_dim)
         return dy.reshape(
             packed_batch_size * n_batch_packed_in_channel, y_dim
         )  # (batch, y_dim)
@@ -607,7 +617,9 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
             return dy[:, :y_dim, :num_channels]
         # dy is packed (packed_batch_size, y_dim_padded, 128); unpack like dx (it shares x's
         # lane layout) back to (batch, y_dim, channel).
-        return self._unpack_dx(dy, batch, y_dim, num_channels, n_batch_packed_in_channel)
+        return self._unpack_dx(
+            dy, batch, y_dim, num_channels, n_batch_packed_in_channel
+        )
 
 
 def _tensor_product_kernel_mosaic_tpu_bwd(

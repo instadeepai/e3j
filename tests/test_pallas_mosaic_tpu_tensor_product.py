@@ -85,7 +85,9 @@ def _reference_trailing_outer(x, y, params):
     indices = jnp.asarray(params.indices)
     values = jnp.asarray(params.values, dtype=x.dtype)
     oi, xi, yi = indices[:, 0], indices[:, 1], indices[:, 2]
-    contrib = values[None, :, None] * x[:, xi, :] * y[:, yi, None]  # (batch, nnz, channels)
+    contrib = (
+        values[None, :, None] * x[:, xi, :] * y[:, yi, None]
+    )  # (batch, nnz, channels)
     out = jnp.zeros((x.shape[0], params.z_space.dim, x.shape[2]), x.dtype)
     return out.at[:, oi, :].add(contrib)
 
@@ -95,7 +97,9 @@ def _reference_trailing_map(x, y, params):
     indices = jnp.asarray(params.indices)
     values = jnp.asarray(params.values, dtype=x.dtype)
     oi, xi, yi = indices[:, 0], indices[:, 1], indices[:, 2]
-    contrib = values[None, :, None] * x[:, xi, :] * y[:, yi, :]  # (batch, nnz, channels)
+    contrib = (
+        values[None, :, None] * x[:, xi, :] * y[:, yi, :]
+    )  # (batch, nnz, channels)
     out = jnp.zeros((x.shape[0], params.z_space.dim, x.shape[2]), x.dtype)
     return out.at[:, oi, :].add(contrib)
 
