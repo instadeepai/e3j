@@ -165,7 +165,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         dz = pad_for_tpu(dz.transpose(1, 0, 2))  # (out_dim, kbatch, channel_padded)
         y = pad_for_tpu(y)  # OUTER: (kbatch, y_dim_p); MAP: (kbatch, y_dim_p, channel_p)
 
-        # After packing the kernel runs on the shrunk batch ``packed_batch_size``.
+        # After packing the kernel runs on the shrunk batch `packed_batch_size`.
         kernel_batch = x.shape[0]
         x_dim_padded = x.shape[1]
         z_dim = dz.shape[0]
@@ -311,7 +311,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
 
     @staticmethod
     def _pack_rows(x: jax.Array, n_batch_packed_in_channel: int) -> jax.Array:
-        """Fold ``n_batch_packed_in_channel`` batch rows into the lane axis."""
+        """Fold `n_batch_packed_in_channel` batch rows into the lane axis."""
         batch_size, lm, channels = x.shape[0], x.shape[1], x.shape[2]
         assert batch_size % n_batch_packed_in_channel == 0
         packed_batch_size = batch_size // n_batch_packed_in_channel
@@ -327,7 +327,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         channels: int,
         n_batch_packed_in_channel: int,
     ) -> jax.Array:
-        """Reconstruct ``dx (batch, x_dim, channel)`` from the kernel output."""
+        """Reconstruct `dx (batch, x_dim, channel)` from the kernel output."""
         if n_batch_packed_in_channel == 1:
             return dx[:, :x_dim, :channels]
         packed_batch_size, x_dim_p = dx.shape[0], dx.shape[1]
@@ -384,13 +384,13 @@ class _BwdTrailingChannelKernel(BwdKernel):
 
     @abstractmethod
     def pack_y(self, y: jax.Array, n_batch_packed_in_channel: int) -> jax.Array:
-        """Fold ``k`` batch rows of ``y`` to match :meth:`_pack_x`'s lane layout."""
+        """Fold `k` batch rows of `y` to match :meth:`_pack_x`'s lane layout."""
 
     @abstractmethod
     def dy_kernel_shape(
         self, y_padded: jax.Array, kernel_batch: int
     ) -> tuple[int, ...]:
-        """Return the full HBM shape of the ``dy`` output for this mode."""
+        """Return the full HBM shape of the `dy` output for this mode."""
 
     @abstractmethod
     def y_block_shape(
@@ -411,10 +411,10 @@ class _BwdTrailingChannelKernel(BwdKernel):
         num_channels_vmem: int,
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
-        """Materialize a map from ``yi`` to ``(batch_block_size, num_channels)``.
+        """Materialize a map from `yi` to `(batch_block_size, num_channels)`.
         We materialize this ones and then all access don't need any expensive broadcast.
 
-        ``n_batch_packed_in_channel`` describes the active lane packing (``== 1`` when off).
+        `n_batch_packed_in_channel` describes the active lane packing (`== 1` when off).
         """
 
     @abstractmethod
@@ -425,9 +425,9 @@ class _BwdTrailingChannelKernel(BwdKernel):
         dy_acc: jax.Array,
         n_batch_packed_in_channel: int,
     ) -> None:
-        """Store the accumulated ``(batch_block_size, channel)`` ``dy_acc`` for component ``yi``.
+        """Store the accumulated `(batch_block_size, channel)` `dy_acc` for component `yi`.
 
-        ``n_batch_packed_in_channel`` describes the active lane packing (``== 1`` when off).
+        `n_batch_packed_in_channel` describes the active lane packing (`== 1` when off).
         """
 
     @abstractmethod
@@ -451,7 +451,7 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
         ), f"OUTER mode requires 2D y (batch, y_dim), got {y.shape}"
 
     def pack_y(self, y: jax.Array, n_batch_packed_in_channel: int) -> jax.Array:
-        """pack y:``(batch, y_dim)`` -> ``(packed_batch_size, y_dim * k)``."""
+        """pack y:`(batch, y_dim)` -> `(packed_batch_size, y_dim * k)`."""
         batch_size, y_lm_dim = y.shape[0], y.shape[1]
         assert batch_size % n_batch_packed_in_channel == 0
         packed_batch_size = batch_size // n_batch_packed_in_channel
@@ -560,7 +560,7 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         ), f"MAP mode requires 3D y with matching channel, got x={x.shape} y={y.shape}"
 
     def pack_y(self, y: jax.Array, n_batch_packed_in_channel: int) -> jax.Array:
-        """MAP y is ``(batch, y_dim, channel)`` -> packed identically to x: ``(packed_batch_size, y_dim, 128)``."""
+        """MAP y is `(batch, y_dim, channel)` -> packed identically to x: `(packed_batch_size, y_dim, 128)`."""
         return self._pack_rows(y, n_batch_packed_in_channel)
 
     def dy_kernel_shape(

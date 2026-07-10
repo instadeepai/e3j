@@ -262,7 +262,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
     def _pack_x(
         x: jax.Array, n_batch_packed_in_channel: int, packed_batch_size: int
     ) -> jax.Array:
-        """Fold ``n_batch_packed_in_channel`` batch rows into the lane axis."""
+        """Fold `n_batch_packed_in_channel` batch rows into the lane axis."""
         x_dim, channels = x.shape[1], x.shape[2]
         x = x.reshape(packed_batch_size, n_batch_packed_in_channel, x_dim, channels)
         x = x.transpose(0, 2, 1, 3)
@@ -274,7 +274,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
     def pack_y(
         self, y: jax.Array, n_batch_packed_in_channel: int, packed_batch_size: int
     ) -> jax.Array:
-        """Fold ``n_batch_packed_in_channel`` batch rows of ``y`` to match :meth:`_pack_x`'s lane layout."""
+        """Fold `n_batch_packed_in_channel` batch rows of `y` to match :meth:`_pack_x`'s lane layout."""
 
     def _vmem_bytes_per_batch_element(
         self,
@@ -328,10 +328,10 @@ class _FwdTrailingChannelKernel(FwdKernel):
         n_batch_packed_in_channel: int,
         real_channels: int,
     ) -> dict[int, jax.Array]:
-        """Materialize a ``yi -> (batch_block_size, channel)`` operand for each used y component.
+        """Materialize a `yi -> (batch_block_size, channel)` operand for each used y component.
 
-        ``n_batch_packed_in_channel``/``real_channels`` describe the active lane packing
-        (``n_batch_packed_in_channel == 1`` when off).
+        `n_batch_packed_in_channel`/`real_channels` describe the active lane packing
+        (`n_batch_packed_in_channel == 1` when off).
         """
 
 
@@ -346,7 +346,7 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
     def pack_y(
         self, y: jax.Array, n_batch_packed_in_channel: int, packed_batch_size: int
     ) -> jax.Array:
-        """OUTER y is ``(batch, y_dim)`` -> ``(packed_batch_size, y_dim, n_batch_packed_in_channel)`` (scalar per packed row)."""
+        """OUTER y is `(batch, y_dim)` -> `(packed_batch_size, y_dim, n_batch_packed_in_channel)` (scalar per packed row)."""
         y_dim = y.shape[1]
         y = y.reshape(packed_batch_size, n_batch_packed_in_channel, y_dim)
         return y.transpose(0, 2, 1)
@@ -402,7 +402,7 @@ class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
     def pack_y(
         self, y: jax.Array, n_batch_packed_in_channel: int, packed_batch_size: int
     ) -> jax.Array:
-        """MAP y is ``(batch, y_dim, channel)`` -> packed identically to x: ``(packed_batch_size, y_dim, 128)``."""
+        """MAP y is `(batch, y_dim, channel)` -> packed identically to x: `(packed_batch_size, y_dim, 128)`."""
         return self._pack_x(y, n_batch_packed_in_channel, packed_batch_size)
 
     def y_block_shape(
