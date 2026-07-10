@@ -651,3 +651,61 @@ def test_hessian_under_vmap():
     H_ref = np.stack([jax.jacrev(jax.grad(f_ref))(xb) for xb in xs])
 
     testing.assert_allclose(H_op, H_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_vmap_grad_hessian_all_inputs():
+    """`vmap(grad(hessian(...)))` matches reference, differentiating x, y and s.
+
+    Contracting the Hessian with two tangents gives a scalar; one more grad is
+    a third-order reverse pass that reaches every input. vmap batches it over
+    distinct graphs, testing the recursive vmap rule with the double backward.
+    """
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    batch = 3
+    kx, ky, ks = random.split(random.key(5), 3)
+    xs = random.normal(kx, (batch, *x.shape))
+    ys = random.normal(ky, (batch, *y.shape))
+    ss = random.normal(ks, (batch, *s.shape))
+
+    def tangents(key):
+        kx, ky, ks = random.split(key, 3)
+        return (
+            random.normal(kx, x.shape),
+            random.normal(ky, y.shape),
+            random.normal(ks, s.shape),
+        )
+
+    t1, t2 = tangents(random.key(8)), tangents(random.key(9))
+
+    def directional(f, tangents):
+        """Contract `grad(f)` with `tangents` into a scalar."""
+
+        def d(p):
+            grads = jax.grad(f)(p)
+            dots = jax.tree_util.tree_map(lambda g, t: np.vdot(g, t), grads, tangents)
+            return jax.tree_util.tree_reduce(lambda a, b: a + b, dots)
+
+        return d
+
+    def grad_hessian(conv_fn):
+        def f(p):
+            x, y, s = p
+            return np.sum(conv_fn(x, y, s) ** 2)
+
+        # grad of the twice-contracted Hessian: gradients for x, y and s.
+        return jax.grad(directional(directional(f, t1), t2))
+
+    def op_conv(x, y, s):
+        return convolution(coef, x, y, s, sender, receiver, params)
+
+    def ref_conv(x, y, s):
+        return convolution_reference(
+            idx, val, x, y, s, s_index, sender, receiver, params.num_out
+        )
+
+    g_op = jax.vmap(grad_hessian(op_conv))((xs, ys, ss))
+    g_ref = jax.vmap(grad_hessian(ref_conv))((xs, ys, ss))
+
+    for a, b in zip(jax.tree_util.tree_leaves(g_op), jax.tree_util.tree_leaves(g_ref)):
+        testing.assert_allclose(a, b, atol=1e-3, rtol=1e-3)
