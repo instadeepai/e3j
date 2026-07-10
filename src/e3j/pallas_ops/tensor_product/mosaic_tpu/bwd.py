@@ -408,7 +408,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         y_vmem: jax.Array,
         yis: frozenset[int],
         batch_block_size: int,
-        num_channels: int,
+        num_channels_vmem: int,
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
         """Materialize a map from ``yi`` to ``(batch_block_size, num_channels)``.
@@ -435,7 +435,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         self,
         dy: jax.Array,
         y_dim: int,
-        channels: int,
+        num_channels: int,
         batch: int,
         n_batch_packed_in_channel: int,
     ) -> jax.Array:
@@ -482,11 +482,11 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
         y_vmem: jax.Array,
         yis: frozenset[int],
         batch_block_size: int,
-        num_channels: int,
+        num_channels_vmem: int,
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
         if n_batch_packed_in_channel > 1:
-            real_channels = num_channels // n_batch_packed_in_channel
+            real_channels = num_channels_vmem // n_batch_packed_in_channel
 
             def _broadcast(yi: int) -> jax.Array:
                 seg = y_vmem[
@@ -502,7 +502,7 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
             return {yi: _broadcast(yi) for yi in yis}
         return {
             yi: jnp.broadcast_to(
-                y_vmem[:, yi][:, None], (batch_block_size, num_channels)
+                y_vmem[:, yi][:, None], (batch_block_size, num_channels_vmem)
             )
             for yi in yis
         }
@@ -532,7 +532,7 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
         self,
         dy: jax.Array,
         y_dim: int,
-        channels: int,
+        num_channels: int,
         batch: int,
         n_batch_packed_in_channel: int,
     ) -> jax.Array:
@@ -581,7 +581,7 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         y_vmem: jax.Array,
         yis: frozenset[int],
         batch_block_size: int,
-        num_channels: int,
+        num_channels_vmem: int,
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
         return {yi: y_vmem[:, yi, :] for yi in yis}
@@ -599,15 +599,15 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         self,
         dy: jax.Array,
         y_dim: int,
-        channels: int,
+        num_channels: int,
         batch: int,
         n_batch_packed_in_channel: int,
     ) -> jax.Array:
         if n_batch_packed_in_channel == 1:
-            return dy[:, :y_dim, :channels]
+            return dy[:, :y_dim, :num_channels]
         # dy is packed (packed_batch_size, y_dim_padded, 128); unpack like dx (it shares x's
         # lane layout) back to (batch, y_dim, channel).
-        return self._unpack_dx(dy, batch, y_dim, channels, n_batch_packed_in_channel)
+        return self._unpack_dx(dy, batch, y_dim, num_channels, n_batch_packed_in_channel)
 
 
 def _tensor_product_kernel_mosaic_tpu_bwd(
