@@ -289,7 +289,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
         """VMEM bytes consumed per batch element (pipeline double-buffered + body intermediates).
 
         Pipeline buffers are double-buffered by emit_pipeline.
-        Body intermediates: transposed x, preloaded y slices, splill, one accumulator.
+        Body intermediates: transposed x, preloaded y slices, spill, one accumulator.
 
         """
         y_elems = math.prod(self.y_block_shape(y_padded.shape, 1, channels_padded))
