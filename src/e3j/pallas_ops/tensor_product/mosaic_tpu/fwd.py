@@ -31,6 +31,10 @@ from e3j.pallas_ops.utils.mosaic_tpu import pad_for_tpu, select_batch_block_size
 from e3j.pallas_ops.utils.named_scope import named_scope
 from e3j.utils import options
 
+# Empirical safety factor for the register-spill VMEM cost of each unrolled
+# CG contribution in the kernel body; see `_vmem_bytes_per_batch_element`.
+_SPILL_BYTES_PER_CONTRIB = 3
+
 
 class FwdKernel(ABC):
     """Forward tensor-product kernel."""
@@ -142,11 +146,18 @@ class _FwdTrailingChannelKernel(FwdKernel):
             for zi in range(z_dim)
         )
         yis = frozenset(yi for _, contribs in cg_groups for _, yi, _ in contribs)
+        total_contribs = sum(len(contribs) for _, contribs in cg_groups)
 
         batch_block_size = select_batch_block_size(
             batch_size=batch_size,
             vmem_bytes_per_batch_element=self._vmem_bytes_per_batch_element(
-                x_dim_padded, mul_padded, y, z_dim, len(yis), x.dtype.itemsize
+                x_dim_padded,
+                mul_padded,
+                y,
+                z_dim,
+                len(yis),
+                total_contribs,
+                x.dtype.itemsize,
             ),
             vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
             num_kernel=num_kernel,
@@ -254,19 +265,22 @@ class _FwdTrailingChannelKernel(FwdKernel):
         y_padded: jax.Array,
         z_dim: int,
         num_yis: int,
+        total_contribs: int,
         dtype_bytes: int,
     ) -> int:
         """VMEM bytes consumed per batch element (pipeline double-buffered + body intermediates).
 
         Pipeline buffers are double-buffered by emit_pipeline.
-        Body intermediates: transposed x, preloaded y slices, one accumulator.
+        Body intermediates: transposed x, preloaded y slices, splill, one accumulator.
+
         """
         y_elems = math.prod(self.y_block_shape(y_padded.shape, 1, mul_padded))
         pipeline = (
             2 * dtype_bytes * (x_dim_padded * mul_padded + y_elems + z_dim * mul_padded)
         )
         body = 4 * mul_padded * (x_dim_padded + num_yis + 1)
-        return pipeline + body
+        spill = _SPILL_BYTES_PER_CONTRIB * mul_padded * dtype_bytes * total_contribs
+        return pipeline + body + spill
 
     @abstractmethod
     def _validate_y(self, x: jax.Array, y: jax.Array) -> None:
@@ -274,9 +288,9 @@ class _FwdTrailingChannelKernel(FwdKernel):
 
     @abstractmethod
     def y_block_shape(
-        self, y_shape: tuple[int, ...], bbs: int, mul: int
+        self, y_shape: tuple[int, ...], batch_block_size: int, mul: int
     ) -> tuple[int, ...]:
-        """Return the per-tile y `BlockSpec` shape for a batch block of `bbs`."""
+        """Return the per-tile y `BlockSpec` shape for a batch block of `batch_block_size`."""
 
     @abstractmethod
     def y_index_map(self, i: int) -> tuple[int, ...]:
@@ -287,12 +301,12 @@ class _FwdTrailingChannelKernel(FwdKernel):
         self,
         y_vmem: jax.Array,
         yis: frozenset[int],
-        bbs: int,
+        batch_block_size: int,
         mul: int,
         k: int,
         real_mul: int,
     ) -> dict[int, jax.Array]:
-        """Materialize a ``yi -> (bbs, mul)`` operand for each used y component.
+        """Materialize a ``yi -> (batch_block_size, mul)`` operand for each used y component.
 
         ``k``/``real_mul`` describe the active lane packing (``k == 1`` when off).
         """
@@ -313,11 +327,11 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
         return y.transpose(0, 2, 1)
 
     def y_block_shape(
-        self, y_shape: tuple[int, ...], bbs: int, mul: int
+        self, y_shape: tuple[int, ...], batch_block_size: int, mul: int
     ) -> tuple[int, ...]:
         if len(y_shape) == 3:  # packed: (packed_batch_size, y_dim, k_padded)
-            return (bbs, y_shape[1], y_shape[2])
-        return (bbs, y_shape[1])
+            return (batch_block_size, y_shape[1], y_shape[2])
+        return (batch_block_size, y_shape[1])
 
     def y_index_map(self, i: int) -> tuple[int, ...]:
         if self._pack_k > 1:  # packed y is 3D
@@ -328,7 +342,7 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
         self,
         y_vmem: jax.Array,
         yis: frozenset[int],
-        bbs: int,
+        batch_block_size: int,
         mul: int,
         k: int,
         real_mul: int,
@@ -336,12 +350,17 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
         if k > 1:
 
             def _broadcast(yi: int) -> jax.Array:
-                seg = y_vmem[:, yi, :k]  # (bbs, k)
-                seg = jnp.broadcast_to(seg[:, :, None], (bbs, k, real_mul))
-                return seg.reshape(bbs, k * real_mul)  # (bbs, 128 == mul)
+                seg = y_vmem[:, yi, :k]  # (batch_block_size, k)
+                seg = jnp.broadcast_to(seg[:, :, None], (batch_block_size, k, real_mul))
+                return seg.reshape(
+                    batch_block_size, k * real_mul
+                )  # (batch_block_size, 128 == mul)
 
             return {yi: _broadcast(yi) for yi in yis}
-        return {yi: jnp.broadcast_to(y_vmem[:, yi][:, None], (bbs, mul)) for yi in yis}
+        return {
+            yi: jnp.broadcast_to(y_vmem[:, yi][:, None], (batch_block_size, mul))
+            for yi in yis
+        }
 
 
 class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
@@ -357,9 +376,9 @@ class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
         return self._pack_x(y, k, packed_batch_size)
 
     def y_block_shape(
-        self, y_shape: tuple[int, ...], bbs: int, mul: int
+        self, y_shape: tuple[int, ...], batch_block_size: int, mul: int
     ) -> tuple[int, ...]:
-        return (bbs, y_shape[1], mul)
+        return (batch_block_size, y_shape[1], mul)
 
     def y_index_map(self, i: int) -> tuple[int, ...]:
         return (i, 0, 0)
@@ -368,7 +387,7 @@ class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
         self,
         y_vmem: jax.Array,
         yis: frozenset[int],
-        bbs: int,
+        batch_block_size: int,
         mul: int,
         k: int,
         real_mul: int,
