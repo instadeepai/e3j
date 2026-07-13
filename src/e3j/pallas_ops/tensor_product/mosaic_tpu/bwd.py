@@ -416,7 +416,8 @@ class _BwdTrailingChannelKernel(BwdKernel):
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
         """Materialize a map from `yi` to `(batch_block_size, num_channels)`.
-        We materialize this ones and then all access don't need any expensive broadcast.
+
+        We materialize these once so that all accesses avoid an expensive broadcast.
 
         `n_batch_packed_in_channel` describes the active lane packing (`== 1` when off).
         """
@@ -429,7 +430,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         dy_acc: jax.Array,
         n_batch_packed_in_channel: int,
     ) -> None:
-        """Store the accumulated `(batch_block_size, channel)` `dy_acc` for component `yi`.
+        """Store the accumulated `(batch_block_size, num_channels)` `dy_acc` for component `yi`.
 
         `n_batch_packed_in_channel` describes the active lane packing (`== 1` when off).
         """
