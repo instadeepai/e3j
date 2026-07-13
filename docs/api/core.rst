@@ -19,3 +19,5 @@ core
     Polynomial
     Harmonics
     Bigotimes
+    Permutation
+    Filter
