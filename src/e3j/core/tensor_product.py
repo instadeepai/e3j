@@ -42,11 +42,13 @@ from .permutation import Permutation
 
 
 class TensorProduct(SparseMixin):
-    """Bilinear tensor products.
+    r"""Bilinear tensor products.
 
-    This class implements (equivariant) bilinear maps of the form::
+    This class implements (equivariant) bilinear maps of the form
 
-        z[:,i] = Σⱼₖ c[i,j,k] * x[:,j] * y[:,k],
+    .. math::
+
+        z_i = \sum_{jk} c_{ijk}\, x_j\, y_k,
 
     defined by a 3D coefficient array `c` in sparse BCOO format.
 
