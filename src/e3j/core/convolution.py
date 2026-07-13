@@ -212,7 +212,8 @@ class Convolution:
         `convolution()` and `convolution_bwd()`.
 
         Note:
-            Edges (and edge features) must be sorted by receivers.
+            Edges (and edge features) must be sorted by the endpoint selected
+            via `graph_ordering`: by receivers (default) or by senders.
         """
         with jax.ensure_compile_time_eval():
             coef4D_packed = self.coef.pack_jax()
@@ -230,6 +231,7 @@ class Convolution:
             senders,
             receivers,
             params,
+            self.graph_ordering,
         )
 
     def _fused_mosaic_tpu_eval(

@@ -25,6 +25,7 @@ from numpy import int32
 from e3j.data.graph import GraphCSR
 from e3j.ops.coef import Coef4D
 from e3j.utils import config, is_pow2
+from e3j.utils.options import GraphOrdering
 
 
 @dataclass
@@ -60,6 +61,7 @@ def convolution(
     sender: Array,
     receiver: Array,
     params: CUDAConvolutionParams,
+    graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
 ) -> Array:
     """Primitive bound to the CUDA convolution kernel.
 
@@ -77,10 +79,10 @@ def convolution(
     The edge messages are computed as a single trilinear mixing of x, y, z.
 
     Note:
-        Edges and edge features should be sorted by receiver index, in order
-        to compute the CSR adjacency matrix correctly. This ordering should be
-        done at graph creation time to avoid having to reorder features at
-        every convolution call.
+        On sender-sorted edges, symmetry assumptions on the graph and edge
+        features are leveraged to bypass the edge permutation otherwise incurred
+        during the backward pass. See :class:`e3j.core.Convolution`.
+        In both cases, a CSR adjacency matrix is constructed to avoid atomic operations.
 
     Args:
         coef: Packed Coef4D coefficients (opaque idx_dtype vector).
@@ -90,6 +92,7 @@ def convolution(
         sender: CSR sender indices, shape (num_edges,).
         receiver: Receiver indices, shape (num_edges,).
         params: Convolution parameters.
+        graph_ordering: Edge ordering contract (SENDER or RECEIVER).
 
     Returns:
         Output node features, shape (num_nodes, num_out, channels_x).
@@ -112,6 +115,10 @@ def convolution(
         n = x.shape[0]
         sender_local = sender % n
         receiver_local = receiver % n
+        if graph_ordering == GraphOrdering.SENDER:
+            # NOTE: Transposing edges in the forward pass requires to sign edge features
+            #       accordingly. The parities of y are applied on the coefficients.
+            sender_local, receiver_local = receiver_local, sender_local
         receiver_local_ptr = GraphCSR(n, sender_local, receiver_local).receiver_ptr
         shape_out = (n, num_out, channels_x)
         return ffi_call(
@@ -206,19 +213,35 @@ def convolution(
 
     def _bwd(res, dm):
         x, y, s, sender, receiver = res
-        return convolution_bwd(coef, x, y, s, sender, receiver, dm, params)
+        return convolution_bwd(
+            coef, x, y, s, sender, receiver, dm, params, graph_ordering
+        )
 
     convolution_op.defvjp(_fwd, _bwd)
 
     return convolution_op(x, y, s)
 
 
-def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
+def convolution_bwd(
+    coef,
+    x,
+    y,
+    s,
+    sender,
+    receiver,
+    dm,
+    params,
+    graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
+):
     """Primitive bound to the CUDA convolution backward kernel.
 
     Computes cotangents `dx`, `dy`, `ds` from output cotangent `dm`
-    by calling the fused backward kernel with transposed coefficients
-    and transposed CSR adjacency.
+    by calling the fused backward kernel with transposed coefficients.
+    Under the default `GraphOrdering.RECEIVER` the CSR adjacency is
+    transposed (sorted by sender) and an edge permutation threads per-edge
+    quantities in original order. Under `GraphOrdering.SENDER` the primal
+    graph is already sender-sorted, so the CSR is built directly and a null
+    `edge_perm` is forwarded (no transpose, no permuted gather).
     """
     has_cx = x.ndim > 2
 
@@ -241,11 +264,21 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
         num_nodes = x.shape[0]
         sender_local = sender % num_nodes
         receiver_local = receiver % num_nodes
-        perm, graph_local_t, _ = GraphCSR(
-            num_nodes, sender_local, receiver_local
-        ).transpose()
-        sender_local_t = graph_local_t.sender
-        receiver_local_t_ptr = graph_local_t.receiver_ptr
+        if graph_ordering == GraphOrdering.SENDER:
+            # NOTE: The backward pass is cheaper when the graph is already transposed,
+            #       i.e. sorted by senders. No edge permutation required, and `nullptr`
+            #       is passed through the FFI.
+            perm = jnp.zeros((0,), jnp.int32)
+            sender_local_t = receiver_local
+            receiver_local_t_ptr = GraphCSR(
+                num_nodes, receiver_local, sender_local
+            ).receiver_ptr
+        else:
+            perm, graph_local_t, _ = GraphCSR(
+                num_nodes, sender_local, receiver_local
+            ).transpose()
+            sender_local_t = graph_local_t.sender
+            receiver_local_t_ptr = graph_local_t.receiver_ptr
 
         return ffi_call(
             "convolution_bwd",
@@ -351,10 +384,12 @@ def convolution_bwd(coef, x, y, s, sender, receiver, dm, params):
         (x, y, s, dm, sender, receiver) = res
 
         def conv(x, y, s):
-            return convolution(coef, x, y, s, sender, receiver, params)
+            return convolution(coef, x, y, s, sender, receiver, params, graph_ordering)
 
         def conv_bwd(x, y, s):
-            return convolution_bwd(coef, x, y, s, sender, receiver, dm, params)
+            return convolution_bwd(
+                coef, x, y, s, sender, receiver, dm, params, graph_ordering
+            )
 
         # Second variation of messages: three forward passes
         Ddm = conv(Ddx, y, s) + conv(x, Ddy, s) + conv(x, y, Dds)
