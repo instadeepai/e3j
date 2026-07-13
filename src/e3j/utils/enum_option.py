@@ -17,23 +17,31 @@ from typing import Any, Self
 
 
 class EnumOption(Enum):
-    """Helper Enum subclass for parsing `str | Enum` values.
+    """Helper Enum subclass accepting member names as values.
 
-    The `parse` and `parse_value` methods should provide
-    more informative error message than `Enum[key]`.
+    Instances can be built from their (case-insensitive) member name, e.g.
+    `Layout("LEADING_CHANNELS")`, in addition to the standard value lookup.
+    The `parse` and `parse_value` methods add a more informative error message
+    than the default `Enum` lookup.
     """
 
     @classmethod
-    def parse(cls, key: str | Self) -> Self:
-        if isinstance(key, cls):
-            return key
+    def _missing_(cls, key: Any) -> Self | None:
+        # fall back to case-insensitive name lookup, so member names are
+        # accepted wherever the enum value is expected.
         if isinstance(key, str):
-            try:
-                return cls[key.upper()]
-            except KeyError:
-                pass
-        options = (str(cls(i)) for i in range(len(cls)))
-        raise KeyError(f"expected {cls}: " + " | ".join(options))
+            return cls.__members__.get(key.upper())
+        return None
+
+    @classmethod
+    def parse(cls, key: str | Self) -> Self:
+        try:
+            return cls(key)
+        except ValueError:
+            options = " | ".join(cls.__members__)
+            raise KeyError(
+                f"expected one of ({options}) for {cls.__name__}, got {key!r}"
+            )
 
     @classmethod
     def parse_value(cls, key: str | Self) -> int | Any:
