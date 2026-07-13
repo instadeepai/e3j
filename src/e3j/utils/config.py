@@ -77,7 +77,7 @@ class config(Config):
 
     Usage:
 
-        .. code::python
+        .. code:: python
 
             # context manager:
             with e3j.use(**kwargs):

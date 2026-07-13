@@ -92,12 +92,25 @@ class GraphOrdering(EnumOption):
 
 
 class Layout(EnumOption):
-    """Array layouts.
+    """Memory layout for equivariant arrays.
+
+    An equivariant feature space such as `"128x0e + 64x1o"` is built from
+    irreducible blocks with multiplicity `m` and irrep dimension `2l + 1`
+    for each degree `l`.
+
+    The layout controls how different blocks are arranged in memory, eventually
+    factorizing the GCD of multiplicities in a separate `channels` axis.
 
     Values:
-        * LEADING_CHANNELS
-        * TRAILING_CHANNELS
-        * E3NN
+        * LEADING_CHANNELS: `(batch, channels, dim)` -- channels on an explicit
+          leading axis.
+        * TRAILING_CHANNELS: `(batch, dim, channels)` -- channels on a trailing
+          axis. Faster on GPU thanks to coalesced memory access.
+        * E3NN: `(batch, channels * dim)` -- channels folded into the feature
+          dimension, matching `e3nn_jax.IrrepsArray`.
+
+    .. note::
+        The CUDA kernels only support channel counts that are powers of two for now.
     """
 
     LEADING_CHANNELS = 0
