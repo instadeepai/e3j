@@ -337,3 +337,155 @@ class TestConvolutionFused(_TestConvolution):
         )
         for gf, gr in zip(g_fused, g_ref):
             assert_allclose(gf, gr, rtol=2e-3, atol=2e-3)
+
+
+class TestConvolutionSenderSign:
+    """Pin the sender-sorted coefficient sign to the O3 parity label `p`.
+
+    This is a pure coefficient check (no kernel), so it runs on CPU. It fixes
+    the single source of truth for the sign applied under `GraphOrdering.SENDER`:
+    the per-`y`-slice parity `p`, not the harmonic special case `(-1)**l`.
+    """
+
+    @staticmethod
+    def _modules(source) -> tuple[Convolution, Convolution]:
+        with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
+            receiver = Convolution(source)
+            sender = Convolution(source, graph_ordering="SENDER")
+        return receiver, sender
+
+    @staticmethod
+    def _y_signs(module: Convolution) -> numpy.ndarray:
+        """Per-`y`-component parity, folded into the E3NN feature layout."""
+        edge_space = module._otimes.source[1]
+        return numpy.concatenate(
+            [numpy.full(mul * ir.dim, float(ir.p)) for mul, ir in edge_space]
+        )
+
+    def test_sign_is_parity(self):
+        """SENDER coef equals RECEIVER coef times `p`, indexed by the y component."""
+        receiver, sender = self._modules(("0e + 1o", "0e + 1o + 2e"))
+        r, s = receiver.coef, sender.coef
+        # Only the values are signed; the index layout is untouched.
+        numpy.testing.assert_array_equal(numpy.asarray(r.idx), numpy.asarray(s.idx))
+        signs = self._y_signs(receiver)
+        k = numpy.asarray(r.idx)[:, 2]
+        expected = numpy.asarray(r.val) * signs[k]
+        numpy.testing.assert_allclose(
+            numpy.asarray(s.val), expected, rtol=1e-6, atol=1e-7
+        )
+
+    def test_sign_follows_parity_not_degree(self):
+        """A `1e` pseudo-vector edge feature (p=+1) is unchanged, though (-1)**l = -1."""
+        receiver, sender = self._modules(("0e + 1o", "1e"))
+        numpy.testing.assert_allclose(
+            numpy.asarray(sender.coef.val),
+            numpy.asarray(receiver.coef.val),
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+
+@pytest.mark.e3j_ops
+class TestConvolutionFusedSender:
+    """Sender-sorted fused convolution matches the receiver-sorted result.
+
+    Builds a symmetric graph whose edge features honour the graded symmetry the
+    sender trick assumes (`y_ba = p * y_ab` per slice, `s_ba = s_ab`), then
+    checks the `GraphOrdering.SENDER` path (signed coefficients, no transpose,
+    null `edge_perm`) against both the receiver-sorted fused path and the
+    ordering-agnostic unfused reference, for the forward and its gradient.
+    """
+
+    node_irreps = "0e + 1o + 2e + 3o"
+    edge_irreps = "0e + 1o + 2e + 3o"
+    out = "0e + 1o + 2e + 3o"
+    num_nodes = 6
+    num_pairs = 12
+    num_channels = 32
+    layout = "TRAILING_CHANNELS"
+
+    @pytest.fixture(scope="class")
+    def modules(self) -> tuple[Convolution, Convolution, Convolution]:
+        source = (self.node_irreps, self.edge_irreps)
+        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
+            receiver = Convolution(source, self.out, layout=self.layout)
+            sender = Convolution(
+                source, self.out, layout=self.layout, graph_ordering="SENDER"
+            )
+        with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
+            reference = Convolution(source, self.out, layout=self.layout)
+        return receiver, sender, reference
+
+    @pytest.fixture(scope="class")
+    def data(self, modules):
+        """Symmetric graph in receiver- and sender-sorted orderings, plus `x`.
+
+        The reverse of each edge picks up the per-slice parity sign on `y` and
+        leaves `s` unchanged, so the two orderings describe the same messages.
+        """
+        receiver, _, _ = modules
+        node_space, edge_space, scalar_space = receiver.source
+        K = self.num_channels
+
+        k = random.split(random.key(7), 5)
+        a = random.randint(k[0], (self.num_pairs,), 0, self.num_nodes)
+        off = random.randint(k[1], (self.num_pairs,), 1, self.num_nodes)
+        b = (a + off) % self.num_nodes  # off in [1, num_nodes) avoids self-loops
+
+        # Directed edges: forward pairs followed by their reverses.
+        snd = np.concatenate([a, b])
+        rcv = np.concatenate([b, a])
+
+        # Graded-symmetric y and reversal-symmetric s across edge reversal.
+        y_signs = np.concatenate(
+            [np.full(mul * ir.dim, float(ir.p)) for mul, ir in edge_space]
+        )
+        y_fwd = random.normal(k[2], (self.num_pairs, edge_space.dim))
+        y = np.concatenate([y_fwd, y_fwd * y_signs[None, :]])
+        s_fwd = random.normal(k[3], (self.num_pairs, scalar_space.dim, K))
+        s = np.concatenate([s_fwd, s_fwd])
+
+        x = random.normal(k[4], (self.num_nodes, node_space.dim, K))
+
+        def reorder(order):
+            return snd[order], rcv[order], y[order], s[order]
+
+        return x, reorder(np.argsort(rcv)), reorder(np.argsort(snd))
+
+    @staticmethod
+    def _loss(conv):
+        def loss(x, y, s, snd, rcv):
+            return np.sum(conv(x, y, s, snd, rcv) ** 2)
+
+        return loss
+
+    def test_forward_matches(self, modules, data):
+        """SENDER path == RECEIVER path == unfused reference on the same graph."""
+        receiver, sender, reference = modules
+        x, recv_sorted, send_sorted = data
+        snd_r, rcv_r, y_r, s_r = recv_sorted
+        snd_s, rcv_s, y_s, s_s = send_sorted
+
+        o_recv = receiver(x, y_r, s_r, snd_r, rcv_r)
+        o_send = sender(x, y_s, s_s, snd_s, rcv_s)
+        o_ref = reference(x, y_s, s_s, snd_s, rcv_s)
+        assert_allclose(o_send, o_ref, rtol=2e-3, atol=2e-3)
+        assert_allclose(o_send, o_recv, rtol=2e-3, atol=2e-3)
+
+    def test_grad_matches(self, modules, data):
+        """Gradients through the SENDER backward (no transpose, null edge_perm,
+        sign propagated to coef_dx/dy/ds) match the unfused reference on the
+        same sender-sorted inputs, exercising the empty `edge_perm` handler."""
+        _, sender, reference = modules
+        x, _, send_sorted = data
+        snd_s, rcv_s, y_s, s_s = send_sorted
+        argnums = (0, 1, 2)
+        g_send = jax.grad(self._loss(sender), argnums=argnums)(
+            x, y_s, s_s, snd_s, rcv_s
+        )
+        g_ref = jax.grad(self._loss(reference), argnums=argnums)(
+            x, y_s, s_s, snd_s, rcv_s
+        )
+        for gf, gr in zip(g_send, g_ref):
+            assert_allclose(gf, gr, rtol=2e-3, atol=2e-3)
