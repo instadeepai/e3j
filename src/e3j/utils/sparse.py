@@ -107,10 +107,12 @@ class SparseMixin:
 
     @property
     def nnz(self) -> int:
+        """Number of non-zero coefficients."""
         return self.indices.shape[0]
 
     @property
     def nnz_ratio(self) -> float:
+        """Density of the coefficient tensor, i.e. `nnz` over its size."""
         shape = np.array(self.shape)
         return self.nnz / float(np.prod(shape))
 
