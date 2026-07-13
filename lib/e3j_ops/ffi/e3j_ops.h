@@ -517,6 +517,13 @@ xla::Error ConvolutionBwdHandler(
             .receiver_ptr = receiver_ptr.typed_data(),          \
         };                                                      \
                                                                 \
+        /* NOTE: nullptr signaled by `np.zeros((0,), int32)`    \
+         *       through the FFI with SENDER graph ordering.    \
+         */                                                     \
+        const int32_t *edge_perm_ptr =                          \
+            edge_perm.element_count()                           \
+                ? edge_perm.typed_data() : nullptr;             \
+                                                                \
         return e3j::convolution::launch_bwd<Idx, Val>(          \
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
@@ -524,10 +531,10 @@ xla::Error ConvolutionBwdHandler(
             s.typed_data<Val>(),                                \
             dm.typed_data<Val>(),                               \
             adj,                                                \
-            edge_perm.typed_data(),                             \
+            edge_perm_ptr,                                      \
             dx->typed_data<Val>(),                              \
             dy->typed_data<Val>(),                              \
-            ds->typed_data<Val>(),                            \
+            ds->typed_data<Val>(),                              \
             params, stream, debug                               \
         ).to_xla();
 
