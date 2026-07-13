@@ -58,14 +58,17 @@ class Convolution:
     Optionally, the sum of messages is rescaled by `avg_num_neighbors`.
 
     Note:
-        - When using the CUDA convolution kernel, edges must be sorted by receiver
-        index for now (at graph construction time). The adjacency relationship
-        is encoded in a sparse CSR format to avoid atomic (memory-locked, non-
-        deterministic) operations.
-        - When using the Mosaic TPU kernel, edges must be sorted by sender index and the
-        edge features must be antisymmetric under sender/receiver swap. The forward
-        aggregates on the swapped order (i.e receiver and sender are swapped),
-        the backward on the natural order.
+        When using CUDA or Mosaic TPU kernels with `SENDER` graph ordering,
+        the following additional assumptions should hold:
+
+        1. **Symmetric graph:** each edge `(a, b)` has its reverse `(b, a)`,
+        2. **Graded-symmetric edge features:** $y_{ba} = p . y_{ab}$ per slice,
+           where the parity is $p = (-1)^l$ for harmonic polynomials.
+        3. **Symmetric scalars:** $s_{ba} = s_{ab}$ (true for distance-based
+           radial functions).
+
+    Note:
+        `RECEIVER` ordering is not yet implemented for the Mosaic TPU kernel.
     """
 
     def __init__(
@@ -75,6 +78,7 @@ class Convolution:
         layout: Layout = Layout.TRAILING_CHANNELS,
         avg_num_neighbors: float | None = None,
         normalization: str | options.TPNormalization = "SQRT_DIM_OUT",
+        graph_ordering: str | options.GraphOrdering = options.GraphOrdering.RECEIVER,
         config: utils.Config | None = None,
     ):
         """
@@ -90,6 +94,9 @@ class Convolution:
             avg_num_neighbors: If given, messages are divided by this factor.
             normalization: Normalization of the tensor product's Clebsch-Gordan
                 coefficients, see :class:`e3j.utils.options.TPNormalization`.
+            graph_ordering: Edge ordering for the graph, can be `RECEIVER` or
+                `SENDER`. When edges are sorted by senders, symmetry assumptions
+                on the graph and edge features should hold.
             config: Global :class:`e3j.utils.config.Config` (optional) pointing
                 to the implementation path. The best available option should be
                 automatically selected based on the environment.
@@ -123,6 +130,7 @@ class Convolution:
         self.config = utils.config.state() if config is None else config
         self.layout = layout
         self.normalization = otimes.normalization
+        self.graph_ordering = options.GraphOrdering.parse(graph_ordering)
 
         self._otimes = otimes
         self._mix = mix
@@ -261,8 +269,14 @@ class Convolution:
             edge_scalars: array of shape `(num_edges, num_scalars, num_channels)`
             senders: index vector of length num_edges, in bounds [0, num_nodes)
             receivers: index vector of length num_edges, in bounds [0, num_nodes).
-                Expected to be monotonically increasing when using the CUDA
-                convolution kernel (for sparse CSR adjacency representation).
+
+        Note:
+            On the CUDA convolution kernel the edges must be sorted (for the
+            sparse CSR adjacency) by the endpoint selected via `graph_ordering`:
+            monotonically increasing `receivers` under the default `RECEIVER`
+            ordering, or monotonically increasing `senders` under `SENDER`. The
+            `SENDER` ordering additionally requires the symmetry assumptions
+            documented on the class.
         """
         match self.config.convolution:
             case options.Convolution.UNFUSED:

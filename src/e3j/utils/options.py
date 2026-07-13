@@ -64,6 +64,26 @@ class Convolution(Enum):
     FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
 
 
+class GraphOrdering(EnumOption):
+    """Edge ordering contract for the fused CUDA :class:`~e3j.core.Convolution`.
+
+    Values:
+        RECEIVER: Edges sorted by receiver index (default). The forward pass
+            uses the CSR adjacency directly; the backward pass transposes the
+            graph (sort by sender) and threads an edge permutation.
+        SENDER: Edges sorted by sender index. Flips the two roles: the backward
+            pass becomes natural (no transpose, no permutation), while the
+            forward pass aggregates at the sender node and recovers the true
+            receiver message through a per-`y`-slice reversal sign baked into
+            the coefficients. Only valid for a symmetric graph with graded-
+            symmetric edge features and reversal-symmetric scalars (see
+            :class:`~e3j.core.Convolution`).
+    """
+
+    RECEIVER = "RECEIVER"
+    SENDER = "SENDER"
+
+
 # FIXME: Integer code translation of enums for the XLA handler.
 #        See lib/e3j_ops/ffi/e3j_ops.h
 # We cannot pass C++ strings to the XLA-FFI handler yet,
