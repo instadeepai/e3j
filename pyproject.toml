@@ -51,8 +51,10 @@ cpu = [
     "jaxlib >= 0.6.2"
 ]
 tpu = [
-    "jax[tpu] >= 0.6.2",
-    "jaxlib >= 0.6.2"
+    "jax[tpu] >= 0.10.1",
+    "jaxlib >= 0.10.1",
+    # 0.0.42 / 0.0.42.1 malformed: https://github.com/jax-ml/jax/issues/39025.
+    "libtpu > 0.0.40, != 0.0.42, != 0.0.42.1"
 ]
 
 dev = [

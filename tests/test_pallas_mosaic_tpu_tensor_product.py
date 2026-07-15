@@ -150,7 +150,10 @@ def test_backward_trailing_channel_outer_matches_reference(
     _, vjp = jax.vjp(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params), x, y)
     dx, dy = vjp(do)
 
-    _, vjp_ref = jax.vjp(lambda x, y: _reference_trailing_outer(x, y, params), x, y)
+    # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
+    _, vjp_ref = jax.vjp(
+        jax.jit(lambda x, y: _reference_trailing_outer(x, y, params)), x, y
+    )
     dx_ref, dy_ref = vjp_ref(do)
 
     assert dx.shape == (batch_size, params.x_space.dim, channels)
@@ -189,7 +192,10 @@ def test_backward_trailing_channel_map_matches_reference(
     _, vjp = jax.vjp(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params), x, y)
     dx, dy = vjp(do)
 
-    _, vjp_ref = jax.vjp(lambda x, y: _reference_trailing_map(x, y, params), x, y)
+    # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
+    _, vjp_ref = jax.vjp(
+        jax.jit(lambda x, y: _reference_trailing_map(x, y, params)), x, y
+    )
     dx_ref, dy_ref = vjp_ref(do)
 
     assert dx.shape == (batch_size, params.x_space.dim, channels)
@@ -246,7 +252,10 @@ def test_class_dispatch_trailing_outer_backward(in1, in2, out, batch_size, chann
         _, vjp = jax.vjp(tp, x, y)
         dx, dy = vjp(do)
 
-    _, vjp_ref = jax.vjp(lambda x, y: _reference_trailing_outer(x, y, params), x, y)
+    # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
+    _, vjp_ref = jax.vjp(
+        jax.jit(lambda x, y: _reference_trailing_outer(x, y, params)), x, y
+    )
     dx_ref, dy_ref = vjp_ref(do)
 
     assert dx.shape == (batch_size, params.x_space.dim, channels)
@@ -282,7 +291,10 @@ def test_class_dispatch_trailing_map_backward(in1, in2, out, batch_size, channel
         _, vjp = jax.vjp(tp, x, y)
         dx, dy = vjp(do)
 
-    _, vjp_ref = jax.vjp(lambda x, y: _reference_trailing_map(x, y, params), x, y)
+    # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
+    _, vjp_ref = jax.vjp(
+        jax.jit(lambda x, y: _reference_trailing_map(x, y, params)), x, y
+    )
     dx_ref, dy_ref = vjp_ref(do)
 
     assert dx.shape == (batch_size, params.x_space.dim, channels)
@@ -452,3 +464,20 @@ def test_vmap_precompiles_device_free(in1, in2, out, channels, batch: int = 128)
     shard_batch, shard_channels = _packed_shard_dims(batch, channels)
     _assert_input_sharded(fwd, shard_batch, shard_channels)
     _assert_grad_sharded(grad, shard_batch, shard_channels)
+
+
+def test_vmap_multidevice_indivisible_batch_raises(channels: int = 128):
+    in1, in2, out = SHARD_CASES[0]
+    mesh = _virtual_tpu_mesh()
+    params = _build_params(in1, in2, out)
+    x_dim, y_dim = params.x_space.dim, params.y_space.dim
+    # V=1, batch=1 -> merged leading axis of 1, not divisible by the >=2-way mesh.
+    xa = ShapedArray((1, 1, x_dim, channels), jnp.float32)
+    ya = ShapedArray((1, 1, y_dim), jnp.float32)
+
+    def tp(x, y):
+        return tensor_product_pallas_mosaic_tpu(x, y, params)
+
+    with jax.sharding.set_mesh(mesh):
+        with pytest.raises(AssertionError, match="not divisible"):
+            jax.jit(jax.vmap(tp)).lower(xa, ya)

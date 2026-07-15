@@ -55,10 +55,13 @@ class Convolution(Enum):
     Values:
         UNFUSED: Naive JAX implementation.
         FUSED_CUDA: Dispatch to custom CUDA kernel via XLA-FFI (requires `e3j_ops`).
+        FUSED_MOSAIC_TPU: Single fused Pallas Mosaic-TPU kernel (gather + TP +
+            mixing + scatter), ``TRAILING_CHANNELS`` layout. Requires a TPU backend.
     """
 
     UNFUSED = "UNFUSED"
     FUSED_CUDA = "FUSED_CUDA"
+    FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
 
 
 # FIXME: Integer code translation of enums for the XLA handler.

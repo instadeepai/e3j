@@ -1,5 +1,20 @@
+# Copyright (c) 2026 InstaDeep Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import jax
 import jax.numpy as np
+import numpy as onp
 from jax import Array
 
 from e3j import utils
@@ -7,6 +22,10 @@ from e3j.core.scalar_mixing import ScalarMixing
 from e3j.core.tensor_product import TensorProduct
 from e3j.ops.coef import Coef4D
 from e3j.ops.convolution import CUDAConvolutionParams, convolution
+from e3j.pallas_ops.convolution.mosaic_tpu import (
+    PallasMosaicTPUMessagePassingConvolutionParams,
+    convolution_mosaic_tpu,
+)
 from e3j.spaces import O3Space
 from e3j.utils import options
 from e3j.utils.cache import cache
@@ -39,10 +58,14 @@ class Convolution:
     Optionally, the sum of messages is rescaled by `avg_num_neighbors`.
 
     Note:
-        When using the CUDA convolution kernel, edges must be sorted by receiver
+        - When using the CUDA convolution kernel, edges must be sorted by receiver
         index for now (at graph construction time). The adjacency relationship
         is encoded in a sparse CSR format to avoid atomic (memory-locked, non-
         deterministic) operations.
+        - When using the Mosaic TPU kernel, edges must be sorted by sender index and the
+        edge features must be antisymmetric under sender/receiver swap. The forward
+        aggregates on the swapped order (i.e receiver and sender are swapped),
+        the backward on the natural order.
     """
 
     def __init__(
@@ -176,6 +199,44 @@ class Convolution:
             params,
         )
 
+    def _fused_mosaic_tpu_eval(
+        self,
+        node_features: Array,
+        edge_features: Array,
+        edge_scalars: Array,
+        senders: Array,
+        receivers: Array,
+    ) -> Array:
+        """Mosaic TPU implementation.
+
+        Note:
+            Requires a symmetric, sender-sorted edge list. Edge features are assumed
+            antisymmetric under sender/receiver swap: the forward aggregates on the
+            swapped order, the backward on the natural order.
+        """
+        assert (
+            self.layout == Layout.TRAILING_CHANNELS
+        ), "FUSED_MOSAIC_TPU only supports TRAILING_CHANNELS layout."
+
+        coef = self._otimes.coef
+        params = (
+            PallasMosaicTPUMessagePassingConvolutionParams.build_from_sender_sorted(
+                indices=onp.array(coef.indices),
+                values=onp.array(coef.data),
+                x_space=O3Space(str(self._otimes.source[0])),
+                y_space=O3Space(str(self._otimes.source[1])),
+                z_space=O3Space(str(self._otimes.target)),
+            )
+        )
+        return convolution_mosaic_tpu(
+            node_features,
+            edge_features,
+            edge_scalars,
+            senders,
+            receivers,
+            params,
+        )
+
     def __call__(
         self,
         node_features: Array,
@@ -214,6 +275,14 @@ class Convolution:
                 )
             case options.Convolution.FUSED_CUDA:
                 return self._fused_eval(
+                    node_features,
+                    edge_features,
+                    edge_scalars,
+                    senders,
+                    receivers,
+                )
+            case options.Convolution.FUSED_MOSAIC_TPU:
+                return self._fused_mosaic_tpu_eval(
                     node_features,
                     edge_features,
                     edge_scalars,

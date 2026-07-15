@@ -12,25 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .bigotimes import Bigotimes
-from .convolution import Convolution
-from .filter import Filter
-from .harmonics import Harmonics
-from .permutation import Permutation
-from .polynomials import Monomial, Polynomial
-from .power_expansion import PowerExpansion
-from .scalar_mixing import ScalarMixing
-from .tensor_product import TensorProduct
+"""Fused message-passing convolution on Pallas Mosaic TPU."""
+
+from e3j.pallas_ops.convolution.mosaic_tpu.params import (
+    PallasMosaicTPUMessagePassingConvolutionBwdConfig,
+    PallasMosaicTPUMessagePassingConvolutionFwdConfig,
+    PallasMosaicTPUMessagePassingConvolutionParams,
+)
+from e3j.pallas_ops.convolution.mosaic_tpu.primitives import convolution_mosaic_tpu
 
 __all__ = [
-    "Bigotimes",
-    "Convolution",
-    "Filter",
-    "Harmonics",
-    "Monomial",
-    "Permutation",
-    "Polynomial",
-    "PowerExpansion",
-    "ScalarMixing",
-    "TensorProduct",
+    "convolution_mosaic_tpu",
+    "PallasMosaicTPUMessagePassingConvolutionBwdConfig",
+    "PallasMosaicTPUMessagePassingConvolutionFwdConfig",
+    "PallasMosaicTPUMessagePassingConvolutionParams",
 ]
