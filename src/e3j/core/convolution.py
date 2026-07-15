@@ -249,9 +249,14 @@ class Convolution:
             antisymmetric under sender/receiver swap: the forward aggregates on the
             swapped order, the backward on the natural order.
         """
-        assert (
-            self.layout == Layout.TRAILING_CHANNELS
-        ), "FUSED_MOSAIC_TPU only supports TRAILING_CHANNELS layout."
+        if self.layout != Layout.TRAILING_CHANNELS:
+            raise NotImplementedError(
+                "FUSED_MOSAIC_TPU only supports TRAILING_CHANNELS layout."
+            )
+        if self.graph_ordering != options.GraphOrdering.SENDER:
+            raise NotImplementedError(
+                "FUSED_MOSAIC_TPU only supports SENDER ordering for now."
+            )
 
         coef = self._otimes.coef
         params = (
