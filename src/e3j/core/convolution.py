@@ -137,38 +137,13 @@ class Convolution:
 
     @cache
     def coef(self) -> Coef4D:
-        """Return packed Coef4D coefficients for the forward pass.
-
-        Under `graph_ordering=SENDER` the forward pass aggregates at the sender
-        node over stored edges `(a, b)`, gathering `x_b` and the reversed edge
-        feature `y_ab = (-1)**l y_ba`. That `(-1)**l` reversal sign equals the O3
-        parity label `p` of each `y` slice, so signing the coefficient values by
-        the per-`y`-component parity recovers the true receiver message. The sign
-        is static per module instance (a compile-time multiply by +/-1) and is
-        inherited by the transposed backward coefficients.
-        """
+        """Return packed Coef4D coefficients for the forward pass."""
         with jax.ensure_compile_time_eval():
             mix, otimes = self._mix, self._otimes
             idx = otimes.indices.T
             mix_idx = np.array(mix.mix_indices, dtype=idx.dtype)
-            values = otimes.values
-            if self.graph_ordering == options.GraphOrdering.SENDER:
-                # Sign each y component by its O3 parity label p in {-1, +1}:
-                # p IS the sign the feature takes under edge reversal / inversion,
-                # by definition (correct even for non-natural-parity features,
-                # where it differs from (-1)**l). Repeat each block's parity
-                # across its full width mul*(2l+1) to reproduce the E3NN feature
-                # layout, then index by the coefficient's y index idx[2].
-                y_space = otimes.source[1]
-                y_signs = np.concatenate(
-                    [
-                        np.full(mul * ir.dim, float(ir.p), dtype=np.float32)
-                        for mul, ir in y_space
-                    ]
-                )
-                values = values * y_signs[idx[2]]
             coef4D = Coef4D(
-                values,
+                otimes.values,
                 np.stack([idx[0], idx[1], idx[2], mix_idx[idx[0]]], axis=-1),
                 val_dtype=np.float32,
                 idx_dtype=idx.dtype,
@@ -223,6 +198,19 @@ class Convolution:
             num_scalars=self._mix.num_irreps,
         )
 
+        # Per-y-component O3 parity, signing the forward coefficients under SENDER
+        # ordering (aggregation over reversed edges). The op keeps it out of the
+        # backward pass.
+        y_parity = None
+        if self.graph_ordering == options.GraphOrdering.SENDER:
+            y_space = self._otimes.source[1]
+            y_parity = np.concatenate(
+                [
+                    np.full(m * ir.dim, float(ir.p), dtype=np.float32)
+                    for m, ir in y_space
+                ]
+            )
+
         return convolution(
             coef4D_packed,
             node_features,
@@ -232,6 +220,7 @@ class Convolution:
             receivers,
             params,
             self.graph_ordering,
+            y_parity,
         )
 
     def _fused_mosaic_tpu_eval(

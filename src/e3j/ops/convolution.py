@@ -62,6 +62,7 @@ def convolution(
     receiver: Array,
     params: CUDAConvolutionParams,
     graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
+    y_parity: Array | None = None,
 ) -> Array:
     """Primitive bound to the CUDA convolution kernel.
 
@@ -93,6 +94,9 @@ def convolution(
         receiver: Receiver indices, shape (num_edges,).
         params: Convolution parameters.
         graph_ordering: Edge ordering contract (SENDER or RECEIVER).
+        y_parity: Per-`y`-component O3 parity in {-1, +1}, required under SENDER
+            ordering. Signs the forward coefficients to recover the true receiver
+            message from the reversed edge feature; the backward keeps them unsigned.
 
     Returns:
         Output node features, shape (num_nodes, num_out, channels_x).
@@ -106,6 +110,19 @@ def convolution(
         raise NotImplementedError("RHS y should have only one channel.")
     if not is_pow2(channels_x):
         raise NotImplementedError("LHS x should have power of 2 number of channels.")
+
+    # Sign the forward coefficients by y-parity under SENDER ordering; the backward
+    # pass keeps `coef` unsigned (the sender-sorted graph is already aggregated).
+    coef_fwd = coef
+    if graph_ordering == GraphOrdering.SENDER:
+        if y_parity is None:
+            raise ValueError("SENDER graph ordering requires `y_parity`.")
+        with jax.ensure_compile_time_eval():
+            c = Coef4D.unpack(coef, val_dtype="float32")
+            signs = jnp.asarray(y_parity, dtype=c.val.dtype)[c.idx[:, 2]]
+            coef_fwd = Coef4D(
+                c.val * signs, c.idx, val_dtype=c.val_dtype, idx_dtype=c.idx_dtype
+            ).pack_jax()
 
     # ---- custom_partitioning ----
     #
@@ -164,7 +181,7 @@ def convolution(
 
     @jax.custom_batching.custom_vmap
     def _batched_op(x, y, s, sender, receiver):
-        return _sharded_op(coef, x, y, s, sender, receiver)
+        return _sharded_op(coef_fwd, x, y, s, sender, receiver)
 
     @_batched_op.def_vmap
     def _vmap_rule(axis_size, in_batched, x, y, s, sender, receiver):
@@ -214,7 +231,7 @@ def convolution(
     def _bwd(res, dm):
         x, y, s, sender, receiver = res
         return convolution_bwd(
-            coef, x, y, s, sender, receiver, dm, params, graph_ordering
+            coef, x, y, s, sender, receiver, dm, params, graph_ordering, y_parity
         )
 
     convolution_op.defvjp(_fwd, _bwd)
@@ -232,6 +249,7 @@ def convolution_bwd(
     dm,
     params,
     graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
+    y_parity: Array | None = None,
 ):
     """Primitive bound to the CUDA convolution backward kernel.
 
@@ -242,6 +260,9 @@ def convolution_bwd(
     quantities in original order. Under `GraphOrdering.SENDER` the primal
     graph is already sender-sorted, so the CSR is built directly and a null
     `edge_perm` is forwarded (no transpose, no permuted gather).
+
+    The backward coefficients stay unsigned; `y_parity` is unused here and only
+    forwarded to the higher-order `convolution()` passes (double backward).
     """
     has_cx = x.ndim > 2
 
@@ -384,11 +405,13 @@ def convolution_bwd(
         (x, y, s, dm, sender, receiver) = res
 
         def conv(x, y, s):
-            return convolution(coef, x, y, s, sender, receiver, params, graph_ordering)
+            return convolution(
+                coef, x, y, s, sender, receiver, params, graph_ordering, y_parity
+            )
 
         def conv_bwd(x, y, s):
             return convolution_bwd(
-                coef, x, y, s, sender, receiver, dm, params, graph_ordering
+                coef, x, y, s, sender, receiver, dm, params, graph_ordering, y_parity
             )
 
         # Second variation of messages: three forward passes
