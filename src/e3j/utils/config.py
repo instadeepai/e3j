@@ -144,6 +144,7 @@ class config(Config):
         if backend == "tpu" and _TPU_AVAILABLE:
             return Config(
                 tensor_product=TensorProduct.FUSED_MOSAIC_TPU,
+                convolution=Convolution.FUSED_MOSAIC_TPU,
             )
 
         return Config()
