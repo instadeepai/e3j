@@ -20,7 +20,7 @@ import pytest
 from jax import Array
 
 import e3j
-from e3j.ops import TensorProductParams as Params
+from e3j.ops import CUDATensorProductParams as Params
 from e3j.ops import tensor_product
 from e3j.ops.coef import Coef
 from e3j.utils.sparse import narrow_index_dtype
@@ -365,14 +365,6 @@ class TestTensorProductLeadingInner(_TestTensorProductOp):
 
 
 class TestTensorProductLeadingMap(_TestTensorProductOp):
-    """MAP mode is not implemented for LEADING_CHANNELS on the CUDA kernel.
-
-    See `e3j.utils.options.TPMode`: 'MAP' is only useful with trailing
-    channels, since a map over leading axes is performed in any case. The
-    Python wrapper handles this case by folding the leading channel axis
-    into the row axis and dispatching to 'OUTER' instead.
-    """
-
     layout = "LEADING_CHANNELS"
     mode = "MAP"
     num_idx = 780

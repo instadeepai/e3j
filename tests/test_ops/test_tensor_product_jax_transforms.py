@@ -24,7 +24,7 @@ from jax import Array
 from jax.experimental.topologies import get_topology_desc
 
 import e3j
-from e3j.ops import TensorProductParams as Params
+from e3j.ops import CUDATensorProductParams as Params
 from e3j.ops import tensor_product
 from e3j.ops.coef import Coef
 

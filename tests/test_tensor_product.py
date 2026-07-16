@@ -241,7 +241,7 @@ class TestTensorProductFused(_TestTensorProduct):
 
     @pytest.fixture(scope="class")
     def e3j_module(self):
-        with e3j.config.use(tensor_product="FUSED"):
+        with e3j.config.use(tensor_product="FUSED_CUDA"):
             return TensorProduct((self.in1, self.in2), self.out, sort=True)
 
     def test_e3nn(self, inputs, e3j_module, e3nn_module):
@@ -255,7 +255,7 @@ class TestTensorProductFused(_TestTensorProduct):
         x1, x2 = inputs
         in1, in2, tgt = self.in1, self.in2, self.out
 
-        with e3j.config.use(tensor_product="FUSED"):
+        with e3j.config.use(tensor_product="FUSED_CUDA"):
             f = jax.jit(lambda x, y: TensorProduct((in1, in2), tgt, sort=True)(x, y))
             z = f(x1, x2)
 
@@ -267,7 +267,7 @@ class TestTensorProductFused(_TestTensorProduct):
         x1, x2 = inputs
         in1, in2, tgt = self.in1, self.in2, self.out
 
-        with e3j.config.use(tensor_product="FUSED"):
+        with e3j.config.use(tensor_product="FUSED_CUDA"):
 
             @jax.jit
             def grad_fused(x, y):
@@ -291,7 +291,7 @@ class TestTensorProductFused(_TestTensorProduct):
         x1, x2 = inputs
         in1, in2, tgt = self.in1, self.in2, self.out
 
-        with e3j.config.use(tensor_product="FUSED"):
+        with e3j.config.use(tensor_product="FUSED_CUDA"):
             tp = TensorProduct((in1, in2), tgt, sort=True)
             if batched == "x":
                 stack = np.stack([x1, x1 * 2.0, x1 * 3.0], axis=0)
@@ -312,7 +312,7 @@ class TestTensorProductFused(_TestTensorProduct):
         def loss_ref(x, y):
             return np.sum(e3nn_module(x, y))
 
-        with e3j.config.use(tensor_product="FUSED"):
+        with e3j.config.use(tensor_product="FUSED_CUDA"):
 
             def loss_fused(x, y):
                 return np.sum(TensorProduct((in1, in2), tgt, sort=True)(x, y))
