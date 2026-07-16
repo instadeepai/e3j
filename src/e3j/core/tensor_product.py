@@ -26,8 +26,7 @@ from jax import Array
 from jax.experimental import sparse
 
 import e3j.utils as utils
-from e3j.ops import TensorProductParams as Params
-from e3j.ops import tensor_product
+from e3j.ops import CUDATensorProductParams, tensor_product
 from e3j.ops.coef import Coef
 from e3j.pallas_ops.tensor_product import (
     PallasMosaicTPUTensorProductParams,
@@ -339,7 +338,7 @@ class TensorProduct(SparseMixin):
         """Evaluate bilinear map on pair of inputs."""
         idx = coef.indices
         val = coef.data
-        params = Params(
+        params = CUDATensorProductParams(
             num_out=self.target.dim,
             layout=self.layout,
             mode=self.mode,

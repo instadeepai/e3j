@@ -32,7 +32,7 @@ from e3j.utils.options import Layout, MixingMode
 
 
 @dataclass
-class TensorProductParams:
+class CUDATensorProductParams:
     num_out: int
     mode: str | MixingMode = MixingMode.OUTER
     layout: str | Layout = Layout.LEADING_CHANNELS
@@ -46,7 +46,7 @@ def tensor_product(
     coef: Array,
     x: Array,
     y: Array,
-    params: TensorProductParams,
+    params: CUDATensorProductParams,
 ) -> Array:
     """Sparse tensor product kernel using parallel scatter-reduction.
 
@@ -226,7 +226,7 @@ def tensor_product_bwd(
     x: Array,
     y: Array,
     ct_z: Array,
-    params: TensorProductParams,
+    params: CUDATensorProductParams,
 ) -> tuple[Array, Array]:
     """Backward tensor product kernel handler.
 
@@ -484,6 +484,3 @@ def _tensor_product_bwd_bwd(coef, params, res, ct_xy):
 # Assign VJP rules
 tensor_product.defvjp(_tensor_product_fwd, _tensor_product_bwd)
 tensor_product_bwd.defvjp(_tensor_product_bwd_fwd, _tensor_product_bwd_bwd)
-
-
-tensor_product.Params = TensorProductParams
