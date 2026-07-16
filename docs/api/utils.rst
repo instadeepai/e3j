@@ -26,7 +26,6 @@ Configuration
     options.LinearInitialization
     options.LinearIndexwiseInitialization
 
-
 Utilities
 ---------
 
