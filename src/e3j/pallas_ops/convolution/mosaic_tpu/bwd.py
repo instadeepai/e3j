@@ -49,10 +49,10 @@ from e3j.pallas_ops.utils.named_scope import named_scope
 class BwdScratch(NamedTuple):
     x_stage: (
         pl.MemoryRef
-    )  # (batch_block_size, x_dim, 128): gathered x[senders], one edge per row
+    )  # (batch_block_size, x_dim*128): folded x[senders], one edge per row
     dz_stage: (
         pl.MemoryRef
-    )  # (batch_block_size, out_dim, 128): gathered dz[receivers], one edge per row
+    )  # (batch_block_size, out_dim*128): folded dz[receivers], one edge per row
     dz_plane: pl.MemoryRef  # (out_dim, batch_block_size, 128): dz[receiver], per edge
     x_plane: (
         pl.MemoryRef
@@ -94,8 +94,8 @@ def _bwd_planes(
 class _BwdOperands(NamedTuple):
     """Padded operands fed to the bwd `pallas_call`, in argument order."""
 
-    x: jax.Array  # (n_nodes, x_dim, channels)
-    dz: jax.Array  # (n_nodes, out_dim, channels)
+    x: jax.Array  # (n_nodes, x_dim*channels_padded): folded node feats
+    dz: jax.Array  # (n_nodes, out_dim*channels_padded): folded output cotangent
     y: jax.Array  # (n_edges, num_lanes)
     edge_scalars: jax.Array  # (num_blocks, n_edges, channels)
     senders: jax.Array  # (n_blocks, batch_block_size)
@@ -131,8 +131,8 @@ class _BwdConstants(NamedTuple):
 
 def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
     return BwdScratch(
-        x_stage=pltpu.VMEM((c.batch_block_size, c.x_dim, c.num_lanes), c.dtype),
-        dz_stage=pltpu.VMEM((c.batch_block_size, c.out_dim, c.num_lanes), c.dtype),
+        x_stage=pltpu.VMEM((c.batch_block_size, c.x_dim * c.num_lanes), c.dtype),
+        dz_stage=pltpu.VMEM((c.batch_block_size, c.out_dim * c.num_lanes), c.dtype),
         dz_plane=pltpu.VMEM((c.out_dim, c.batch_block_size, c.num_lanes), c.dtype),
         x_plane=pltpu.VMEM((c.x_dim, c.batch_block_size, c.num_lanes), c.dtype),
         dx_plane=pltpu.VMEM((c.x_dim, c.batch_block_size, c.num_lanes), c.dtype),
@@ -246,6 +246,8 @@ class _MessagePassingBwdKernel:
         channels_padded = round_up(channels, num_lanes)
         x = jnp.pad(x, (no_pad, no_pad, (0, channels_padded - channels)))
         dz = jnp.pad(dz, (no_pad, no_pad, (0, channels_padded - channels)))
+        x = x.reshape(n_nodes, x_dim * channels_padded)
+        dz = dz.reshape(n_nodes, out_dim * channels_padded)
         edge_scalars = jnp.pad(
             edge_scalars, (no_pad, no_pad, (0, channels_padded - channels))
         )
@@ -450,15 +452,15 @@ class _MessagePassingBwdKernel:
                     for k in range(c.batch_block_size):
                         x_copies.append(
                             pltpu.make_async_copy(
-                                x_hbm.at[pl.ds(read_sender(k), 1), :, :],
-                                x_stage.at[pl.ds(k, 1), :, :],
+                                x_hbm.at[pl.ds(read_sender(k), 1), :],
+                                x_stage.at[pl.ds(k, 1), :],
                                 gather_semaphore,
                             )
                         )
                         dz_copies.append(
                             pltpu.make_async_copy(
-                                dz_hbm.at[pl.ds(read_receiver(k), 1), :, :],
-                                dz_stage.at[pl.ds(k, 1), :, :],
+                                dz_hbm.at[pl.ds(read_receiver(k), 1), :],
+                                dz_stage.at[pl.ds(k, 1), :],
                                 stage_semaphore,
                             )
                         )
@@ -474,12 +476,13 @@ class _MessagePassingBwdKernel:
 
                 zero = jnp.zeros((c.batch_block_size, c.num_lanes), c.dtype)
 
-                # ---- 2. slice the gathered per-edge tiles into per-component planes ----
+                # ---- 2. lane-slice the folded rows into per-component planes ----
+                lanes = c.num_lanes
                 with named_scope("extract"):
                     for xi in range(c.x_dim):
-                        x_plane[xi, :, :] = x_stage[:, xi, :]
+                        x_plane[xi, :, :] = x_stage[:, lanes * xi : lanes * (xi + 1)]
                     for zi in range(c.out_dim):
-                        dz_plane[zi, :, :] = dz_stage[:, zi, :]
+                        dz_plane[zi, :, :] = dz_stage[:, lanes * zi : lanes * (zi + 1)]
 
                 count_smem[0] = block_idx + 1
 
