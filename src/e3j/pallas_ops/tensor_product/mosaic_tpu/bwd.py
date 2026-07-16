@@ -631,8 +631,8 @@ def _tensor_product_kernel_mosaic_tpu_bwd(
 ) -> tuple[jax.Array, jax.Array]:
     """Backward pass dispatching on `params.layout`/`params.mode`."""
     if params.layout == options.Layout.TRAILING_CHANNELS:
-        if params.mode == options.TPMode.MAP:
+        if params.mode == options.MixingMode.MAP:
             return _BwdTrailingChannelMapKernel()(x, y, dz, params)
-        if params.mode == options.TPMode.OUTER:
+        if params.mode == options.MixingMode.OUTER:
             return _BwdTrailingChannelOuterKernel()(x, y, dz, params)
     raise NotImplementedError(f"Mosaic TPU TP bwd unsupported for {params}")

@@ -63,9 +63,9 @@ class TensorProduct(SparseMixin):
 
     .. code:: python
 
-        e3j.config(tensor_product="FUSED")              # CUDA
+        e3j.config(tensor_product="FUSED_CUDA")         # CUDA
         e3j.config(tensor_product="FUSED_MOSAIC_TPU")   # Pallas MTPU
-        e3j.config(tensor_product="SPARSE")             # plain JAX, all platforms
+        e3j.config(tensor_product="UNFUSED")            # plain JAX, all platforms
     """
 
     @utils.cache
@@ -86,8 +86,8 @@ class TensorProduct(SparseMixin):
         sort: bool = True,
         config: utils.Config | None = None,
         layout: str | options.Layout = "LEADING_CHANNELS",
-        mode: str | options.TPMode = "OUTER",
-        normalization: str | options.TPNormalization = "NONE",
+        mode: str | options.MixingMode = "OUTER",
+        normalization: str | options.TensorProductNormalization = "NONE",
     ):
         """
         Stack Clebsch Gordan coefficients or use explicitly given ones.
@@ -146,8 +146,8 @@ class TensorProduct(SparseMixin):
         self.config = utils.config.state() if config is None else config
         self.aggregation_method = self.config.aggregation
         self.layout = Layout.parse(layout)
-        self.mode = options.TPMode.parse(mode)
-        self.normalization = options.TPNormalization.parse(normalization)
+        self.mode = options.MixingMode.parse(mode)
+        self.normalization = options.TensorProductNormalization.parse(normalization)
 
         # --- Coefficients ---
 
@@ -167,7 +167,7 @@ class TensorProduct(SparseMixin):
 
     @property
     def is_fused(self):
-        return self.config.tensor_product == options.TensorProduct.FUSED
+        return self.config.tensor_product == options.TensorProduct.FUSED_CUDA
 
     @property
     def is_mtpu(self):
@@ -216,7 +216,7 @@ class TensorProduct(SparseMixin):
         target: O3Space,
         source_1: O3Space,
         source_2: O3Space,
-        normalization: options.TPNormalization = options.TPNormalization.NONE,
+        normalization: options.TensorProductNormalization = options.TensorProductNormalization.NONE,
     ) -> sparse.BCOO:
         """
         Stack Clebsch-Gordan coefficients.
@@ -253,7 +253,7 @@ class TensorProduct(SparseMixin):
                 cg_indices = numpy.stack(nz, axis=-1)  # shape (nnz, 3)
 
                 # optionally, rescale coefficients
-                if normalization == options.TPNormalization.SQRT_DIM_OUT:
+                if normalization == options.TensorProductNormalization.SQRT_DIM_OUT:
                     cg_data = cg_data * numpy.sqrt(2 * l0 + 1)
 
                 # accumulate repeated coefficient values
@@ -359,7 +359,7 @@ class TensorProduct(SparseMixin):
 
         if coef is None:
             coef = self.coef
-        if self.mode not in (options.TPMode.OUTER, options.TPMode.MAP):
+        if self.mode not in (options.MixingMode.OUTER, options.MixingMode.MAP):
             raise NotImplementedError(
                 f"Mosaic TPU tensor product does not support mode {self.mode}; "
                 "use 'OUTER' or 'MAP'."

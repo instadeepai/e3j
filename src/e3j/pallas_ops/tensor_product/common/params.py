@@ -59,7 +59,7 @@ class PallasTensorProductParams(Generic[FwdConfig, BwdConfig]):
     indices: np.ndarray
     values: np.ndarray
     layout: options.Layout
-    mode: options.TPMode
+    mode: options.MixingMode
     x_space: O3Space
     y_space: O3Space
     z_space: O3Space

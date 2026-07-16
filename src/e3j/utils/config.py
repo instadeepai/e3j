@@ -51,7 +51,7 @@ class Config(YamlConfig):
         tensor_product: Evaluation strategy for tensor products.
             See :class:`~e3j.utils.options.TensorProduct`.
         aggregation: Aggregation method for sparse reduction steps.
-            Only used if `tensor_product` option is "SPARSE".
+            Only used if `tensor_product` option is "UNFUSED".
             See :class:`~e3j.utils.options.Aggregation`.
         convolution: Evaluation strategy for convolution.
             See :class:`~e3j.utils.options.Convolution`.
@@ -63,7 +63,7 @@ class Config(YamlConfig):
     """
 
     layout: Layout = Layout.TRAILING_CHANNELS
-    tensor_product: TensorProduct = TensorProduct.SPARSE
+    tensor_product: TensorProduct = TensorProduct.UNFUSED
     aggregation: Aggregation = Aggregation.SCATTER
     convolution: Convolution = Convolution.UNFUSED
     debug_level: int = 0
@@ -138,7 +138,7 @@ class config(Config):
 
         if backend == "gpu" and _E3J_OPS_AVAILABLE:
             return Config(
-                tensor_product=TensorProduct.FUSED,
+                tensor_product=TensorProduct.FUSED_CUDA,
                 convolution=Convolution.FUSED_CUDA,
             )
         if backend == "tpu" and _TPU_AVAILABLE:

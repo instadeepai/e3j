@@ -79,7 +79,7 @@ class Convolution:
         graph_ordering: str | options.GraphOrdering,
         layout: Layout = Layout.TRAILING_CHANNELS,
         avg_num_neighbors: float | None = None,
-        normalization: str | options.TPNormalization = "SQRT_DIM_OUT",
+        normalization: str | options.TensorProductNormalization = "SQRT_DIM_OUT",
         config: utils.Config | None = None,
     ):
         """
@@ -98,7 +98,7 @@ class Convolution:
             layout: Specifies the channel axis, `TRAILING_CHANNELS` is faster.
             avg_num_neighbors: If given, messages are divided by this factor.
             normalization: Normalization of the tensor product's Clebsch-Gordan
-                coefficients, see :class:`e3j.utils.options.TPNormalization`.
+                coefficients, see :class:`e3j.utils.options.TensorProductNormalization`.
             config: Global :class:`e3j.utils.config.Config` (optional) pointing
                 to the implementation path. The best available option should be
                 automatically selected based on the environment.
