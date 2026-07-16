@@ -75,10 +75,11 @@ class Convolution:
         self,
         source: tuple[O3Space, O3Space],
         target: O3Space | None = None,
+        *,
+        graph_ordering: str | options.GraphOrdering,
         layout: Layout = Layout.TRAILING_CHANNELS,
         avg_num_neighbors: float | None = None,
         normalization: str | options.TPNormalization = "SQRT_DIM_OUT",
-        graph_ordering: str | options.GraphOrdering = options.GraphOrdering.RECEIVER,
         config: utils.Config | None = None,
     ):
         """
@@ -90,13 +91,14 @@ class Convolution:
                 inferred from the former two in the `.source` attribute.
             target: Output representation, inferred by default. Passing a target
                 argument enforces a filter on the output irreducible blocks.
+            graph_ordering: Edge ordering for the graph, can be `RECEIVER`,
+                `SENDER` or `NONE`. When edges are sorted by senders, symmetry
+                assumptions on the graph and edge features should hold. Only
+                the unfused path supports `NONE` for now.
             layout: Specifies the channel axis, `TRAILING_CHANNELS` is faster.
             avg_num_neighbors: If given, messages are divided by this factor.
             normalization: Normalization of the tensor product's Clebsch-Gordan
                 coefficients, see :class:`e3j.utils.options.TPNormalization`.
-            graph_ordering: Edge ordering for the graph, can be `RECEIVER` or
-                `SENDER`. When edges are sorted by senders, symmetry assumptions
-                on the graph and edge features should hold.
             config: Global :class:`e3j.utils.config.Config` (optional) pointing
                 to the implementation path. The best available option should be
                 automatically selected based on the environment.
@@ -127,13 +129,14 @@ class Convolution:
 
         # Optional rescaling factor
         self.avg_num_neighbors = avg_num_neighbors
+
         self.config = utils.config.state() if config is None else config
         self.layout = layout
         self.normalization = otimes.normalization
-        self.graph_ordering = options.GraphOrdering.parse(graph_ordering)
-
         self._otimes = otimes
         self._mix = mix
+
+        self.graph_ordering = options.GraphOrdering.parse(graph_ordering)
 
     @cache
     def coef(self) -> Coef4D:
@@ -190,6 +193,10 @@ class Convolution:
             Edges (and edge features) must be sorted by the endpoint selected
             via `graph_ordering`: by receivers (default) or by senders.
         """
+        if self.graph_ordering == options.GraphOrdering.NONE:
+            raise NotImplementedError(
+                "CUDA convolution only supports SENDER and RECEIVER ordering."
+            )
         with jax.ensure_compile_time_eval():
             coef4D_packed = self.coef.pack_jax()
 
