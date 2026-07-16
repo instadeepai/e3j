@@ -68,7 +68,10 @@ class _TestConvolution:
         """Build a Convolution capturing the unfused config at construction."""
         with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
             return Convolution(
-                (self.node_irreps, self.edge_irreps), self.out, layout=self.layout
+                (self.node_irreps, self.edge_irreps),
+                self.out,
+                layout=self.layout,
+                graph_ordering="NONE",
             )
 
     @pytest.fixture(scope="class")
@@ -173,6 +176,7 @@ class _TestConvolution:
                 self.out,
                 layout=self.layout,
                 avg_num_neighbors=avg,
+                graph_ordering="NONE",
             )
         assert_allclose(
             module(*inputs, senders, receivers) / avg,
@@ -249,14 +253,20 @@ class TestConvolutionFused(_TestConvolution):
     def module(self) -> Convolution:
         with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
             return Convolution(
-                (self.node_irreps, self.edge_irreps), self.out, layout=self.layout
+                (self.node_irreps, self.edge_irreps),
+                self.out,
+                layout=self.layout,
+                graph_ordering="RECEIVER",
             )
 
     @pytest.fixture(scope="class")
     def reference(self) -> Convolution:
         with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
             return Convolution(
-                (self.node_irreps, self.edge_irreps), self.out, layout=self.layout
+                (self.node_irreps, self.edge_irreps),
+                self.out,
+                layout=self.layout,
+                graph_ordering="NONE",
             )
 
     def test_fused_matches_unfused(self, module, reference, inputs, graph):
@@ -279,9 +289,9 @@ class TestConvolutionFused(_TestConvolution):
 
         with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
             f = jax.jit(
-                lambda a, b, c: Convolution(source, self.out, layout=self.layout)(
-                    a, b, c, senders, receivers
-                )
+                lambda a, b, c: Convolution(
+                    source, self.out, layout=self.layout, graph_ordering="RECEIVER"
+                )(a, b, c, senders, receivers)
             )
             z = f(*inputs)
 
@@ -361,12 +371,16 @@ class TestConvolutionFusedSender:
     def modules(self) -> tuple[Convolution, Convolution, Convolution]:
         source = (self.node_irreps, self.edge_irreps)
         with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
-            receiver = Convolution(source, self.out, layout=self.layout)
+            receiver = Convolution(
+                source, self.out, layout=self.layout, graph_ordering="RECEIVER"
+            )
             sender = Convolution(
                 source, self.out, layout=self.layout, graph_ordering="SENDER"
             )
         with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
-            reference = Convolution(source, self.out, layout=self.layout)
+            reference = Convolution(
+                source, self.out, layout=self.layout, graph_ordering="NONE"
+            )
         return receiver, sender, reference
 
     @pytest.fixture(scope="class")

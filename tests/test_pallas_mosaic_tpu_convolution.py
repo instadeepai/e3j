@@ -143,6 +143,7 @@ def test_fused_matches_unfused(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     node, sph, es, senders, receivers = _contract_valid_inputs(
         conv, n_nodes=16, channels=channels
@@ -164,6 +165,7 @@ def test_backward_matches_unfused(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     node, sph, es, senders, receivers = _contract_valid_inputs(
         conv, n_nodes=8, channels=channels
@@ -196,6 +198,7 @@ def test_backward_cotangents_match(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     node, sph, es, senders, receivers = _contract_valid_inputs(
         conv, n_nodes=8, channels=channels
@@ -224,6 +227,7 @@ def test_force_training_double_backward(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     node, sph, es, senders, receivers = _contract_valid_inputs(
         conv, n_nodes=8, channels=channels
@@ -263,6 +267,7 @@ def test_vmap_forward_matches_per_graph(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     fused = conv._fused_mosaic_tpu_eval
     batched, per = _batch_valid_inputs(conv, n_nodes=8, channels=channels, n_graphs=3)
@@ -281,6 +286,7 @@ def test_vmap_backward_matches_per_graph(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     fused = conv._fused_mosaic_tpu_eval
     batched, per = _batch_valid_inputs(conv, n_nodes=8, channels=channels, n_graphs=3)
@@ -320,6 +326,7 @@ def test_vmap_multidevice_forward_matches_per_graph(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     fused = conv._fused_mosaic_tpu_eval
     mesh = _device_mesh()
@@ -343,6 +350,7 @@ def test_vmap_multidevice_backward_matches_per_graph(x_ir, y_ir, o_ir, channels)
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     fused = conv._fused_mosaic_tpu_eval
     mesh = _device_mesh()
@@ -369,6 +377,7 @@ def _assertion_conv() -> Convolution:
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
 
 
@@ -396,6 +405,7 @@ def test_end_to_end_position_gradient_matches(x_ir, y_ir, o_ir, channels):
         layout=Layout.TRAILING_CHANNELS,
         avg_num_neighbors=None,
         normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
     )
     n_nodes = 8
     senders, receivers = _symmetric_edges(n_nodes)
