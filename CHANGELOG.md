@@ -4,7 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
-## Unreleased
+## [0.1.0b5] — 2026-07-17
+
+### Fixed
+
+- The `options.Layout` enum constructor only accepted integer codes,
+  and now matches case-insensitive strings.
+- Support for all layouts and tensor product implementations in `PowerExpansion`.
 
 ### Added
 
@@ -13,8 +19,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   vectors) and edge scalars (typically MLP transforms of RBF-encoded interatomic
   distances), common in many MLIPs.
 - CUDA convolution kernels (forward and backward), fusing the trilinear mixing
-  with gather/scatter operations to avoid materializing messages. The associated
-  JAX primitive is infinitely differentiable and SPMD compatible.
+  with gather/scatter operations to avoid materializing messages. Both kernels
+  support sender and receiver sorted graphs. The associated JAX primitive
+  is infinitely differentiable and SPMD compatible.
+- Pallas Mosaic TPU convolution kernels (forward and backward), fusing the
+  trilinear mixing with gather/scatter operations, supporting only sender
+  sorted graphs for now, infinitely differentiable and SPMD compatible too.
+- Support for mixing mode `MAP` and leading channels in the CUDA tensor product
+  kernel.
 
 ### Changed
 
@@ -24,6 +36,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 - The default global `config()` picks up platform-specific options on TPU too,
   by looking up installed packages (`libtpu`). This avoids side effects of
   JAX backends initialization.
+- The Mosaic TPU tensor product kernel may pack multiple batches in VMEM to
+  process more channels at a time, improving runtime by 30% with 32 channels
+  and `l_max` 3.
 
 ## [0.1.0b4] — 2026-07-06
 
