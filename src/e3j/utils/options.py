@@ -102,12 +102,12 @@ class Layout(EnumOption):
     factorizing the GCD of multiplicities in a separate `channels` axis.
 
     Values:
-        * LEADING_CHANNELS: `(batch, channels, dim)` -- channels on an explicit
-          leading axis.
-        * TRAILING_CHANNELS: `(batch, dim, channels)` -- channels on a trailing
-          axis. Faster on GPU thanks to coalesced memory access.
-        * E3NN: `(batch, channels * dim)` -- channels folded into the feature
-          dimension, matching `e3nn_jax.IrrepsArray`.
+        LEADING_CHANNELS: `(batch, channels, dim)` -- channels on an explicit
+            leading axis.
+        TRAILING_CHANNELS: `(batch, dim, channels)` -- channels on a trailing
+            axis. Faster on GPU thanks to coalesced memory access.
+        E3NN: `(batch, channels * dim)` -- channels folded into the feature
+            dimension, matching `e3nn_jax.IrrepsArray`.
 
     .. note::
         The CUDA kernels only support channel counts that are powers of two for now.
@@ -122,9 +122,9 @@ class TPMode(EnumOption):
     """Tensor product modes.
 
     Values:
-        * OUTER:  "u -> v -> (u,v)"
-        * INNER:  "v -> v -> 1"
-        * MAP:    "v -> v -> v"
+        OUTER: "u -> v -> (u,v)"
+        INNER: "v -> v -> 1"
+        MAP: "v -> v -> v"
 
     The 'MAP' mode is only useful with trailing channels,
     since a map over leading axes is performed in any case.
@@ -139,8 +139,8 @@ class TPNormalization(EnumOption):
     """Tensor product normalization options of Clebsch-Gordan coefficients.
 
     Values:
-        * NONE: orthonormal Clebsch-Gordan coefficients (default).
-        * SQRT_DIM_OUT: coefficients scaled by sqrt(2L+1).
+        NONE: orthonormal Clebsch-Gordan coefficients (default).
+        SQRT_DIM_OUT: coefficients scaled by sqrt(2L+1).
     """
 
     NONE = "NONE"
@@ -151,8 +151,8 @@ class LinearInitialization(EnumOption):
     """Linear weight initialization options.
 
     Values:
-        * FAN_IN: stddev is 1/sqrt(m_in) per block (e3nn: "path").
-        * FAN_OUT: stddev is 1/sqrt(m_out) per block (e3nn: "irrep").
+        FAN_IN: stddev is 1/sqrt(m_in) per block (e3nn: "path").
+        FAN_OUT: stddev is 1/sqrt(m_out) per block (e3nn: "irrep").
     """
 
     FAN_IN = "FAN_IN"
