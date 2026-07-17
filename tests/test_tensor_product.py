@@ -251,7 +251,7 @@ class TestTensorProductFused(_TestTensorProduct):
         assert_allclose(expect, result, rtol=2e-3, atol=2e-3)
 
     def test_jit_pack_jax(self, inputs, e3j_module, e3nn_module):
-        """Coef.pack_jax() must succeed inside JIT via fused_eval."""
+        """Coef.pack_jax() must succeed inside JIT via _fused_eval."""
         x1, x2 = inputs
         in1, in2, tgt = self.in1, self.in2, self.out
 

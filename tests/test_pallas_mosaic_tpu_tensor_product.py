@@ -211,7 +211,7 @@ def test_backward_trailing_channel_map_matches_reference(
 #
 # These exercise the public `TensorProduct.__call__` path rather than calling
 # `tensor_product_pallas_mosaic_tpu` directly: with `tensor_product` set to
-# `MOSAIC_TPU` the class must route through `mtpu_eval`. References are built
+# `MOSAIC_TPU` the class must route through `_mtpu_eval`. References are built
 # from the same `tp` (via `tp.mtpu_params()`) so coefficients stay consistent.
 
 

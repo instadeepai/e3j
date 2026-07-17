@@ -270,14 +270,14 @@ class TestConvolutionFused(_TestConvolution):
             )
 
     def test_fused_matches_unfused(self, module, reference, inputs, graph):
-        """`fused_eval` reproduces the gather/TP/mix/scatter reference."""
+        """`_fused_eval` reproduces the gather/TP/mix/scatter reference."""
         senders, receivers = graph
         result = module(*inputs, senders, receivers)
         expect = reference(*inputs, senders, receivers)
         assert_allclose(expect, result, rtol=2e-3, atol=2e-3)
 
     def test_jit_pack_jax(self, inputs, reference, graph):
-        """`coef.pack_jax()` must succeed at trace time inside fused_eval.
+        """`coef.pack_jax()` must succeed at trace time inside _fused_eval.
 
         Building the module within the traced function forces the packed
         Coef4D to be materialized during compilation, which only works if the
