@@ -362,3 +362,23 @@ class TestTensorProductLeadingInner(_TestTensorProductOp):
     channels_y = 256
     num_out = 93
     num_rows = 100
+
+
+class TestTensorProductLeadingMap(_TestTensorProductOp):
+    """MAP mode is not implemented for LEADING_CHANNELS on the CUDA kernel.
+
+    See `e3j.utils.options.TPMode`: 'MAP' is only useful with trailing
+    channels, since a map over leading axes is performed in any case. The
+    Python wrapper handles this case by folding the leading channel axis
+    into the row axis and dispatching to 'OUTER' instead.
+    """
+
+    layout = "LEADING_CHANNELS"
+    mode = "MAP"
+    num_idx = 780
+    num_x = 16
+    num_y = 25
+    channels_x = 256
+    channels_y = 256
+    num_out = 93
+    num_rows = 100

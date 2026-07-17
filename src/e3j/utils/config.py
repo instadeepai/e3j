@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -21,15 +22,15 @@ from pathlib import Path
 import yaml
 
 from e3j.utils._yaml_config import YamlConfig
-from e3j.utils.options import Aggregation, Layout, TensorProduct
+from e3j.utils.options import Aggregation, Convolution, Layout, TensorProduct
 
 E3J_CONFIG = Path(os.environ.get("E3J_CONFIG") or "e3j.yaml")
 
-E3J_OPS_AVAILABLE = True
-try:
-    import e3j_ops  # noqa
-except ModuleNotFoundError:
-    E3J_OPS_AVAILABLE = False
+# Check if `e3j_ops` is installed for our CUDA binaries
+_E3J_OPS_AVAILABLE = importlib.util.find_spec("e3j_ops") is not None
+
+# Check if `jax[tpu]` is installed, without initializing JAX backends.
+_TPU_AVAILABLE = importlib.util.find_spec("libtpu") is not None
 
 
 @dataclass
@@ -52,6 +53,8 @@ class Config(YamlConfig):
         aggregation: Aggregation method for sparse reduction steps.
             Only used if `tensor_product` option is "SPARSE".
             See :class:`~e3j.utils.options.Aggregation`.
+        convolution: Evaluation strategy for convolution.
+            See :class:`~e3j.utils.options.Convolution`.
         debug_level: Verbosity level (0 = silent).
 
     Example::
@@ -60,10 +63,9 @@ class Config(YamlConfig):
     """
 
     layout: Layout = Layout.TRAILING_CHANNELS
-    tensor_product: TensorProduct = (
-        TensorProduct.FUSED if E3J_OPS_AVAILABLE else TensorProduct.SPARSE
-    )
+    tensor_product: TensorProduct = TensorProduct.SPARSE
     aggregation: Aggregation = Aggregation.SCATTER
+    convolution: Convolution = Convolution.UNFUSED
     debug_level: int = 0
 
 
@@ -75,7 +77,7 @@ class config(Config):
 
     Usage:
 
-        .. code::python
+        .. code:: python
 
             # context manager:
             with e3j.use(**kwargs):
@@ -93,27 +95,59 @@ class config(Config):
 
     _path = E3J_CONFIG if E3J_CONFIG.exists() else None
 
-    _is_initialized: bool = False
-
     def __new__(cls, **kwargs):
         """Get/set the global configuration object."""
-        # Initialize global configuration
-        if not cls._is_initialized:
+        # Initialize global singleton: config() -> config
+        if cls._state is None:
+            # Set singleton config object from default Config dataclass
+            default_config = cls._default_backend_config()
             _state = super().__new__(cls)
+            for key in cls.fields():
+                setattr(_state, key, getattr(default_config, key))
             cls._state = _state
-        # Getter
+        # Getter: config(key) -> value
         if not len(kwargs):
             return cls._state
-        # Setter
+        # Setter: config(key=value)
         for key, value in kwargs.items():
             setattr(cls._state, key, value)
         return cls._state
 
     def __init__(self, **kwargs):
-        if self.__class__._is_initialized:
-            return None
-        super().__init__(**kwargs)
-        self.__class__._is_initialized = True
+        # Global state is created and seeded in __new__; nothing to do here.
+        return None
+
+    @classmethod
+    def _default_backend_config(cls) -> Config:
+        """Backend-specific default configuration.
+
+        Detects available JAX backends from the package environment
+        using `importlib`, to avoid initializing JAX backends, assuming
+        the install is consistent.
+
+        The backend detection logic can be overriden by the `$E3J_BACKEND`
+        environment variable.
+        """
+        # Bypass our fragile backend detection attempts with $E3J_BACKEND
+        backend = os.environ.get("E3J_BACKEND")
+        if not backend:
+            if _E3J_OPS_AVAILABLE:
+                backend = "gpu"
+            if _TPU_AVAILABLE:
+                backend = "tpu"
+
+        if backend == "gpu" and _E3J_OPS_AVAILABLE:
+            return Config(
+                tensor_product=TensorProduct.FUSED,
+                convolution=Convolution.FUSED_CUDA,
+            )
+        if backend == "tpu" and _TPU_AVAILABLE:
+            return Config(
+                tensor_product=TensorProduct.FUSED_MOSAIC_TPU,
+                convolution=Convolution.FUSED_MOSAIC_TPU,
+            )
+
+        return Config()
 
     @classmethod
     def fields(cls):

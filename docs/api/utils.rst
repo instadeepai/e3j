@@ -16,11 +16,15 @@ Configuration
 
     config.Config
     config.config
-    options.TensorProduct
-    options.Aggregation
     options.Layout
     options.TPMode
+    options.TensorProduct
+    options.Convolution
+    options.GraphOrdering
+    options.Aggregation
     options.TPNormalization
+    options.LinearInitialization
+    options.LinearIndexwiseInitialization
 
 Utilities
 ---------

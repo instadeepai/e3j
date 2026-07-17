@@ -15,8 +15,7 @@
 
     .. autosummary::
     {% for item in all_methods %}
-        {% if not item.startswith('_') or item in ['__init__',
-                                                    '__len__',
+        {% if not item.startswith('_') or item in ['__len__',
                                                     '__call__',
                                                     '__iter__',
                                                     '__getitem__',

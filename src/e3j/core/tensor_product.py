@@ -42,11 +42,13 @@ from .permutation import Permutation
 
 
 class TensorProduct(SparseMixin):
-    """Bilinear tensor products.
+    r"""Bilinear tensor products.
 
-    This class implements (equivariant) bilinear maps of the form::
+    This class implements (equivariant) bilinear maps of the form
 
-        z[:,i] = Σⱼₖ c[i,j,k] * x[:,j] * y[:,k],
+    .. math::
+
+        z_i = \sum_{jk} c_{ijk}\, x_j\, y_k,
 
     defined by a 3D coefficient array `c` in sparse BCOO format.
 
@@ -187,11 +189,10 @@ class TensorProduct(SparseMixin):
         return O3Space.otimes(source[0], source[1], target, sort)
 
     def sort(self) -> "TensorProduct":
-        """Sort irreducible output blocks.
+        """Sort irreducible output blocks by degree and parity.
 
-        In contrast with `e3nn`, the reordering of output coordinates is
-        performed once and for all on the full coefficient tensor,
-        avoiding the associated overhead at evaluation time.
+        The ordering agrees with `e3nn`. It is performed once for all
+        on the coefficient tensor by permuting target coordinates.
         """
         perm = Permutation.sort(self.target)
         if not self.is_dense:

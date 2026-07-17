@@ -86,15 +86,6 @@ __global__ void kernel_bwd(
 
     using Coef = Coef<Idx,Val>;
 
-    // Map threads to (x,y,z) channels.
-    // Number of parallel channel triplets is k.total
-    Channels k_dx = Channels::get<dxMode, N>(
-        threadIdx.x, dz.shape[1], y.shape[1], dx.shape[1]
-    );
-    Channels k_dy = Channels::get<dyMode, N>(
-        threadIdx.x, dz.shape[1], x.shape[1], dy.shape[1]
-    );
-
     unsigned int size_x = x.size(),
                  size_y = y.size(),
                  size_z = dz.size();
@@ -188,7 +179,7 @@ __global__ void kernel_bwd(
 
             // Compute dx = otimes(dz, y)
             otimes<Idx,Val,dxMode, N, inner_dx>(
-                coef_dx, coef_range_dx, smem.dz, smem.y, dx_s, k_dx, smem.dxy
+                coef_dx, coef_range_dx, smem.dz, smem.y, dx_s, smem.dxy
             );
 
             // Drain x
@@ -196,7 +187,7 @@ __global__ void kernel_bwd(
 
             // Compute dy = otimes(dz, x)
             otimes<Idx,Val,dyMode, N, inner_dy>(
-                coef_dy, coef_range_dy, smem.dz, smem.x, dy_s, k_dy, smem.dxy
+                coef_dy, coef_range_dy, smem.dz, smem.x, dy_s, smem.dxy
             );
 
             __syncthreads();

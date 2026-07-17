@@ -10,10 +10,11 @@ and open-source CUDA and Pallas kernels for GPU and TPU.
 
 The equivariance backend of our MLIP library is [e3j] as of [mlip] 0.2.0.
 
-> **Note:** `e3j` is currently in pre-release,
-> with version 0.1.0 planned for early June 2026.
+> **Note:** `e3j` is currently in pre-release (0.1.0b5),
+> with version 0.1.0 planned in July 2026.
 > Additional CUDA kernels and dedicated Pallas kernels for TPU
-> will be rolled out progressively.
+> are being rolled out progressively, supporting infinite differentiability
+> and SPMD support.
 
 [e3nn]: https://github.com/e3nn/e3nn-jax
 [e3x]: https://github.com/google-research/e3x

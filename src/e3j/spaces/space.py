@@ -80,7 +80,6 @@ class Space(abc.ABC):
     def slices(self) -> list[slice]: ...
 
 
-# TODO: consider merging with Space which has
 class IrrepSum(Space, abc.ABC, Generic[IrrepT]):
     """Base class representing sums of irreducible blocks.
 
@@ -112,6 +111,11 @@ class IrrepSum(Space, abc.ABC, Generic[IrrepT]):
     def dim(self) -> int:
         """Dimension of the representation."""
         return sum(m * ir.dim for m, ir in self)
+
+    @property
+    def num_irreps(self) -> int:
+        """Number of irreducible subspaces."""
+        return sum(m for m, _ in self.blocks)
 
     def __iter__(self) -> Iterator[tuple[int, IrrepT]]:
         """Yield (mul, ir) pairs of irreducible spaces with multiplicity."""

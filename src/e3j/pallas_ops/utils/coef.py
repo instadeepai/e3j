@@ -15,6 +15,7 @@
 """Coefficient helpers shared across Pallas kernels."""
 
 from collections import defaultdict
+from itertools import groupby
 from typing import NamedTuple, TypeAlias
 
 import numpy as np
@@ -54,6 +55,11 @@ CoefByZi: TypeAlias = dict[int, list[ZiContribution]]
 #: Contributions grouped by x-input index `xi`, sorted by key.
 CoefByXi: TypeAlias = dict[int, list[XiContribution]]
 
+#: Per output index `zi`, its `xi` groups, each with its `(yi, value)` paths.
+CoefByZiThenXi: TypeAlias = tuple[
+    tuple[int, tuple[tuple[int, tuple[tuple[int, float], ...]], ...]], ...
+]
+
 
 def group_coef_by_zi(indices: np.ndarray, values: np.ndarray) -> CoefByZi:
     """Group coefficients by z index for static unrolling.
@@ -87,3 +93,30 @@ def group_coef_by_xi(indices: np.ndarray, values: np.ndarray) -> CoefByXi:
     for (zi, xi, yi), v in zip(indices.tolist(), values.tolist()):
         by_xi[xi].append(XiContribution(zi, yi, float(v)))
     return dict(sorted(by_xi.items()))
+
+
+def group_coef_by_zi_then_xi(indices: np.ndarray, values: np.ndarray) -> CoefByZiThenXi:
+    """Group coefficients by output index `zi`, then by x-input index `xi`.
+
+    Nests `group_coef_by_zi` one level deeper so a kernel can load each `x[xi]`
+    tile once and reuse it across its `yi` paths.
+
+    Args:
+        indices: `(nnz, 3)` COO index array; each row is `(zi, xi, yi)`.
+        values: `(nnz,)` coefficient values aligned with `indices`.
+
+    Returns:
+        `((zi, ((xi, ((yi, value), ...)), ...)), ...)`, sorted by `zi` then `xi`.
+    """
+    return tuple(
+        (
+            zi,
+            tuple(
+                (xi, tuple((c.yi, c.value) for c in grp))
+                for xi, grp in groupby(
+                    sorted(contribs, key=lambda c: c.xi), key=lambda c: c.xi
+                )
+            ),
+        )
+        for zi, contribs in group_coef_by_zi(indices, values).items()
+    )

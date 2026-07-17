@@ -259,7 +259,7 @@ Vec<T> transpose_trailing_axes(Vec<T> vec, int n_2, int n_1) {
 template <typename T>
 std::ostream& showLine (std::ostream& out, T* v, int n, int width = 4) {
     for (int i = 0; i < n; i++) {
-        out << std::setw(width) << v[i] << (i < n - 1 ? " " : "");
+        out << std::setw(width) << +v[i] << (i < n - 1 ? " " : "");
     }
     return out;
 }

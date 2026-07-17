@@ -64,11 +64,11 @@ namespace tensor_product {
     // to claim the nearest cut at each output-index boundary.
     // smem_cuts: int[blockDim.y + 1] scratch in shared memory.
     // Assumes num_coef < 2^16.
-    template<typename Idx, typename Val>
+    template<typename Idx, typename Val, template<typename,typename> class CoefT=Coef>
     __device__ CoefRange
     find_coef_bounds(
         int *smem_cuts,
-        const Coef<Idx, Val> *coef,
+        const CoefT<Idx, Val> *coef,
         int num_coef,
         int num_out
     ) {

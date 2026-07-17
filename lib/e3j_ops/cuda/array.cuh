@@ -71,6 +71,17 @@ struct CuArray2D {
             );
     }
 
+    // Load a 2D slice from a GMEM CuArray2D and random row index.
+    //
+    // NOTE: The `row * size()` address must be computed in 64 bit to avoid overflows
+    //       and segmentation faults on large graphs and feature sizes.
+    template<int N=1>
+    __device__ void load(CuArray2D<const T> &src, size_t row) {
+        src.data += row * src.size();
+        load<N>(src);
+        src.data -= row * src.size();
+    }
+
     // Store a 2D array to global memory (inline copy with striding support).
     __device__ void store(CuArray2D<T> dst) {
         if (shape[1] == dst.shape[1])
@@ -81,6 +92,16 @@ struct CuArray2D {
             utils::copy_strided(
                 dst.data, data, shape[0], dst.shape[1], shape[1]
             );
+    }
+
+    // Store a 2D slice to a GMEM CuArray2D at a random row index.
+    //
+    // NOTE: The `row * size()` address must be computed in 64 bit to avoid overflows
+    //       and segmentation faults on large graphs and feature sizes.
+    __device__ void store(CuArray2D<T> &dst, size_t row) {
+        dst.data += row * dst.size();
+        store(dst);
+        dst.data -= row * dst.size();
     }
 
 };

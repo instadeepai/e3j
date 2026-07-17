@@ -86,21 +86,67 @@ class PowerExpansion:
     def target(self) -> tuple[O3Space, ...]:
         return tuple(layer.target for layer in self.filter_layers())
 
-    def get_target_filter(self, power: int) -> str | O3Space | None:
-        """Return filter on irreducible blocks at given step."""
-        if power == self.exponent and self.target_filter is not None:
-            return self.target_filter
-        if power == self.exponent and self.target_filter is None:
-            return irrep_range(self.source.l_max * self.exponent, True)
+    def _final_target(self) -> O3Space:
+        """Filter applied to the final, full-exponent output."""
         if self.target_filter is not None:
-            # l_max - p * l_max_in <= l_max_out
-            l_max_out = O3Space(self.target_filter).l_max
-            l_max_in = self.source.l_max
-            l_max = l_max_out + l_max_in * (self.exponent - power)
+            return self.target_filter
+        return irrep_range(self.source.l_max * self.exponent, True)
+
+    def _reachable_filter(self, power: int) -> O3Space:
+        """Irreps at `power` that can still contribute to the final output.
+
+        This method prunes:
+        * high-degree blocks that cannot descend to target degrees,
+        * low-degree blocks that cannot climb to target degrees,
+        * blocks whose parity cannot match a target block.
+
+        We grow the target set *backwards* by `source`, one product at a time,
+        tracking both degree **and** parity, and keep the union over every
+        remaining product count (a block may feed the output of any later
+        power). This prunes, beyond the plain degree upper bound:
+
+        * low-degree blocks that can never climb up to the target, and
+        * blocks whose parity can never match a target block.
+
+        The global `l_max` threshold caps the *hidden* blocks reached while
+        climbing; the target blocks themselves are always kept.
+        """
+        target = self._final_target()
+        source_irreps = {(ir.l, ir.p) for _, ir in self.source}
+        # j = 0: blocks already in the target are output as-is at this power.
+        reachable = {(ir.l, ir.p) for _, ir in target}
+        frontier = set(reachable)
+        for _ in range(self.exponent - power):
+            # (l, p) * (s, ps) overlaps a frontier block (L, pL) iff
+            # l in [|L - s|, L + s] and p * ps = pL  <=>  p = pL * ps.
+            nxt = set()
+            for ell, par in frontier:
+                for s, ps in source_irreps:
+                    p = par * ps
+                    for l in range(abs(ell - s), ell + s + 1):
+                        nxt.add((l, p))
             if self.l_max is not None:
-                l_max = min(l_max, self.l_max)
-            return irrep_range(l_max, True)
-        return None
+                nxt = {(l, p) for l, p in nxt if l <= self.l_max}
+            frontier = nxt
+            reachable |= frontier
+        return O3Space([(1, (l, p)) for l, p in sorted(reachable)])
+
+    def get_target_filter(self, power: int) -> O3Space | None:
+        """Return filter on irreducible blocks at given step.
+
+        When a `target_filter` is set, the filter keeps exactly the irreps that
+        can still reach the final output after the remaining tensor products,
+        pruning both low-degree blocks that can never climb to the target and
+        blocks of the wrong parity (see :meth:`_reachable_filter`).
+        """
+        if self.target_filter is not None:
+            return self._reachable_filter(power)
+        # No target filter: keep everything, optionally capped by `l_max`.
+        if power == self.exponent:
+            return self._final_target()
+        if self.l_max is None:
+            return None
+        return irrep_range(self.l_max, True)
 
     @functools.cache
     def filter_layers(self) -> list[Filter]:
@@ -128,16 +174,12 @@ class PowerExpansion:
         for nu in range(2, self.exponent + 1):
             # Filter output
             irreps_out = self.get_target_filter(nu)
-            # TODO: support MAP mode with leading channels too, which allows
-            #       to unroll over the batch axis.
-            layout = Layout.parse(self.layout)
-            mode = TPMode.MAP if layout == Layout.TRAILING_CHANNELS else TPMode.OUTER
             # Accumulate TP layer
             otimes = TensorProduct(
                 (irrep_nu, self.source),
                 irreps_out,
                 layout=self.layout,
-                mode=mode,
+                mode=TPMode.MAP,
             )
             irrep_nu = otimes.target
             layers.append(otimes)

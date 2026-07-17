@@ -71,15 +71,30 @@ __device__ Vect<N, Val> mul(Vect<N, Val> a, Vect<N, Val> b) {
     }
 }
 
-// Fused multiply-add: acc[i] += a * b[i]  (scalar a, Vect b).
+// Fused multiply-add: acc[i] += a[i] * b[i].
 // Uses __fmaf_rn to emit FFMA instead of FMUL+FADD, eliminating the
 // intermediate prod[] register and halving FP instruction count on the
 // hot accumulation path (N=4: saves 4 FADD per coefficient iteration).
 template<int N, typename Val>
-__device__ void fmadd(Vect<N, Val> &acc, Val a, Vect<N, Val> b) {
+__device__ void fmadd(Vect<N, Val> &acc, Vect<N, Val> a, Vect<N, Val> b) {
     if constexpr (N == 1) {
         acc = __fmaf_rn(a, b, acc);
     } else if constexpr (N == 2) {
+        acc.x = __fmaf_rn(a.x, b.x, acc.x);
+        acc.y = __fmaf_rn(a.y, b.y, acc.y);
+    } else {
+        acc.x = __fmaf_rn(a.x, b.x, acc.x);
+        acc.y = __fmaf_rn(a.y, b.y, acc.y);
+        acc.z = __fmaf_rn(a.z, b.z, acc.z);
+        acc.w = __fmaf_rn(a.w, b.w, acc.w);
+    }
+}
+
+// Fused multiply-add: acc[i] += a * b[i]  (scalar a broadcast).
+// Disabled for N=1 where Vect<1,Val> = Val would conflict with the above.
+template<int N, typename Val, std::enable_if_t<(N > 1), int> = 0>
+__device__ void fmadd(Vect<N, Val> &acc, Val a, Vect<N, Val> b) {
+    if constexpr (N == 2) {
         acc.x = __fmaf_rn(a, b.x, acc.x);
         acc.y = __fmaf_rn(a, b.y, acc.y);
     } else {
@@ -156,7 +171,20 @@ template <int N=1, typename T>
 __device__ void copy_pipe(T* dst, const T* src, const int numel) {
     int tid = threadIdx.x + threadIdx.y * blockDim.x;
     int dim = blockDim.x * blockDim.y;
-    if constexpr (N > 1) {
+    // cp.async supports 4, 8, or 16 byte copies.
+    constexpr size_t cp_size = sizeof(T) * N;
+    if constexpr (cp_size > 16) {
+        static_assert(cp_size % 16 == 0);
+        constexpr int K = cp_size / 16;
+        int4 *dst4 = reinterpret_cast<int4*>(dst);
+        const int4 *src4 = reinterpret_cast<const int4*>(src);
+        #pragma unroll 1
+        for (int i = tid * K; i < numel * K; i += dim * K) {
+            #pragma unroll
+            for (int k = 0; k < K; k++)
+                __pipeline_memcpy_async(&dst4[i + k], &src4[i + k], 16);
+        }
+    } else if constexpr (N > 1) {
         int aligned = (numel / N) * N;
         #pragma unroll 1
         for (int i = tid * N; i < aligned; i += dim * N) {
@@ -237,11 +265,30 @@ __device__ void copy_strided(
     }
 }
 
-// Used to flush SMEM buffer.
+// Scalar fill with a 1D block along blockDim.x.
 template <typename T>
 __device__ void fill(T* dst, const T value, const int numel) {
     for (int col = threadIdx.x; col < numel; col += blockDim.x) {
         dst[col] = value;
+    }
+}
+
+// Vectorized fill (N-wide stores, full 2D block).
+template <int N, typename T>
+__device__ void fill(T* dst, const T value, const int numel) {
+    int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    int dim = blockDim.x * blockDim.y;
+    if constexpr (N > 1) {
+        Vect<N, T> v = broadcast<N, T>(value);
+        Vect<N, T>* out = reinterpret_cast<Vect<N, T>*>(dst);
+        int aligned = numel / N;
+        for (int i = tid; i < aligned; i += dim)
+            out[i] = v;
+        for (int i = aligned * N + tid; i < numel; i += dim)
+            dst[i] = value;
+    } else {
+        for (int i = tid; i < numel; i += dim)
+            dst[i] = value;
     }
 }
 

@@ -22,7 +22,7 @@ from e3j.utils.spherical_harmonics import Y
 
 
 class Harmonics:
-    """Evaluation module for harmonic polynomials.
+    r"""Evaluation module for harmonic polynomials.
 
     This class provides additional control and options over polynomial
     evaluation, e.g. by safely projecting inputs on the S2 sphere of
@@ -38,7 +38,7 @@ class Harmonics:
         momentum-dependent normalization factor,
     real : `bool`
         use real spherical harmonics :math:`Y_{lm}` by default, switch off for
-        complex eigenvalues :math:`Y_l^m = |lm⟩` of :math:`J_z, J^2`.
+        complex eigenvalues :math:`Y_l^m = |lm\rangle` of :math:`J_z, J^2`.
     """
 
     def __init__(

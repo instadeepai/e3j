@@ -41,6 +41,8 @@
 #include "cuda/scatter_add.cuh"
 #include "cuda/tensor_product.cuh"
 #include "cuda/tensor_product_bwd.cuh"
+#include "cuda/convolution.cuh"
+#include "cuda/convolution_bwd.cuh"
 
 /* Boilerplate DTYPE macros are now in dispatch_macros.h:
  *
@@ -58,6 +60,14 @@
  */
 
 namespace e3j_ops {
+
+namespace {
+
+    // NOTE: only power of 2 number of channels well supported for now.
+    constexpr bool is_pow_2 (int n) {
+        return n > 0 && (n & (n - 1)) == 0;
+    }
+}
 
 namespace xla = xla::ffi;
 
@@ -155,27 +165,19 @@ xla::Error TensorProductHandler(
             return e3j::Error::InvalidArgument("Invalid tensor product layout.").to_xla();
     }
 
-    // FIXME: support non-32 multiples with TRAILING_CHANNELS
+    // FIXME: support arbitrary numbers of channels in TRAILING_CHANNELS layout.
     if (layout == Layout::TRAILING_CHANNELS) {
-        // Assert channels are 32-multiple or 1 in Mode::OUTER
-        if (
-            mode == Mode::OUTER
-            and (channels_x % 32 != 0 or channels_x == 1)
-            and (channels_y % 32 != 0 or channels_y == 1)
-        ) {
+        // Assert channels are powers of 2 in Mode::OUTER
+        if (mode == Mode::OUTER and not (is_pow_2(channels_x) and is_pow_2(channels_y))) {
             std::string msg =
-                "TRAILING_CHANNELS requires 32 multiple as LHS channels "
-                "broadcast with 1 RHS channel with mode OUTER. Got ("
+                "TRAILING_CHANNELS requires powers of 2 as LHS and RHS channels."
                 + std::to_string(channels_x) + ", " + std::to_string(channels_y) + ").";
             return e3j::Error::Unimplemented(msg).to_xla();
         }
-        // Assert channels are 32-multiples and match in Mode::MAP | Mode::INNER
-        else if (
-            mode != Mode::OUTER
-            and channels_x % 32 != 0 and channels_y != channels_x
-        ) {
+        // Assert channels are powers of 2 and match in Mode::MAP | Mode::INNER
+        if (mode != Mode::OUTER and not (is_pow_2(channels_x) and channels_x == channels_y)) {
             std::string msg =
-                "TRAILING_CHANNELS requires 32 multiple as LHS channels "
+                "TRAILING_CHANNELS requires power of 2 as LHS channels "
                 "and as many RHS channels with modes MAP | INNER. Got ("
                 + std::to_string(channels_x) + ", " + std::to_string(channels_y) + ").";
             return e3j::Error::Unimplemented(msg).to_xla();
@@ -351,6 +353,215 @@ XLA_FFI_DEFINE_HANDLER(
         .Ret<xla::AnyBuffer>()   // dy
         .Attr<int32_t>("mode")
         .Attr<int32_t>("layout")
+        .Attr<int32_t>("debug")
+);
+
+
+//===----------------------------------------------------------===//
+//  convolution
+//===----------------------------------------------------------===//
+xla::Error ConvolutionHandler(
+    cudaStream_t stream,
+    xla::AnyBuffer coef,
+    xla::AnyBuffer x,
+    xla::AnyBuffer y,
+    xla::AnyBuffer s,
+    xla::BufferR1<xla::DataType::S32> sender,
+    xla::BufferR1<xla::DataType::S32> receiver_ptr,
+    xla::Result<xla::AnyBuffer> out,
+    int32_t num_nodes,
+    int debug = 0
+) {
+
+    xla::AnyBuffer::Dimensions dims_x = x.dimensions();
+    xla::AnyBuffer::Dimensions dims_y = y.dimensions();
+
+    int32_t num_coef = coef.dimensions().front();
+    int32_t num_x = dims_x[1];
+    int32_t channels_x = dims_x.size() > 2 ? dims_x.back() : 1;
+    int32_t num_y = dims_y[1];
+    int32_t num_out = out->dimensions()[1];
+    int32_t num_scalars = s.dimensions()[1];
+
+    // Assert LHS channels are 32-multiple
+    bool supported = (is_pow_2(channels_x));
+    if (not supported) {
+        std::string msg =
+            "Convolution requires power of 2 as LHS channels for now. Got "
+            + std::to_string(channels_x) + ".\n";
+        return e3j::Error::Unimplemented(msg).to_xla();
+    }
+
+    #define DISPATCH_DTYPE_PAIR_ERROR(IDX_T, VAL_T)             \
+        return e3j::Error::InvalidArgument(                     \
+            "unsupported (IDX, VAL) dtype pair").to_xla();
+
+    #define DISPATCH_DTYPE_PAIR(Idx, Val)                       \
+        using Coef = e3j::convolution::Coef4D<Idx, Val>;       \
+        const Coef *coef_ptr = reinterpret_cast<const Coef*>(  \
+            coef.typed_data<Idx>()                              \
+        );                                                      \
+                                                                \
+        e3j::convolution::Params params = {                     \
+            .num_nodes = num_nodes,                             \
+            .num_coef = num_coef,                               \
+            .num_x = num_x,                                     \
+            .num_y = num_y,                                     \
+            .num_out = num_out,                                 \
+            .num_scalars = num_scalars,                         \
+            .channels_x = channels_x,                           \
+        };                                                      \
+                                                                \
+        e3j::convolution::AdjacencyCSR adj = {                  \
+            .sender = sender.typed_data(),                      \
+            .receiver_ptr = receiver_ptr.typed_data(),          \
+        };                                                      \
+                                                                \
+        return e3j::convolution::launch<Idx, Val>(              \
+            coef_ptr,                                           \
+            x.typed_data<Val>(),                                \
+            y.typed_data<Val>(),                                \
+            s.typed_data<Val>(),                                \
+            adj,                                                \
+            out->typed_data<Val>(),                             \
+            params, stream, debug                               \
+        ).to_xla();
+
+    __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
+    #undef DISPATCH_DTYPE_PAIR
+    #undef DISPATCH_DTYPE_PAIR_ERROR
+
+    return e3j::Error::Success().to_xla();
+}
+
+XLA_FFI_DEFINE_HANDLER(
+    xla_convolution,
+    ConvolutionHandler,
+    xla::Ffi::Bind()
+        .Ctx<xla::PlatformStream<cudaStream_t>>()
+        .Arg<xla::AnyBuffer>()   // coef (packed Coef4D<Idx,Val> as idx_t vector)
+        .Arg<xla::AnyBuffer>()   // x (node features)
+        .Arg<xla::AnyBuffer>()   // y (edge embeddings)
+        .Arg<xla::AnyBuffer>()   // s (radial scalars)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (CSR)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (CSR)
+        .Ret<xla::AnyBuffer>()   // out (output node features)
+        .Attr<int32_t>("num_nodes")
+        .Attr<int32_t>("debug")
+);
+
+
+//===----------------------------------------------------------===//
+//  convolution_bwd
+//===----------------------------------------------------------===//
+xla::Error ConvolutionBwdHandler(
+    cudaStream_t stream,
+    xla::AnyBuffer coef,
+    xla::AnyBuffer x,
+    xla::AnyBuffer y,
+    xla::AnyBuffer s,
+    xla::AnyBuffer dm,
+    xla::BufferR1<xla::DataType::S32> sender,
+    xla::BufferR1<xla::DataType::S32> receiver_ptr,
+    xla::BufferR1<xla::DataType::S32> edge_perm,
+    xla::Result<xla::AnyBuffer> dx,
+    xla::Result<xla::AnyBuffer> dy,
+    xla::Result<xla::AnyBuffer> ds,
+    int32_t num_nodes,
+    int debug = 0
+) {
+
+    xla::AnyBuffer::Dimensions dims_x = x.dimensions();
+    xla::AnyBuffer::Dimensions dims_y = y.dimensions();
+
+    // Robust to both concat (3*num_coef, numel) and stack (3, num_coef, numel)
+    int32_t numel = coef.dimensions().back();
+    int32_t num_coef = coef.element_count() / (3 * numel);
+    int32_t num_x = dims_x[1];
+    int32_t channels_x = dims_x.size() > 2 ? dims_x.back() : 1;
+    int32_t num_y = dims_y[1];
+    int32_t num_out = dm.dimensions()[1];
+    int32_t num_scalars = s.dimensions()[1];
+
+    // Assert LHS channels are 32-multiple
+    bool supported = (channels_x % 32 == 0);
+    if (not supported) {
+        std::string msg =
+            "Convolution backward requires 32 multiple as LHS channels. Got "
+            + std::to_string(channels_x) + ".\n";
+        return e3j::Error::Unimplemented(msg).to_xla();
+    }
+
+    #define DISPATCH_DTYPE_PAIR_ERROR(IDX_T, VAL_T)             \
+        return e3j::Error::InvalidArgument(                     \
+            "unsupported (IDX, VAL) dtype pair").to_xla();
+
+    #define DISPATCH_DTYPE_PAIR(Idx, Val)                       \
+        using Coef = e3j::convolution::Coef4D<Idx, Val>;       \
+        const Coef *coef_ptr = reinterpret_cast<const Coef*>(  \
+            coef.typed_data<Idx>()                              \
+        );                                                      \
+                                                                \
+        e3j::convolution::Params params = {                     \
+            .num_nodes = num_nodes,                             \
+            .num_coef = num_coef,                               \
+            .num_x = num_x,                                     \
+            .num_y = num_y,                                     \
+            .num_out = num_out,                                 \
+            .num_scalars = num_scalars,                         \
+            .channels_x = channels_x,                           \
+        };                                                      \
+                                                                \
+        e3j::convolution::AdjacencyCSR adj = {                  \
+            .sender = sender.typed_data(),                      \
+            .receiver_ptr = receiver_ptr.typed_data(),          \
+        };                                                      \
+                                                                \
+        /* NOTE: nullptr signaled by `np.zeros((0,), int32)`    \
+         *       through the FFI with SENDER graph ordering.    \
+         */                                                     \
+        const int32_t *edge_perm_ptr =                          \
+            edge_perm.element_count()                           \
+                ? edge_perm.typed_data() : nullptr;             \
+                                                                \
+        return e3j::convolution::launch_bwd<Idx, Val>(          \
+            coef_ptr,                                           \
+            x.typed_data<Val>(),                                \
+            y.typed_data<Val>(),                                \
+            s.typed_data<Val>(),                                \
+            dm.typed_data<Val>(),                               \
+            adj,                                                \
+            edge_perm_ptr,                                      \
+            dx->typed_data<Val>(),                              \
+            dy->typed_data<Val>(),                              \
+            ds->typed_data<Val>(),                              \
+            params, stream, debug                               \
+        ).to_xla();
+
+    __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
+    #undef DISPATCH_DTYPE_PAIR
+    #undef DISPATCH_DTYPE_PAIR_ERROR
+
+    return e3j::Error::Success().to_xla();
+}
+
+XLA_FFI_DEFINE_HANDLER(
+    xla_convolution_bwd,
+    ConvolutionBwdHandler,
+    xla::Ffi::Bind()
+        .Ctx<xla::PlatformStream<cudaStream_t>>()
+        .Arg<xla::AnyBuffer>()   // coef (packed 3x Coef4D<Idx,Val>)
+        .Arg<xla::AnyBuffer>()   // x (node features)
+        .Arg<xla::AnyBuffer>()   // y (edge embeddings)
+        .Arg<xla::AnyBuffer>()   // s (radial scalars)
+        .Arg<xla::AnyBuffer>()   // dm (cotangent messages)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (transposed CSR)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (transposed CSR)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // edge_perm (transposed → original)
+        .Ret<xla::AnyBuffer>()   // dx (cotangent node features)
+        .Ret<xla::AnyBuffer>()   // dy (cotangent edge features)
+        .Ret<xla::AnyBuffer>()   // ds (cotangent edge scalars)
+        .Attr<int32_t>("num_nodes")
         .Attr<int32_t>("debug")
 );
 

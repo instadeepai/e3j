@@ -128,6 +128,28 @@ def test_backward_scatter_add_narrow_idx():
     np.testing.assert_allclose(grad_custom, grad_ref, rtol=1e-5, atol=1e-5)
 
 
+def test_forward_scatter_add_multi_strip_single_index():
+    """
+    Regression test stale-prefetch OOB lanes in the last strip of a
+    multi-strip row (num_idx > blockDim.x == 256) used to keep valid (idx, val) pairs
+    from an earlier strip, corrupting the warp reduction and over-counting the result.
+
+    Global sum-pooling of 300 elements into a single output index should give 300.
+    """
+    num_idx = 300  # > blockDim.x (256) => two strips, triggers the bug
+    idx = jnp.zeros(num_idx, dtype=jnp.int32)
+    src = jnp.ones((1, num_idx), dtype=jnp.float32)
+    out_init = jnp.zeros((1, 1), dtype=jnp.float32)
+
+    out_custom = scatter_add_1(idx, src, out_init)
+    out_ref = scatter_add_reference(idx, src, out_init)
+
+    np.testing.assert_allclose(out_custom, out_ref, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        out_custom, jnp.array([[float(num_idx)]]), rtol=1e-5, atol=1e-5
+    )
+
+
 if __name__ == "__main__":
     test_forward_scatter_add()
     test_backward_scatter_add()

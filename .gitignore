@@ -22,7 +22,7 @@ notes.jl
 docs/_build
 docs/img/*
 outputs/
-
+media/
 traces/
 *.ncu-rep
 

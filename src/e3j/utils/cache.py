@@ -20,7 +20,8 @@ class cache:
 
     Use as a decorator around the getter method or property:
 
-    .. code-block::python
+    .. code-block:: python
+
         class TensorProduct:
 
             @cache
@@ -38,6 +39,7 @@ class cache:
         self.getter = getter
         self.name = getter.__name__
         self._name = "_" + self.name
+        self.__doc__ = getter.__doc__
 
     def __get__(self, obj, objtype=None):
         if obj is None:

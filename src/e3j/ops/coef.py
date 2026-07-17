@@ -13,27 +13,35 @@
 # limitations under the License.
 
 """
-Example:
+Structured dtype arrays used to pack sparse COO coefficients.
+
+While Numpy supports structured dtype such as:
 
     _Coef = numpy.dtype([
         ("val", "float32"), ("i", "int32"), ("j", "int32"), ("k", "int32")
     ])
+
+JAX does not, so we have to reinterpret_cast the packed Numpy array as
+an opaque `idx_t*` array to pass coefficients through the XLA-FFI call.
 """
 
 from enum import Enum
+from typing import ClassVar, Self
 
 import jax
 import jax.numpy as jnp
 import numpy
 from flax import struct
 
-# TODO: add support for F16 and/or BF16
+from e3j.utils import next_pow2
 
 
 class ValDtype(Enum):
     """Scalar value dtypes supported by the e3j_ops binary."""
 
     F32 = "float32"
+
+    # TODO: add support for F16 and/or BF16
 
     def __str__(self):
         return self.value
@@ -44,11 +52,8 @@ class IdxDtype(Enum):
 
     I32 = "int32"
     U8 = "uint8"
-    # U16 = "uint16"  # disabled: sizeof mismatch between CUDA (16 B, alignas
-    # inflated) and numpy align=True (12 B) corrupts every entry after index 0.
-    # No memory saving vs I32 either. Fix _numpy_dtype to use explicit
-    # next_pow2 itemsize before re-adding; restore in dispatch_macros.h too.
-    # Think about: SoA layout removes the negotiation entirely. See todo.md.
+
+    # TODO: reintroduce support for U16
 
     def __str__(self):
         return self.value
@@ -64,6 +69,10 @@ class Coef:
 
     It is therefore assumed that the size of indices divides the size of values,
     i.e. `val_dtype % idx_dtype == 0`.
+
+    Note:
+        The base class assumes 3D coefficients for bilinear Clebsch-Gordan
+        tensor products by default.
     """
 
     val: jnp.ndarray | numpy.ndarray
@@ -72,23 +81,32 @@ class Coef:
     val_dtype: ValDtype | str = "float32"
     idx_dtype: IdxDtype | str = "int32"
 
+    rank: ClassVar[int] = 3
+    index_names: ClassVar[list[str]] = ["i", "j", "k"]
+
     @property
     def dtype(self) -> numpy.dtype:
         val_t = ValDtype(self.val_dtype).value
         idx_t = IdxDtype(self.idx_dtype).value
         return self._numpy_dtype(val_t, idx_t)
 
-    @staticmethod
-    def _numpy_dtype(val_t: numpy.dtype, idx_t: numpy.dtype) -> numpy.dtype:
-        return numpy.dtype(
-            [
-                ("val", val_t),
-                ("i", idx_t),
-                ("j", idx_t),
-                ("k", idx_t),
-            ],
-            align=True,
-        )
+    @classmethod
+    def _numpy_dtype(cls, val_t: numpy.dtype, idx_t: numpy.dtype) -> numpy.dtype:
+        """Structured dtype matching CUDA `alignas(next_pow2(...))` layout."""
+        val_t, idx_t = numpy.dtype(val_t), numpy.dtype(idx_t)
+        fields = [("val", val_t)] + [(name, idx_t) for name in cls.index_names]
+        dt = numpy.dtype(fields, align=True)
+        target = next_pow2(val_t.itemsize + cls.rank * idx_t.itemsize)
+        if dt.itemsize < target:
+            dt = numpy.dtype(
+                {
+                    "names": dt.names,
+                    "formats": [dt.fields[n][0] for n in dt.names],
+                    "offsets": [dt.fields[n][1] for n in dt.names],
+                    "itemsize": target,
+                }
+            )
+        return dt
 
     def __post_init__(self):
         # Normalize and validate dtypes:
@@ -98,14 +116,14 @@ class Coef:
         object.__setattr__(self, "val_dtype", val_t)
         object.__setattr__(self, "idx_dtype", idx_t)
         assert self.idx.shape[:-1] == self.val.shape
-        assert self.idx.shape[-1] == 3
+        assert self.idx.shape[-1] == self.rank
 
-    def to_numpy(self) -> "Coef":
-        return Coef(self.val.__array__(), self.idx.__array__())
+    def to_numpy(self) -> Self:
+        return self.__class__(self.val.__array__(), self.idx.__array__())
 
     def pack_numpy(self) -> numpy.ndarray:
         return numpy.array(
-            [(val, i, j, k) for val, (i, j, k) in self],
+            [(val, *idx) for val, idx in self],
             dtype=self.dtype,
         )
 
@@ -122,22 +140,24 @@ class Coef:
         coef_cast = coef_np.view(idx_t).reshape(-1, numel)
         return jnp.asarray(coef_cast)
 
-    def transpose(self, argnums: tuple[int, int, int]) -> "Coef":
+    def transpose(self, argnums: tuple[int, int, int]) -> Self:
         """Transposed COO coefficients with sorted indices and values."""
         # Note: Lexsorting indices *might* reduce bank conflicts.
         val, idx = self.val, self.idx.T
-        a, b, c = argnums
-        sigma = jnp.argsort(idx[a])
-        val_abc = val[sigma]
-        idx_abc = jnp.stack([idx[a][sigma], idx[b][sigma], idx[c][sigma]])
-        return Coef(val_abc, idx_abc.T)
+        first = argnums[0]
+        sigma = jnp.argsort(idx[first])
+        val_sorted = val[sigma]
+        idx_sorted = jnp.stack([idx[i][sigma] for i in argnums])
+        return self.__class__(
+            val_sorted, idx_sorted.T, val_dtype=self.val_dtype, idx_dtype=self.idx_dtype
+        )
 
     @classmethod
     def unpack(
         cls,
         data: jax.Array | numpy.ndarray,
         val_dtype: ValDtype | str,
-    ) -> "Coef":
+    ) -> Self:
         """Unpack a packed array into (val, idx) pair.
 
         Args:
@@ -167,10 +187,21 @@ class Coef:
         # Slice N values
         val_as_idx = data[:, :numval]
         val = val_as_idx.view(dtype=val_t).reshape(-1)
-        # Retrieve 3 index columns, skipping any trailing padding.
-        idx = data[:, numval : numval + 3]
+        # Retrieve `cls.rank` index columns, skipping any trailing padding.
+        idx = data[:, numval : numval + cls.rank]
         return cls(val, idx, val_dtype=val_t, idx_dtype=idx_t)
 
     def __iter__(self):
         """Yield `val, (i, j, k)` value/3D-index pairs."""
         return zip(self.val, self.idx)
+
+
+@struct.dataclass
+class Coef4D(Coef):
+    """Interface between a 4D JAX-native BCOO format and a packed representation.
+
+    See :class:`Coef` for more details.
+    """
+
+    rank: ClassVar[int] = 4
+    index_names: ClassVar[list[str]] = ["i", "j", "k", "l"]
