@@ -160,18 +160,6 @@ class TensorProduct(SparseMixin):
                 other = self.sort()
                 self.target, self.coef = other.target, other.coef
 
-    @property
-    def is_dense(self):
-        return self.config.tensor_product == options.TensorProduct.DENSE
-
-    @property
-    def is_fused(self):
-        return self.config.tensor_product == options.TensorProduct.FUSED_CUDA
-
-    @property
-    def is_mtpu(self):
-        return self.config.tensor_product == options.TensorProduct.FUSED_MOSAIC_TPU
-
     @classmethod
     def infer_target(
         cls,
@@ -194,15 +182,16 @@ class TensorProduct(SparseMixin):
         on the coefficient tensor by permuting target coordinates.
         """
         perm = Permutation.sort(self.target)
-        if not self.is_dense:
+        if self.config.tensor_product == options.TensorProduct.DENSE:
+            coef = self.coef[perm.sigma]
+        else:
             idx_out = perm.sigma_1[self.indices[:, 0]]
             indices = np.concat(
                 (idx_out[:, None], self.indices[:, 1:]),
                 axis=-1,
             )
             coef = sparse_bcoo(self.values, indices, self.shape)
-        else:
-            coef = self.coef[perm.sigma]
+
         return self.__class__(
             self.source,
             perm.target,
@@ -284,7 +273,7 @@ class TensorProduct(SparseMixin):
 
         return sparse_bcoo(values, indices, shape)
 
-    def dense_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _dense_eval(self, x: Array, y: Array, coef: Array) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         return np.einsum("ijk, ...j, ...k -> ...i", coef, x, y)
 
@@ -308,7 +297,7 @@ class TensorProduct(SparseMixin):
             return x[..., None], y
         raise ValueError(f"Incompatible operand ranks: {x.ndim} vs {y.ndim}")
 
-    def sparse_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _sparse_eval(self, x: Array, y: Array, coef: Array) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         ijk, c_ijk = coef.indices, coef.data
         # Gather inputs
@@ -329,7 +318,7 @@ class TensorProduct(SparseMixin):
         # Note: can't be staticmethod there because of SparseMixin
         return self.aggregate(cxy_ijk, layout=self.layout)
 
-    def fused_eval(
+    def _fused_eval(
         self,
         x: Array,
         y: Array,
@@ -376,9 +365,8 @@ class TensorProduct(SparseMixin):
             z_space=self.target,
         )
 
-    def mtpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _mtpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
         """Evaluate bilinear map via the Pallas Mosaic TPU kernel."""
-
         params = self._mtpu_params(coef)
         return tensor_product_pallas_mosaic_tpu(x, y, params)
 
@@ -388,11 +376,14 @@ class TensorProduct(SparseMixin):
         if coef is None:
             coef = self.coef
         # Algorithm branching
-        if self.is_dense:
-            return self.dense_eval(x, y, coef)
-        if self.is_fused:
-            return self.fused_eval(x, y, coef)
-        if self.is_mtpu:
-            return self.mtpu_eval(x, y, coef)
-        else:
-            return self.sparse_eval(x, y, coef)
+        impl = self.config.tensor_product
+        match impl:
+            case options.TensorProduct.DENSE:
+                return self._dense_eval(x, y, coef)
+            case options.TensorProduct.FUSED_CUDA:
+                return self._fused_eval(x, y, coef)
+            case options.TensorProduct.FUSED_MOSAIC_TPU:
+                return self._mtpu_eval(x, y, coef)
+            case options.TensorProduct.UNFUSED:
+                return self._sparse_eval(x, y, coef)
+        raise ValueError(f"Unrecognized tensor product option: {impl}")
