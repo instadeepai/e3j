@@ -595,7 +595,8 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         num_channels_vmem: int,
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
-        return {yi: y_vmem[:, yi, :] for yi in yis}
+        y_t = jax.lax.transpose(y_vmem[...], (1, 0, 2))
+        return {yi: y_t[yi, :, :] for yi in yis}
 
     def write_dy(
         self,
