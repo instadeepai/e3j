@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import jax
 import jax.experimental.custom_partitioning
 import jax.numpy as jnp
+import numpy
 from jax import Array, custom_vjp
 from jax.ffi import ffi_call
 from numpy import int32
@@ -62,7 +63,7 @@ def convolution(
     receiver: Array,
     params: CUDAConvolutionParams,
     graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
-    y_parity: Array | None = None,
+    y_parity: numpy.ndarray | None = None,
 ) -> Array:
     """Primitive bound to the CUDA convolution kernel.
 
@@ -249,7 +250,7 @@ def convolution_bwd(
     dm,
     params,
     graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
-    y_parity: Array | None = None,
+    y_parity: numpy.ndarray | None = None,
 ):
     """Primitive bound to the CUDA convolution backward kernel.
 

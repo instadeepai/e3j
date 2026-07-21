@@ -14,7 +14,7 @@
 
 import jax
 import jax.numpy as np
-import numpy as onp
+import numpy
 from jax import Array
 
 from e3j import utils
@@ -211,9 +211,9 @@ class Convolution:
         y_parity = None
         if self.graph_ordering == options.GraphOrdering.SENDER:
             y_space = self._otimes.source[1]
-            y_parity = np.concatenate(
+            y_parity = numpy.concatenate(
                 [
-                    np.full(m * ir.dim, float(ir.p), dtype=np.float32)
+                    numpy.full(m * ir.dim, float(ir.p), dtype=numpy.float32)
                     for m, ir in y_space
                 ]
             )
@@ -257,8 +257,8 @@ class Convolution:
         coef = self._otimes.coef
         params = (
             PallasMosaicTPUMessagePassingConvolutionParams.build_from_sender_sorted(
-                indices=onp.array(coef.indices),
-                values=onp.array(coef.data),
+                indices=numpy.array(coef.indices),
+                values=numpy.array(coef.data),
                 x_space=O3Space(str(self._otimes.source[0])),
                 y_space=O3Space(str(self._otimes.source[1])),
                 z_space=O3Space(str(self._otimes.target)),
