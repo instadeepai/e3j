@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import e3nn_jax as e3nn
 import jax.numpy as np
 
 from e3j.core.polynomials import Polynomial
