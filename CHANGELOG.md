@@ -47,6 +47,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   left it 8-byte aligned for `N < 4` with odd coefficient counts. Padding is
   now unified through a `utils::smem_align()` helper that always rounds up to
   16 bytes, matching the vectorized `LDS.128` / `int4` `cp.async` accesses.
+- *Breaking Change* `e3j.core.Harmonics` now reproduces `e3nn.spherical_harmonics` value-for-value
+  (for `normalization="integral"`, under the `y, z, x` axis ordering), instead of
+  only up to a per-channel sign. The real spherical harmonics were built with a
+  phase convention that differed from e3nn / the standard (Condon-Shortley) one by
+  a fixed per-`(l, m)` sign; that sign is now applied in the real-harmonic
+  construction (`utils.spherical_harmonics.Y`).
 
 ## [0.1.0b5] — 2026-07-17
 
