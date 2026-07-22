@@ -112,7 +112,7 @@ class Monomial:
         return self.exponentiate_and_multiply(x)
 
     def eval_coords(self, r: jax.Array) -> jax.Array:
-        if self.coords == "harmonic":
+        if isinstance(self.coords, str) and self.coords == "harmonic":
             x, y, z = r[..., 0], r[..., 1], r[..., 2]
             return np.stack([x + 1j * y, x - 1j * y, z], axis=-1)
         return r if r is None else r @ self.coords
@@ -415,7 +415,7 @@ class MonomialC(Monomial):
         self.coords = np.concat((coords.real, coords.imag), axis=-1)
 
     def eval_coords(self, r: jax.Array) -> jax.Array:
-        if self.coords == "harmonic":
+        if isinstance(self.coords, str) and self.coords == "harmonic":
             x, y, z = r[..., 0], r[..., 1], r[..., 2]
             o = np.zeros_like(z)
             return np.stack([x, x, z, y, -y, o], axis=-1)

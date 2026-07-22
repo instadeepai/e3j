@@ -15,7 +15,7 @@
 import functools
 
 import jax
-import jax.numpy as np
+import numpy as np
 
 from e3j.core.polynomials import Monomial, Polynomial
 from e3j.utils.factorials import bifact_even, bifact_odd
@@ -126,20 +126,7 @@ def c_(l: int, m: int) -> jax.Array:
     It measures the norm scaling of the non-unitary ladder operator J_ by:
 
         J_⋅|lm⟩ = c_(l, m) |l(m-1)⟩
-
-    Note
-    ----
-    When computing normalized gener ators `|lm⟩` by repeated application of
-    the ladder operator `J_`, the succession of square-roots / divisions will
-    yield unsatisfying numerical errors in single precision.
-
-    Set `JAX_ENABLE_X64=True` to force double precision.
     """
-    if jax.config.x64_enabled:
-        print("float64")
-    dtype = np.float64 if jax.config.x64_enabled else np.float32
-    l = np.array(l, dtype=dtype)
-    m = np.array(m, dtype=dtype)
     return np.sqrt((l + m) * (l - m + 1))
 
 
