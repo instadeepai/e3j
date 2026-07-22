@@ -359,6 +359,8 @@ class _MessagePassingFwdKernel:
                         copy.wait()
 
                 # ---- 1. Tensor product + scalar mixing ----
+                with named_scope("fwd_x_transpose"):
+                    x_plane = jnp.transpose(x_stage_vmem[:, :, :], (1, 0, 2))
                 message_by_zi = {}
                 with named_scope("fwd_tp_compute"):
                     for zi, by_xi in c.cg_groups:
@@ -366,7 +368,7 @@ class _MessagePassingFwdKernel:
                         edge_scalars_tile = edge_scalars_vmem[block, :, :]
                         tp_acc = jnp.zeros_like(edge_scalars_tile)
                         for xi, paths in by_xi:
-                            x_tile = x_stage_vmem[:, xi, :]
+                            x_tile = x_plane[xi, :, :]
                             for yi, v in paths:
                                 y_vec = y_vmem[yi, :]
                                 tp_acc = tp_acc + v * y_vec[:, None] * x_tile
