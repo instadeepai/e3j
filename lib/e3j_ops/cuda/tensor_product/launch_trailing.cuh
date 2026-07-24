@@ -62,8 +62,9 @@ struct LaunchConfig {
         if constexpr (kMode == Mode::INNER)
             sizeSMEM += sizeof(Val) * p.num_out * (1 + (p.channels_x - 1) / (32 * N));
         if (BUFFER_FWD_COEFS_IN_SMEM) {
-            // Pad coef buffer to N-float boundary (same as kernel pointer logic).
-            size_t align = N * sizeof(Val);
+            // Pad coef buffer to 16 B (same as kernel pointer logic) so the
+            // x/y buffers that follow stay 16-byte aligned.
+            size_t align = SMEM_BUFFER_ALIGN;
             sizeSMEM += (sizeCoef + align - 1) & ~(align - 1);
         }
 

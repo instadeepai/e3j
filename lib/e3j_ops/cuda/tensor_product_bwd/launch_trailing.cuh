@@ -47,7 +47,7 @@ struct LaunchConfigBwd {
             size_z = (size_z_raw + (A-1)) & ~(A-1);
 
         size_t sizeCoef = sizeof(Coef<Idx,Val>) * 2 * p.num_idx;
-        size_t align = N * sizeof(Val);
+        size_t align = SMEM_BUFFER_ALIGN;  // 16 B, matches kernel pointer logic
         sizeCoef = (sizeCoef + align - 1) & ~(align - 1);
         size_t sizeLoad = fused
             ? sizeof(Val) * (size_z + size_x + size_y)
