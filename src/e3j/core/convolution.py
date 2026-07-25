@@ -21,7 +21,7 @@ from e3j import utils
 from e3j.core.scalar_mixing import ScalarMixing
 from e3j.core.tensor_product import TensorProduct
 from e3j.ops.coef import Coef4D
-from e3j.ops.convolution import CUDAConvolutionParams, convolution
+from e3j.ops.convolution import DUMMY_INDEX, CUDAConvolutionParams, convolution
 from e3j.pallas_ops.convolution.mosaic_tpu import (
     PallasMosaicTPUMessagePassingConvolutionParams,
     convolution_mosaic_tpu,
@@ -280,6 +280,7 @@ class Convolution:
         edge_scalars: Array,
         senders: Array,
         receivers: Array,
+        node_mask: Array | None = None,
     ) -> Array:
         """Return sum of messages on receiver nodes.
 
@@ -297,6 +298,10 @@ class Convolution:
             edge_scalars: array of shape `(num_edges, num_scalars, num_channels)`
             senders: index vector of length num_edges, in bounds [0, num_nodes)
             receivers: index vector of length num_edges, in bounds [0, num_nodes).
+            node_mask: optional boolean vector of length num_nodes, `True` for
+                real nodes and `False` for padding nodes. Edges touching a
+                padding node are excluded from the aggregation (no kernel work,
+                zero cotangents), avoiding a work pile-up on padding receivers.
 
         Note:
             On the CUDA convolution kernel the edges must be sorted (for the
@@ -306,6 +311,14 @@ class Convolution:
             `SENDER` ordering additionally requires the symmetry assumptions
             documented on the class.
         """
+        # Mark edges touching a padding node with `DUMMY_INDEX` so every
+        # implementation path skips them: the CUDA kernel drops them from the
+        # CSR adjacency, while the plain-JAX gather/scatter clamps and discards.
+        if node_mask is not None:
+            edge_mask = node_mask[senders] & node_mask[receivers]
+            senders = np.where(edge_mask, senders, DUMMY_INDEX)
+            receivers = np.where(edge_mask, receivers, DUMMY_INDEX)
+
         match self.config.convolution:
             case options.Convolution.UNFUSED:
                 return self._unfused_eval(
