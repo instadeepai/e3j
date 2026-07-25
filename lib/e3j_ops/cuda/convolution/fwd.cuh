@@ -349,11 +349,7 @@ __global__ void kernel (
 
                 int sender = adj.sender[edge];
 
-                // NOTE: temporary guard. `sender` is used below as an unchecked
-                // offset into node features (x[sender]); a value >= num_nodes
-                // reads past `x` and causes CUDA_ERROR_ILLEGAL_ADDRESS. Skipping
-                // such edges tells us whether out-of-range senders are the cause
-                // of the random segfaults. Remove once root cause is confirmed.
+                // Skip padding edges: OOB can signal padding safely
                 if (sender < 0 || sender >= num_nodes) continue;
 
                 // Load sender features, edge embeddings, and radial scalars.

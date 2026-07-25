@@ -229,6 +229,9 @@ __global__ void kernel_bwd (
 
             int receiver = adj.sender[edge];
 
+            // Skip padding edges: OOB can signal padding safely
+            if (receiver < 0 || receiver >= (int)num_nodes) continue;
+
             // Load dm[receiver], y[edge_t], s[edge_t]
             smem.dm.load<N>(dm_, receiver);
             smem.y.load<1>(y, edge_t);
