@@ -28,6 +28,27 @@ from e3j.ops.coef import Coef4D
 from e3j.utils import config, is_pow2
 from e3j.utils.options import GraphOrdering
 
+# Sentinel index marking a padding ("dummy") edge. Edges whose sender or
+# receiver equals this value fall outside [0, num_nodes) and are dropped from
+# the CSR adjacency by `jnp.bincount` (which ignores out-of-range indices), so
+# the kernel does no work on them. Callers batching padded graphs mark dummy
+# edges with `where(edge_mask, index, DUMMY_INDEX)`.
+#
+# NOTE: valid on a single pre-batched (disjoint) graph. Under vmap folding a
+#       node offset is added before the local wrap, overflowing the sentinel;
+#       apply the marker after folding in that case.
+DUMMY_INDEX = int32(numpy.iinfo(int32).max)
+
+
+def _wrap_global_index(index: Array, num_nodes: int) -> Array:
+    """Wrap a global or batch-folded index into the local node range.
+
+    Reduces modulo `num_nodes` as required under SPMD sharding and vmap
+    folding, while preserving the `DUMMY_INDEX` sentinel out of range so
+    padding edges stay dropped from the CSR adjacency.
+    """
+    return jnp.where(index == DUMMY_INDEX, index, index % num_nodes)
+
 
 @dataclass
 class CUDAConvolutionParams:
@@ -131,8 +152,8 @@ def convolution(
     @jax.experimental.custom_partitioning.custom_partitioning
     def _sharded_op(coef, x, y, s, sender, receiver):
         n = x.shape[0]
-        sender_local = sender % n
-        receiver_local = receiver % n
+        sender_local = _wrap_global_index(sender, n)
+        receiver_local = _wrap_global_index(receiver, n)
         if graph_ordering == GraphOrdering.SENDER:
             # NOTE: Transposing edges in the forward pass requires to sign edge features
             #       accordingly. The parities of y are applied on the coefficients.
@@ -284,8 +305,8 @@ def convolution_bwd(
     @jax.experimental.custom_partitioning.custom_partitioning
     def _sharded_op(coef_bwd, x, y, s, dm, sender, receiver):
         num_nodes = x.shape[0]
-        sender_local = sender % num_nodes
-        receiver_local = receiver % num_nodes
+        sender_local = _wrap_global_index(sender, num_nodes)
+        receiver_local = _wrap_global_index(receiver, num_nodes)
         if graph_ordering == GraphOrdering.SENDER:
             # NOTE: The backward pass is cheaper when the graph is already transposed,
             #       i.e. sorted by senders. No edge permutation required, and `nullptr`
@@ -302,7 +323,7 @@ def convolution_bwd(
             sender_local_t = graph_local_t.sender
             receiver_local_t_ptr = graph_local_t.receiver_ptr
 
-        return ffi_call(
+        dx, dy, ds = ffi_call(
             "convolution_bwd",
             (
                 jax.ShapeDtypeStruct(x.shape, x.dtype),
@@ -321,6 +342,13 @@ def convolution_bwd(
             num_nodes=int32(num_nodes),
             debug=int32(config().debug_level),
         )
+
+        # Dummy edges are dropped from the CSR, so their per-edge cotangents are
+        # never written by the kernel; zero them explicitly.
+        dummy = (sender == DUMMY_INDEX) | (receiver == DUMMY_INDEX)
+        dy = jnp.where(dummy[:, None], 0, dy)
+        ds = jnp.where(dummy[:, None, None], 0, ds)
+        return dx, dy, ds
 
     def _partition(mesh, arg_shapes, result_shape):
         ct_x_shape, ct_y_shape, ct_s_shape = result_shape
