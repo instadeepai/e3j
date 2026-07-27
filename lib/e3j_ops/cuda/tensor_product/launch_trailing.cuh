@@ -64,8 +64,7 @@ struct LaunchConfig {
         if (BUFFER_FWD_COEFS_IN_SMEM) {
             // Pad coef buffer to 16 B (same as kernel pointer logic) so the
             // x/y buffers that follow stay 16-byte aligned.
-            size_t align = SMEM_BUFFER_ALIGN;
-            sizeSMEM += (sizeCoef + align - 1) & ~(align - 1);
+            sizeSMEM += utils::smem_align(sizeCoef);
         }
 
         return Sizes {

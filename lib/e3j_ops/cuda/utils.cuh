@@ -128,6 +128,27 @@ __device__ Val hsum(Vect<N, Val> v) {
 
 namespace utils {
 
+// Rounds `x` up to the next multiple of `align` (a power of two).
+__host__ __device__ constexpr size_t round_up(size_t x, size_t align) {
+    return (x + align - 1) & ~(align - 1);
+}
+
+// Byte alignment of the SMEM buffers that follow a coefficient buffer in the
+// tensor_product / convolution kernels. They must be 16-byte aligned because
+// every access to them is a 16-byte (int4 / float4) transaction: the
+// vectorized `load<4>` reads AND the cp.async copies in `copy_pipe<4>` /
+// `copy_pipe_strided` — the latter always issuing 16-byte writes regardless
+// of N. Padding the coef buffer to a smaller `N * sizeof(Val)` boundary left
+// the buffers at an 8-byte offset for N < 4 and odd coefficient counts
+// (sizeof(Coef) == 8), which faulted with CUDA_ERROR_MISALIGNED_ADDRESS on
+// the strided path.
+constexpr size_t SMEM_BUFFER_ALIGN = 16;
+
+// Rounds `bytes` up to SMEM_BUFFER_ALIGN.
+__host__ __device__ constexpr size_t smem_align(size_t bytes) {
+    return round_up(bytes, SMEM_BUFFER_ALIGN);
+}
+
 // Simple synchronous copy.
 //
 // Copy with a 2D block by passing thread IDs and block dim explicitly.

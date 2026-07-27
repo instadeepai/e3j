@@ -34,16 +34,7 @@ namespace trailing_channels {
     using utils::wait_pipe;
     using utils::fill;
     using utils::DeviceProperties;
-
-    // Byte alignment of the x/y/out SMEM buffers that follow the coefficient
-    // buffer. They must be 16-byte aligned because every access to them is a
-    // 16-byte (int4 / float4) transaction: the vectorized `load<4>` reads AND
-    // the cp.async copies in `copy_pipe<4>` / `copy_pipe_strided` — the latter
-    // always issuing 16-byte writes regardless of N. Padding the coef buffer to
-    // a smaller `N * sizeof(Val)` boundary left the buffers at an 8-byte offset
-    // for N < 4 and odd coefficient counts (sizeof(Coef) == 8), which faulted
-    // with CUDA_ERROR_MISALIGNED_ADDRESS on the strided path.
-    constexpr size_t SMEM_BUFFER_ALIGN = 16;
+    using utils::smem_align;
 
     // Alias of int4, mapping threads to I/O channels.
     //
@@ -409,9 +400,8 @@ __global__ void kernel(
         coef = smem_coef;
         // Advance past the coef buffer, rounding up to 16 B so the x/y buffers
         // stay 16-byte aligned for LDS.128 and the int4 cp.async copies.
-        constexpr size_t align = SMEM_BUFFER_ALIGN;
         size_t coef_bytes = (size_t)num_coef * sizeof(Coef);
-        coef_bytes =  (coef_bytes + align - 1) & ~(align - 1);
+        coef_bytes = smem_align(coef_bytes);
         smem_ = (char*)smem_coef + coef_bytes;
         // Wait for coef copy.
         __pipeline_commit();

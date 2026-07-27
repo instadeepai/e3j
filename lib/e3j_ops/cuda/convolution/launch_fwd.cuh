@@ -68,8 +68,7 @@ struct LaunchConfig {
             * (size_lhs + size_rhs + size_out + size_mix);
 
         size_t sizeCoef = (size_t)p.num_coef * sizeof(Coef4D<Idx,Val>);
-        constexpr size_t align = 16;
-        sizeCoef = (sizeCoef + align - 1) & ~(align - 1);
+        sizeCoef = utils::smem_align(sizeCoef);
 
         size_t sizeSMEM = sizeLoad + sizeCoef;
 

@@ -67,8 +67,7 @@ struct LaunchConfigBwd {
         size_t sizeCoef = (size_t)(3 * p.num_coef) * sizeof(Coef4D<Idx,Val>);
         // Pad to 16 B (same as kernel pointer logic) so the dm/x/y/mix/dx
         // buffers that follow stay 16-byte aligned, regardless of N.
-        constexpr size_t align = 16;
-        sizeCoef = (sizeCoef + align - 1) & ~(align - 1);
+        sizeCoef = utils::smem_align(sizeCoef);
 
         size_t sizeSMEM = sizeLoad + sizeCoef;
 

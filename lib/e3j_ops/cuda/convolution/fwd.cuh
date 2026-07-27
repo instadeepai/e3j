@@ -308,9 +308,8 @@ __global__ void kernel (
         // Overwrite reference to GMEM `coef` with SMEM buffer.
         coef = smem_coef;
         // Align `smem_` to Vect<N, Val> for LDS.64 / LDS.128
-        constexpr size_t align = 16;
         size_t coef_bytes = (size_t)num_coef * sizeof(Coef);
-        coef_bytes =  (coef_bytes + align - 1) & ~(align - 1);
+        coef_bytes = utils::smem_align(coef_bytes);
         smem_ = (char*)smem_coef + coef_bytes;
         // Wait for coef copy.
         __pipeline_commit();

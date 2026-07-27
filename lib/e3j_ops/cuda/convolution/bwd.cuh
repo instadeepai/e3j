@@ -157,9 +157,8 @@ __global__ void kernel_bwd (
         // mix/dx buffers stay 16-byte aligned for LDS.128 and the int4
         // cp.async copies (copy_pipe_strided always issues 16 B transactions
         // regardless of N).
-        constexpr size_t align = 16;
         size_t coef_bytes = (size_t)(3 * num_coef) * sizeof(Coef);
-        coef_bytes = (coef_bytes + align - 1) & ~(align - 1);
+        coef_bytes = utils::smem_align(coef_bytes);
         smem_ = (char*)smem_coef + coef_bytes;
         __pipeline_commit();
         wait_pipe();

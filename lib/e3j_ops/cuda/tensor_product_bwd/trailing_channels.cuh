@@ -106,12 +106,11 @@ __global__ void kernel_bwd(
         coef = smem_coef;
         // Advance past the coef buffer, rounding up to 16 B so smem_x/y stay
         // 16-byte aligned for LDS.128 and the int4 cp.async copies (see
-        // SMEM_BUFFER_ALIGN). The concatenated dx/dy coef buffer (factor 2)
+        // utils::smem_align). The concatenated dx/dy coef buffer (factor 2)
         // is already a 16 B multiple here, but pinning the boundary to 16
         // keeps it correct for any future Coef size.
-        constexpr size_t align = SMEM_BUFFER_ALIGN;
         size_t coef_bytes = (size_t)num_coef * sizeof(Coef) * 2;
-        smem_ = (char*)smem_coef + ((coef_bytes + align - 1) & ~(align - 1));
+        smem_ = (char*)smem_coef + utils::smem_align(coef_bytes);
         // Wait for coef copy.
         __pipeline_commit();
         wait_pipe();
