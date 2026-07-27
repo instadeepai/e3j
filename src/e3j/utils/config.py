@@ -128,12 +128,14 @@ class config(Config):
         The backend detection logic can be overriden by the `$E3J_BACKEND`
         environment variable.
         """
-        # Bypass our fragile backend detection attempts with $E3J_BACKEND
+        # Bypass backend detection with JAX_PLATFORMS='cpu' or $E3J_BACKEND
         backend = os.environ.get("E3J_BACKEND")
         if not backend:
-            if _E3J_OPS_AVAILABLE:
+            if os.environ.get("JAX_PLATFORMS") == "cpu":
+                backend = "cpu"
+            elif _E3J_OPS_AVAILABLE:
                 backend = "gpu"
-            if _TPU_AVAILABLE:
+            elif _TPU_AVAILABLE:
                 backend = "tpu"
 
         if backend == "gpu" and _E3J_OPS_AVAILABLE:
