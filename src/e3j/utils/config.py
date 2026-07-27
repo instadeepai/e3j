@@ -69,26 +69,36 @@ class Config(YamlConfig):
     debug_level: int = 0
 
 
+# ------ Platform-dependent defaults ------
+
+_CUDA_CONFIG = Config(
+    tensor_product=TensorProduct.FUSED_CUDA,
+    convolution=Convolution.FUSED_CUDA,
+)
+
+_TPU_CONFIG = Config(
+    tensor_product=TensorProduct.FUSED_MOSAIC_TPU,
+    convolution=Convolution.FUSED_MOSAIC_TPU,
+)
+
+
+# ------ Context manager -------------------
+
+
 class config(Config):
     """Singleton config class for e3j.
 
-    This class manages a global :class:`Config` instance. See
-    `help(e3j.config.state())` for more details on the actual configuration options.
+    This class manages a global :class:`Config` instance.
+    The global configuration can be read with `e3j.config()`
+    and overriden permanently with `e3j.config(**kwargs)`.
 
-    Usage:
+    To override with context manager scope, use:
 
-        .. code:: python
+    .. code:: python
 
-            # context manager:
-            with e3j.use(**kwargs):
-                ...
-            # get mutable global state
-            cfg = e3j.config()
-            # get copy of current global state
-            cfg = e3j.config.state()
-            # set permanently
-            e3j.config(**kwargs)
-
+        # context manager:
+        with e3j.use(**kwargs):
+            ...
     """
 
     _state: type["config"] = None
@@ -139,16 +149,9 @@ class config(Config):
                 backend = "tpu"
 
         if backend == "gpu" and _E3J_OPS_AVAILABLE:
-            return Config(
-                tensor_product=TensorProduct.FUSED_CUDA,
-                convolution=Convolution.FUSED_CUDA,
-            )
+            return _CUDA_CONFIG
         if backend == "tpu" and _TPU_AVAILABLE:
-            return Config(
-                tensor_product=TensorProduct.FUSED_MOSAIC_TPU,
-                convolution=Convolution.FUSED_MOSAIC_TPU,
-            )
-
+            return _TPU_CONFIG
         return Config()
 
     @classmethod
