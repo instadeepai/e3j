@@ -153,7 +153,11 @@ __global__ void kernel_bwd (
         Coef* smem_coef = reinterpret_cast<Coef*>(smem_);
         copy_pipe<1>(smem_coef, coef, 3 * num_coef);
         coef = smem_coef;
-        constexpr size_t align = N * sizeof(Val);
+        // Advance past the coef buffer, rounding up to 16 B so the dm/x/y/
+        // mix/dx buffers stay 16-byte aligned for LDS.128 and the int4
+        // cp.async copies (copy_pipe_strided always issues 16 B transactions
+        // regardless of N).
+        constexpr size_t align = 16;
         size_t coef_bytes = (size_t)(3 * num_coef) * sizeof(Coef);
         coef_bytes = (coef_bytes + align - 1) & ~(align - 1);
         smem_ = (char*)smem_coef + coef_bytes;
