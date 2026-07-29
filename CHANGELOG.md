@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Fixed
+
+- Misaligned SMEM access (`CUDA_ERROR_MISALIGNED_ADDRESS`) in the CUDA tensor
+  product and convolution kernels: the coefficient buffer preceding the x/y/dx
+  buffers in shared memory was only padded to an `N`-dependent boundary, which
+  left it 8-byte aligned for `N < 4` with odd coefficient counts. Padding is
+  now unified through a `utils::smem_align()` helper that always rounds up to
+  16 bytes, matching the vectorized `LDS.128` / `int4` `cp.async` accesses.
+
 ## [0.1.0b5] — 2026-07-17
 
 ### Fixed
