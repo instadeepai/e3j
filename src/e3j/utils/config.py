@@ -141,7 +141,8 @@ class config(Config):
         # Bypass backend detection with JAX_PLATFORMS='cpu' or $E3J_BACKEND
         backend = os.environ.get("E3J_BACKEND")
         if not backend:
-            if os.environ.get("JAX_PLATFORMS") == "cpu":
+            jax_platforms = os.environ.get("JAX_PLATFORMS") or ""
+            if jax_platforms[:3] == "cpu":
                 backend = "cpu"
             elif _E3J_OPS_AVAILABLE:
                 backend = "gpu"
