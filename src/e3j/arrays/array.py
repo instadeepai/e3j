@@ -108,7 +108,7 @@ class Array(Generic[SpaceT]):
                 arr = self.array[..., slc, :]
             else:
                 arr = self.array[..., slc]
-            yield self.__class__(ir, arr, self.layout)
+            yield self.__class__(self.space.__class__([(mul, ir)]), arr, self.layout)
 
     @property
     def ndim(self) -> int:

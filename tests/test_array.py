@@ -53,6 +53,16 @@ class _TestO3Array:
             O3Array(self.space, y, self.layout),
         )
 
+    def test_blocks(self, o3_inputs):
+        x, _ = o3_inputs
+        blocks = list(x.blocks())
+        assert len(blocks) == len(self.space.blocks)
+        for (mul, ir), block in zip(self.space, blocks):
+            assert isinstance(block, type(x))
+            assert block.space == type(self.space)([(mul, ir)])
+            assert block.layout == x.layout
+            assert block.shape[block.feature_axis] == ir.dim
+
     def test_add(self, o3_inputs):
         x, y = o3_inputs
         z = x + y
