@@ -12,10 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 
 import jax.numpy as jnp
+import numpy
 from jax import Array
+from numpy import int32
+
+# Sentinel index marking a padding ("dummy") edge. Edges whose sender or
+# receiver equals this value fall outside [0, num_nodes) and are dropped from
+# the CSR adjacency by `jnp.bincount` (which ignores out-of-range indices), so
+# the kernel does no work on them. Callers batching padded graphs mark dummy
+# edges with `where(edge_mask, index, DUMMY_INDEX)`.
+#
+# NOTE: valid on a single pre-batched (disjoint) graph. Under vmap folding a
+#       node offset is added before the local wrap, overflowing the sentinel;
+#       apply the marker after folding in that case.
+DUMMY_INDEX = int32(numpy.iinfo(int32).max)
 
 
 class GraphCSR:
@@ -34,8 +46,8 @@ class GraphCSR:
         self.num_nodes = num_nodes
         self.sender = sender
         self.receiver = receiver
-        num_neighbors = jnp.bincount(receiver, length=num_nodes)
-        self.receiver_ptr = jnp.append(0, jnp.cumsum(num_neighbors))
+        self.num_neighbors = jnp.bincount(receiver, length=num_nodes)
+        self.receiver_ptr = jnp.append(0, jnp.cumsum(self.num_neighbors))
 
     @classmethod
     def sort(
@@ -52,6 +64,22 @@ class GraphCSR:
             self.num_nodes,
             self.receiver,
             self.sender,
+        )
+
+    @staticmethod
+    def mask_edges(
+        sender: Array, receiver: Array, node_mask: Array
+    ) -> tuple[Array, Array]:
+        """Mark edges touching a padding node with `DUMMY_INDEX`.
+
+        Edges with a masked (padding) endpoint are set to the out-of-range
+        sentinel so every path skips them: the CUDA kernel drops them from the
+        CSR adjacency, the plain-JAX gather/scatter clamps and discards.
+        """
+        edge_mask = node_mask[sender] & node_mask[receiver]
+        return (
+            jnp.where(edge_mask, sender, DUMMY_INDEX),
+            jnp.where(edge_mask, receiver, DUMMY_INDEX),
         )
 
     @staticmethod

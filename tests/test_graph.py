@@ -86,6 +86,40 @@ class TestDummyEdgesCSR:
         )
         assert int(graph_t.receiver_ptr[-1]) == num_real
 
+    def test_counting_in_place_keeps_csr_contiguous(self):
+        """Folding two graphs interleaves each one's tail dummies with the next
+        graph's real edges. The vmap fold reassigns every dummy's grouping
+        endpoint (the CSR key: the receiver here) to its graph's last node, so
+        the folded key stays non-decreasing and `bincount` yields a contiguous
+        CSR without any regroup. The dummies are counted into the last node's
+        range, where the kernel guard skips them."""
+        num_edges = num_real + num_dummy
+        n2 = 2 * num_nodes
+        sender, receiver = _padded_graph()  # [ real | dummy ]
+
+        def fold(index, group):
+            # Real edges take a per-graph node offset; a dummy's grouping endpoint
+            # takes its graph's last node, its guard endpoint keeps the sentinel.
+            offset = np.array([0, num_nodes], dtype=np.int32)[:, None]
+            last_node = offset + (num_nodes - 1)
+            stacked = np.stack([index, index])
+            fill = last_node if group else DUMMY_INDEX
+            return np.where(stacked == DUMMY_INDEX, fill, stacked + offset).reshape(-1)
+
+        sender_local = fold(sender, group=False)
+        receiver_local = fold(receiver, group=True)  # RECEIVER forward CSR key
+
+        ptr = GraphCSR(n2, sender_local, receiver_local).receiver_ptr
+
+        # The grouping key is non-decreasing, so the physical edge order matches
+        # the CSR ranges (contiguous adjacency).
+        assert bool(np.all(np.diff(receiver_local) >= 0))
+        assert bool(np.all(np.diff(ptr) >= 0))
+        # Every folded edge is counted now that dummies land in the last node.
+        assert int(ptr[-1]) == 2 * num_edges
+        # Dummy guard endpoints stay out of range, so the kernel skips them.
+        assert int(np.sum(sender_local == DUMMY_INDEX)) == 2 * num_dummy
+
 
 class TestUnfusedConvolutionDummyEdges:
     """The plain-JAX (unfused) path treats `DUMMY_INDEX` edges as no-ops: the

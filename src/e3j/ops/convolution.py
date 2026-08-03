@@ -23,21 +23,10 @@ from jax import Array, custom_vjp
 from jax.ffi import ffi_call
 from numpy import int32
 
-from e3j.data.graph import GraphCSR
+from e3j.data.graph import DUMMY_INDEX, GraphCSR
 from e3j.ops.coef import Coef4D
 from e3j.utils import config, is_pow2
 from e3j.utils.options import GraphOrdering
-
-# Sentinel index marking a padding ("dummy") edge. Edges whose sender or
-# receiver equals this value fall outside [0, num_nodes) and are dropped from
-# the CSR adjacency by `jnp.bincount` (which ignores out-of-range indices), so
-# the kernel does no work on them. Callers batching padded graphs mark dummy
-# edges with `where(edge_mask, index, DUMMY_INDEX)`.
-#
-# NOTE: valid on a single pre-batched (disjoint) graph. Under vmap folding a
-#       node offset is added before the local wrap, overflowing the sentinel;
-#       apply the marker after folding in that case.
-DUMMY_INDEX = int32(numpy.iinfo(int32).max)
 
 
 def _wrap_global_index(index: Array, num_nodes: int) -> Array:
@@ -48,6 +37,33 @@ def _wrap_global_index(index: Array, num_nodes: int) -> Array:
     padding edges stay dropped from the CSR adjacency.
     """
     return jnp.where(index == DUMMY_INDEX, index, index % num_nodes)
+
+
+def _fold_endpoints(
+    receiver: Array, sender: Array, axis_size: int, num_nodes: int
+) -> tuple[Array, Array]:
+    """Fold `axis_size` batches of graphs, while preserving padding mask.
+
+    All node indices are offset in a single batched, disjoint graph.
+
+    Args:
+        receiver: node indices the CSR adjacency groups by, swapped under
+            SENDER ordering or during the backward pass.
+        sender: neighbour indices walked in the inner loop.
+        axis_size: dimension of the mapped-over axis.
+        num_nodes: total number of nodes in the graph.
+
+    Returns:
+        Masked pair of `(receiver, sender)` indices. Padding sender nodes
+        keep their INT_MAX mask so kernel OOB guards skip the associated edge,
+        while padding `receiver` nodes are mapped in bound to support non-terminal
+        padding edges (interleaved with real edges under `vmap`).
+    """
+    node_offsets = jnp.arange(axis_size, dtype=receiver.dtype)[:, None] * num_nodes
+    last_node = node_offsets + (num_nodes - 1)
+    receiver = jnp.where(receiver == DUMMY_INDEX, last_node, receiver + node_offsets)
+    sender = jnp.where(sender == DUMMY_INDEX, sender, sender + node_offsets)
+    return receiver.reshape(-1), sender.reshape(-1)
 
 
 @dataclass
@@ -158,6 +174,11 @@ def convolution(
             # NOTE: Transposing edges in the forward pass requires to sign edge features
             #       accordingly. The parities of y are applied on the coefficients.
             sender_local, receiver_local = receiver_local, sender_local
+        # `bincount` yields a contiguous CSR directly: a single graph's dummies
+        # keep their out-of-range grouping endpoint and drop out; a folded batch's
+        # dummies were reassigned to their graph's last node (see `_fold_endpoints`)
+        # and are counted there. Either way the guard endpoint stays out of range,
+        # so the kernel skips them.
         receiver_local_ptr = GraphCSR(n, sender_local, receiver_local).receiver_ptr
         shape_out = (n, num_out, channels_x)
         return ffi_call(
@@ -226,9 +247,12 @@ def convolution(
         num_edges = y.shape[1]
 
         # batched=False tiles the shared graph; batched=True concatenates.
-        node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
-        sender = (sender + node_offsets).reshape(-1)
-        receiver = (receiver + node_offsets).reshape(-1)
+        # Fold nodes per graph. The forward CSR groups by receiver (RECEIVER
+        # ordering) or sender (SENDER), so that endpoint is the grouping key.
+        if graph_ordering == GraphOrdering.SENDER:
+            sender, receiver = _fold_endpoints(sender, receiver, axis_size, num_nodes)
+        else:
+            receiver, sender = _fold_endpoints(receiver, sender, axis_size, num_nodes)
 
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
@@ -311,6 +335,10 @@ def convolution_bwd(
             # NOTE: The backward pass is cheaper when the graph is already transposed,
             #       i.e. sorted by senders. No edge permutation required, and `nullptr`
             #       is passed through the FFI.
+            # The direct CSR groups by sender. A single graph's dummies drop out
+            # (out-of-range sender); a folded batch's dummies were reassigned to
+            # their graph's last node and counted there. The receiver (guard)
+            # stays out of range, so the kernel skips them either way.
             perm = jnp.zeros((0,), jnp.int32)
             sender_local_t = receiver_local
             receiver_local_t_ptr = GraphCSR(
@@ -343,8 +371,9 @@ def convolution_bwd(
             debug=int32(config().debug_level),
         )
 
-        # Dummy edges are dropped from the CSR, so their per-edge cotangents are
-        # never written by the kernel; zero them explicitly.
+        # Dummy edges are skipped by the kernel guard, so their per-edge
+        # cotangents are never written; zero them explicitly. Edges keep their
+        # original order (no regroup), so the mask applies directly.
         dummy = (sender == DUMMY_INDEX) | (receiver == DUMMY_INDEX)
         dy = jnp.where(dummy[:, None], 0, dy)
         ds = jnp.where(dummy[:, None, None], 0, ds)
@@ -400,9 +429,9 @@ def convolution_bwd(
         num_edges = y.shape[1]
 
         # batched=False tiles the shared graph; batched=True concatenates.
-        node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
-        sender = (sender + node_offsets).reshape(-1)
-        receiver = (receiver + node_offsets).reshape(-1)
+        # Fold nodes per graph. The backward CSR groups by sender in both
+        # orderings, so the sender is the grouping key.
+        sender, receiver = _fold_endpoints(sender, receiver, axis_size, num_nodes)
 
         x = x.reshape((axis_size * num_nodes,) + x.shape[2:])
         y = y.reshape((axis_size * num_edges,) + y.shape[2:])
