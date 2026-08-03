@@ -125,8 +125,8 @@ class Array(Generic[SpaceT]):
         ndim = self.ndim
         axis = self.feature_axis % ndim
         key = idx if isinstance(idx, tuple) else (idx,)
-        if Ellipsis in key:
-            ellipsis_pos = key.index(Ellipsis)
+        if any(k is Ellipsis for k in key):
+            ellipsis_pos = next(i for i, k in enumerate(key) if k is Ellipsis)
             pre, post = key[:ellipsis_pos], key[ellipsis_pos + 1 :]
             n_explicit = sum(1 for k in pre if k is not None) + sum(
                 1 for k in post if k is not None
@@ -141,7 +141,8 @@ class Array(Generic[SpaceT]):
             # unlike every other index type which always consumes exactly
             # one axis.
             span = k.ndim if getattr(k, "dtype", None) == bool else 1
-            if pos <= axis < pos + span and k != slice(None):
+            is_full_slice = isinstance(k, slice) and k == slice(None)
+            if pos <= axis < pos + span and not is_full_slice:
                 raise ValueError(
                     f"Indexing the feature axis ({axis}) would silently "
                     f"reindex the irreps of {self.space}; got index {k!r} "

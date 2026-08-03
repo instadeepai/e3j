@@ -14,6 +14,7 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from e3j.arrays import Array, O3Array
@@ -135,6 +136,16 @@ class _TestO3Array:
     def test_getitem(self, o3_inputs):
         _, y = o3_inputs
         idx = jnp.array([0, 1, 2])
+        yi = y[idx]
+        assert isinstance(yi, O3Array) and yi.space == self.space
+        assert jnp.all(yi.array == y.array[idx])
+
+    def test_getitem_numpy_index_off_feature_axis(self, o3_inputs):
+        _, y = o3_inputs
+        # A plain numpy (not jax) array index doesn't touch the feature
+        # axis, so this must index normally rather than raising from an
+        # ambiguous elementwise `==`/`!=`/`in` comparison against it.
+        idx = np.array([0, 1, 2])
         yi = y[idx]
         assert isinstance(yi, O3Array) and yi.space == self.space
         assert jnp.all(yi.array == y.array[idx])
