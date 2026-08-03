@@ -122,7 +122,27 @@ class Array(Generic[SpaceT]):
         return self.__class__(self.space, array, self.layout)
 
     def __getitem__(self, idx):
-        # TODO: reindexing on feature dimension should be prevented
+        ndim = self.ndim
+        axis = self.feature_axis % ndim
+        key = idx if isinstance(idx, tuple) else (idx,)
+        if Ellipsis in key:
+            ellipsis_pos = key.index(Ellipsis)
+            pre, post = key[:ellipsis_pos], key[ellipsis_pos + 1 :]
+            n_explicit = sum(1 for k in pre if k is not None) + sum(
+                1 for k in post if k is not None
+            )
+            key = pre + (slice(None),) * (ndim - n_explicit) + post
+        pos = 0
+        for k in key:
+            if k is None:
+                continue
+            if pos == axis and k != slice(None):
+                raise ValueError(
+                    f"Indexing the feature axis ({axis}) would silently "
+                    f"reindex the irreps of {self.space}; got index {k!r} "
+                    "at that axis."
+                )
+            pos += 1
         return self._alike(self.array[idx])
 
     def __add__(self, other):

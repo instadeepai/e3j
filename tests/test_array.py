@@ -123,6 +123,16 @@ class _TestO3Array:
         assert isinstance(yi, O3Array) and yi.space == self.space
         assert jnp.all(yi.array == y.array[idx])
 
+    def test_getitem_feature_axis_raises(self, o3_inputs):
+        x, _ = o3_inputs
+        axis = x.feature_axis % x.ndim
+        # Same-length reversal: doesn't trip the shape/dim check in
+        # Array.__init__, so it can only be caught by an explicit guard.
+        key = [slice(None)] * x.ndim
+        key[axis] = slice(None, None, -1)
+        with pytest.raises(ValueError):
+            x[tuple(key)]
+
     def test_jit_return(self, o3_inputs):
         x, y = o3_inputs
 
