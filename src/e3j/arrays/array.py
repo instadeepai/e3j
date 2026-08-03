@@ -151,20 +151,20 @@ class Array(Generic[SpaceT]):
             pos += span
         return self._alike(self.array[idx])
 
-    def _check_alike(self, other):
+    def _check_alike(self, other, op="add"):
         if (
             not isinstance(other, self.__class__)
             or self.space != other.space
             or self.layout != other.layout
         ):
-            raise ValueError(f"Can only add arrays that are alike {other}")
+            raise ValueError(f"Can only {op} arrays that are alike {other}")
 
     def __add__(self, other):
-        self._check_alike(other)
+        self._check_alike(other, op="add")
         return self._alike(self.array + other.array)
 
     def __sub__(self, other):
-        self._check_alike(other)
+        self._check_alike(other, op="subtract")
         return self._alike(self.array - other.array)
 
     def __radd__(self, other):

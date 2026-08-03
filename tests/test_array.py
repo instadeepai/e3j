@@ -85,6 +85,13 @@ class _TestO3Array:
         with pytest.raises(ValueError):
             x - other
 
+    def test_sub_incompatible_space_error_mentions_subtract(self, o3_inputs):
+        x, y = o3_inputs
+        other_space = O3Space(f"{self.dim}x0e")
+        other = type(x)(other_space, y.array, self.layout)
+        with pytest.raises(ValueError, match="subtract"):
+            x - other
+
     def test_add_sub_non_array_raises(self, o3_inputs):
         x, _ = o3_inputs
         with pytest.raises(ValueError):
