@@ -75,6 +75,22 @@ class _TestO3Array:
         assert isinstance(z, O3Array) and z.space == self.space
         assert jnp.all(z.array == x.array - y.array)
 
+    def test_add_sub_incompatible_space_raises(self, o3_inputs):
+        x, y = o3_inputs
+        other_space = O3Space(f"{self.dim}x0e")
+        other = type(x)(other_space, y.array, self.layout)
+        with pytest.raises(ValueError):
+            x + other
+        with pytest.raises(ValueError):
+            x - other
+
+    def test_add_sub_non_array_raises(self, o3_inputs):
+        x, _ = o3_inputs
+        with pytest.raises(ValueError):
+            x + x.array
+        with pytest.raises(ValueError):
+            x - x.array
+
     @pytest.mark.xfail
     def test_radd(self, o3_inputs):
         x, _ = o3_inputs
