@@ -168,3 +168,12 @@ class TestO3ArrayLeading(_TestO3Array):
 
 class TestO3ArrayTrailing(_TestO3Array):
     layout = "TRAILING_CHANNELS"
+
+
+def test_rmul_lower_rank_scalar_trailing_channels():
+    space = O3Space("0e+1o")
+    x = O3Array(space, jnp.ones((128, 4, 32)), "TRAILING_CHANNELS")
+    scalar = jnp.arange(32.0)  # per-channel scalar, fewer dims than x.array
+    result = scalar * x
+    assert isinstance(result, O3Array)
+    assert jnp.all(result.array == scalar * x.array)

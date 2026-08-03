@@ -169,7 +169,8 @@ class Array(Generic[SpaceT]):
             return self._alike(other * self.array)
         if isinstance(other, jax.Array):
             axis = self.feature_axis
-            if other.size == 1 or other.shape[axis] == 1:
+            feature_size = other.shape[axis] if other.ndim >= -axis else 1
+            if other.size == 1 or feature_size == 1:
                 return self._alike(other * self.array)
         raise ValueError(f"Cannot left multiply with non-scalar {other}")
 
