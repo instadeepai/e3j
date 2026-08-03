@@ -136,13 +136,18 @@ class Array(Generic[SpaceT]):
         for k in key:
             if k is None:
                 continue
-            if pos == axis and k != slice(None):
+            # A boolean array consumes as many axes as its own rank (it is
+            # matched against that many corresponding axes of self.array),
+            # unlike every other index type which always consumes exactly
+            # one axis.
+            span = k.ndim if getattr(k, "dtype", None) == bool else 1
+            if pos <= axis < pos + span and k != slice(None):
                 raise ValueError(
                     f"Indexing the feature axis ({axis}) would silently "
                     f"reindex the irreps of {self.space}; got index {k!r} "
                     "at that axis."
                 )
-            pos += 1
+            pos += span
         return self._alike(self.array[idx])
 
     def _check_alike(self, other):

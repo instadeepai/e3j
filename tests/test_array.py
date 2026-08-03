@@ -149,6 +149,21 @@ class _TestO3Array:
         with pytest.raises(ValueError):
             x[tuple(key)]
 
+    def test_getitem_multiaxis_boolean_mask_over_feature_axis_raises(
+        self, o3_inputs
+    ):
+        x, _ = o3_inputs
+        # A boolean mask whose rank matches more than one axis (here: the
+        # leading batch axis together with the feature axis) must still be
+        # caught by the feature-axis guard, even though it is a single
+        # index-tuple element rather than one element per axis.
+        axis = x.feature_axis % x.ndim
+        mask = jnp.zeros(x.shape[: axis + 1], dtype=bool)
+        mask = mask.at[(0,) * mask.ndim].set(True)
+        mask = mask.at[(1,) + (0,) * (mask.ndim - 1)].set(True)
+        with pytest.raises(ValueError):
+            x[mask]
+
     def test_jit_return(self, o3_inputs):
         x, y = o3_inputs
 
