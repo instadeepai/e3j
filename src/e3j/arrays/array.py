@@ -122,6 +122,25 @@ class Array(Generic[SpaceT]):
         return self.__class__(self.space, array, self.layout)
 
     def __getitem__(self, idx):
+        """Index into the array's leading (non-feature) axes.
+
+        Ordinary indexing is forwarded to the underlying array as long as it
+        leaves the feature axis (`self.feature_axis`) untouched, e.g.
+        selecting a subset of the batch:
+
+            >>> x = O3Array(space, jnp.ones((128, 4, 32)), "TRAILING_CHANNELS")
+            >>> x[:16]                    # first 16 batch elements
+            >>> x[jnp.array([0, 2, 5])]   # fancy-indexed batch elements
+
+        Indexing that would reorder, drop, or otherwise reindex the feature
+        axis raises a `ValueError`, since that would silently relabel
+        `self.space` without actually permuting the underlying irreps:
+
+            >>> x[:, ::-1, :]              # reverses the feature axis
+            Traceback (most recent call last):
+                ...
+            ValueError: Indexing the feature axis (1) would silently ...
+        """
         ndim = self.ndim
         axis = self.feature_axis % ndim
         key = idx if isinstance(idx, tuple) else (idx,)
