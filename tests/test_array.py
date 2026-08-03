@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from e3j.arrays import O3Array
+from e3j.arrays import Array, O3Array
 from e3j.spaces import O3Space
 
 
@@ -168,6 +168,18 @@ class TestO3ArrayLeading(_TestO3Array):
 
 class TestO3ArrayTrailing(_TestO3Array):
     layout = "TRAILING_CHANNELS"
+
+
+def test_array_repr_interpolates_layout():
+    space = O3Space("0e+1o")
+    # LEADING_CHANNELS is a non-default layout (project default is
+    # TRAILING_CHANNELS), so Array.__repr__ appends the layout suffix.
+    x = O3Array(space, jnp.zeros((2, 32, 4)), "LEADING_CHANNELS")
+    # Call Array.__repr__ directly: O3Array gets its own dataclass-generated
+    # __repr__, which shadows the inherited one for plain repr(x).
+    r = Array.__repr__(x)
+    assert "{self.layout}" not in r
+    assert str(x.layout) in r
 
 
 def test_rmul_lower_rank_scalar_trailing_channels():

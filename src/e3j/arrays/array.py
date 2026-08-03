@@ -187,7 +187,7 @@ class Array(Generic[SpaceT]):
         cls = self.__class__.__name__
         out = f"{cls} '{self.space}'"
         if self.layout != config().layout:
-            out += " {self.layout}"
+            out += f" {self.layout}"
         return out + "\n" + str(self.array)
 
 
