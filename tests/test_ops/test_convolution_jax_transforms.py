@@ -373,9 +373,10 @@ def _batched_conv_data(batch, key):
     )
 
 
-@pytest.mark.skipif(jax.device_count() < 2, reason="requires >= 2 devices")
 def test_vmap_fwd_convolution_multi_devices_numerical():
     """Sharded forward equals single-device vmap over distinct graphs."""
+    if jax.device_count() < 2:
+        pytest.skip("requires >= 2 devices")
     coef, x, y, s, sender, receiver, params = _batched_conv_data(
         batch=2 * jax.device_count(), key=random.key(0)
     )
@@ -397,9 +398,10 @@ def test_vmap_fwd_convolution_multi_devices_numerical():
     testing.assert_array_equal(jax.device_get(out_sharded), jax.device_get(out_ref))
 
 
-@pytest.mark.skipif(jax.device_count() < 2, reason="requires >= 2 devices")
 def test_vmap_grad_convolution_multi_devices_numerical():
     """Sharded gradients equal single-device vmap gradients over distinct graphs."""
+    if jax.device_count() < 2:
+        pytest.skip("requires >= 2 devices")
     coef, x, y, s, sender, receiver, params = _batched_conv_data(
         batch=2 * jax.device_count(), key=random.key(1)
     )
