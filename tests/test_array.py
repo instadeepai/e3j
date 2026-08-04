@@ -167,9 +167,7 @@ class _TestO3Array:
         with pytest.raises(ValueError):
             x[tuple(key)]
 
-    def test_getitem_multiaxis_boolean_mask_over_feature_axis_raises(
-        self, o3_inputs
-    ):
+    def test_getitem_multiaxis_boolean_mask_over_feature_axis_raises(self, o3_inputs):
         x, _ = o3_inputs
         # A boolean mask whose rank matches more than one axis (here: the
         # leading batch axis together with the feature axis) must still be
