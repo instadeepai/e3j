@@ -18,15 +18,9 @@ import numpy
 from jax import Array
 from numpy import int32
 
-# Sentinel index marking a padding ("dummy") edge. Edges whose sender or
-# receiver equals this value fall outside [0, num_nodes) and are dropped from
-# the CSR adjacency by `jnp.bincount` (which ignores out-of-range indices), so
-# the kernel does no work on them. Callers batching padded graphs mark dummy
-# edges with `where(edge_mask, index, DUMMY_INDEX)`.
-#
-# NOTE: valid on a single pre-batched (disjoint) graph. Under vmap folding a
-#       node offset is added before the local wrap, overflowing the sentinel;
-#       apply the marker after folding in that case.
+# Padding mask to ensure dummy edges are skipped in kernels.
+# This is important in typical static-shaped graphs, since a single
+# dummy node may carry all of the padding edges.
 DUMMY_INDEX = int32(numpy.iinfo(int32).max)
 
 
@@ -72,9 +66,9 @@ class GraphCSR:
     ) -> tuple[Array, Array]:
         """Mark edges touching a padding node with `DUMMY_INDEX`.
 
-        Edges with a masked (padding) endpoint are set to the out-of-range
-        sentinel so every path skips them: the CUDA kernel drops them from the
-        CSR adjacency, the plain-JAX gather/scatter clamps and discards.
+        Padding edges are assumed to only connect trailing nodes and must lie
+        at the end of the graph. They are assigned out-of-bounds edges to ensure
+        they are skipped by the message aggregation.
         """
         edge_mask = node_mask[sender] & node_mask[receiver]
         return (
