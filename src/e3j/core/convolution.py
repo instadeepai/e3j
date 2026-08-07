@@ -300,17 +300,14 @@ class Convolution:
             senders: index vector of length num_edges, in bounds [0, num_nodes)
             receivers: index vector of length num_edges, in bounds [0, num_nodes).
             node_mask: optional boolean vector of length num_nodes, `True` for
-                real nodes and `False` for padding nodes. Edges touching a
-                padding node are excluded from the aggregation (no kernel work,
-                zero cotangents), avoiding a work pile-up on padding receivers.
+                real nodes and `False` for padding nodes, which *must* lie at
+                the tail of the graph. Padding edges are also assumed to only
+                connect padding nodes.
 
         Note:
-            On the CUDA convolution kernel the edges must be sorted (for the
-            sparse CSR adjacency) by the endpoint selected via `graph_ordering`:
-            monotonically increasing `receivers` under the default `RECEIVER`
-            ordering, or monotonically increasing `senders` under `SENDER`. The
-            `SENDER` ordering additionally requires the symmetry assumptions
-            documented on the class.
+            On the CUDA convolution kernel the edges must be sorted by the endpoint
+            selected via `graph_ordering`. The `SENDER` ordering additionally
+            requires the symmetry assumptions documented on the class.
         """
         # Edges touching a padding node are excluded from every path: dropped
         # from the CSR (no kernel work) so padding never inflates the aggregation.
