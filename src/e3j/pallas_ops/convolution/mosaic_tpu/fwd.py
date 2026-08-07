@@ -139,10 +139,10 @@ class _MessagePassingFwdKernel:
     - `senders` / `receivers`: `(n_edges,)`.
     - `out`: `(n_nodes, out_dim, channels)`.
 
-    `channels` is padded to a `num_lanes` multiple, `y_dim` to a `num_sublanes` multiple, and
-    the edge axis to a whole number of `batch_block_size * num_cores` tiles (padded edges
-    repeat the last receiver so no extra group is created); the padding is sliced
-    off the result.
+    `channels` is padded up to `num_lanes` unless it already divides it, `y_dim` to a
+    `num_sublanes` multiple, and the edge axis to a whole number of
+    `batch_block_size * num_cores` tiles (padded edges repeat the last receiver so no
+    extra group is created); the padding is sliced off the result.
 
     Algorithm
     ----------
@@ -233,12 +233,14 @@ class _MessagePassingFwdKernel:
         y_dim_padded = round_up(y_dim, num_sublanes)
         y = jnp.pad(y, ((0, y_dim_padded - y_dim), no_pad))
 
-        # Pad the channels to a multiple of num_lanes.
-        channels_padded = round_up(channels, num_lanes)
-        x = jnp.pad(x, (no_pad, no_pad, (0, channels_padded - channels)))
-        edge_scalars = jnp.pad(
-            edge_scalars, (no_pad, no_pad, (0, channels_padded - channels))
+        channels_padded = (
+            channels if num_lanes % channels == 0 else round_up(channels, num_lanes)
         )
+        if channels_padded != channels:
+            x = jnp.pad(x, (no_pad, no_pad, (0, channels_padded - channels)))
+            edge_scalars = jnp.pad(
+                edge_scalars, (no_pad, no_pad, (0, channels_padded - channels))
+            )
 
         out_dim_padded = round_up(out_dim, num_sublanes)
 
