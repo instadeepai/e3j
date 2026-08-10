@@ -78,7 +78,7 @@ class Convolution:
         target: O3Space | None = None,
         *,
         graph_ordering: str | options.GraphOrdering,
-        layout: Layout = Layout.TRAILING_CHANNELS,
+        layout: str | Layout = Layout.TRAILING_CHANNELS,
         avg_num_neighbors: float | None = None,
         normalization: str | options.TensorProductNormalization = "SQRT_DIM_OUT",
         config: utils.Config | None = None,
@@ -132,7 +132,7 @@ class Convolution:
         self.avg_num_neighbors = avg_num_neighbors
 
         self.config = utils.config.state() if config is None else config
-        self.layout = layout
+        self.layout = Layout.parse(layout)
         self.normalization = otimes.normalization
         self._otimes = otimes
         self._mix = mix
