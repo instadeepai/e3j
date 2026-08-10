@@ -213,12 +213,6 @@ class Convolution:
         edge_features = edge_features.astype(val_dtype)
         edge_scalars = edge_scalars.astype(val_dtype)
 
-        # The FFI declares the adjacency buffers as int32, while `jax_enable_x64`
-        # (required by float64) makes int64 the default integer dtype. Narrow
-        # them here, or a graph built with `jnp.arange` would be rejected.
-        senders = senders.astype(numpy.int32)
-        receivers = receivers.astype(numpy.int32)
-
         with jax.ensure_compile_time_eval():
             coef = self.coef
             coef4D_packed = Coef4D(

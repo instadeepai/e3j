@@ -215,11 +215,11 @@ def conv_problem():
 
 
 def conv_graph():
-    # int32 pinned: the FFI declares the adjacency as int32, and x64 would
-    # default these to int64. `core.Convolution` casts, the raw op does not.
+    # Dtype left to JAX on purpose: x64 defaults these to int64, which the op
+    # narrows for the FFI. The float64 cases below cover that path.
     k1, k2 = random.split(random.key(99))
-    sender = random.randint(k1, (CONV_EDGES,), 0, CONV_NODES, dtype="int32")
-    receiver = random.randint(k2, (CONV_EDGES,), 0, CONV_NODES, dtype="int32")
+    sender = random.randint(k1, (CONV_EDGES,), 0, CONV_NODES)
+    receiver = random.randint(k2, (CONV_EDGES,), 0, CONV_NODES)
     perm = jnp.argsort(receiver)
     return sender[perm], receiver[perm]
 

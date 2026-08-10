@@ -39,7 +39,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   also makes int64 the default integer dtype, so the CSR buffers `GraphCSR`
   derives with `jnp.bincount`, `jnp.cumsum` and `jnp.argsort` silently widened,
   and the FFI rejected them with `expected S32 but got S64`. `GraphCSR` derives
-  them as `int32` explicitly now.
+  them as `int32` explicitly now, and the convolution primitives narrow the
+  `sender` / `receiver` pair they are handed at the FFI boundary.
 - Misaligned SMEM access (`CUDA_ERROR_MISALIGNED_ADDRESS`) in the CUDA tensor
   product and convolution kernels: the coefficient buffer preceding the x/y/dx
   buffers in shared memory was only padded to an `N`-dependent boundary, which

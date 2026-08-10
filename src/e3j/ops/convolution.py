@@ -23,7 +23,7 @@ from jax import Array, custom_vjp
 from jax.ffi import ffi_call
 from numpy import int32
 
-from e3j.data.graph import DUMMY_INDEX, GraphCSR
+from e3j.data.graph import DUMMY_INDEX, INDEX_DTYPE, GraphCSR
 from e3j.ops.coef import Coef4D
 from e3j.utils import config, is_pow2
 from e3j.utils.options import GraphOrdering
@@ -35,8 +35,13 @@ def _wrap_global_index(index: Array, num_nodes: int) -> Array:
     Reduces modulo `num_nodes` as required under SPMD sharding and vmap
     folding, while preserving the `DUMMY_INDEX` sentinel out of range so
     padding edges stay dropped from the CSR adjacency.
+
+    Narrowed to `INDEX_DTYPE` for the FFI, which declares the adjacency as
+    int32 while `jax_enable_x64` defaults integers to int64. `DUMMY_INDEX` is
+    `INT32_MAX`, so the sentinel survives the cast.
     """
-    return jnp.where(index == DUMMY_INDEX, index, index % num_nodes)
+    local = jnp.where(index == DUMMY_INDEX, index, index % num_nodes)
+    return local.astype(INDEX_DTYPE)
 
 
 def _fold_endpoints(
