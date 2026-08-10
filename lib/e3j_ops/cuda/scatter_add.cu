@@ -19,6 +19,7 @@
 #include "cuda/dispatch_macros.h"
 #include <cstdint>
 #include <iostream>
+#include <type_traits>
 
 // TODO: Compute occupancy depending on device
 #define WARPS_PER_BLOCK 8
@@ -159,13 +160,22 @@ e3j::Error launch(
     cudaStream_t stream
 ) {
 
-    size_t sharedMem = p.num_out * sizeof(Val);
+    // float16 is not supported yet: the reduction needs atomicAdd(__half*),
+    // which does not exist (see NOTE below). The `if constexpr` keeps
+    // kernel<Idx,__half> from being instantiated at all.
+    if constexpr (std::is_same_v<Val, __half>) {
+        return e3j::Error::Unimplemented(
+            "scatter_add_1 does not support float16 values yet."
+        );
+    } else {
+        size_t sharedMem = p.num_out * sizeof(Val);
 
-    kernel<<<p.num_rows, THREADS_PER_BLOCK, sharedMem, stream>>>(
-        idx, val, out, p
-    );
+        kernel<<<p.num_rows, THREADS_PER_BLOCK, sharedMem, stream>>>(
+            idx, val, out, p
+        );
 
-    return e3j::Error::FromCudaLaunch(cudaGetLastError());
+        return e3j::Error::FromCudaLaunch(cudaGetLastError());
+    }
 }
 
 /* Specialize template for all dtypes using X macro.
@@ -179,10 +189,11 @@ e3j::Error launch(
  * NOTE: Specializing `launch<...>` will force `kernel<...>` to be compiled too.
  * We could otherwise make the namespace `scatter_add_1` a templated class.
  *
- * NOTE: Can't specialize the template to other data types for now, because
- * `atomicAdd(Val*, Val)` is not overloaded for `long` and `double`. We could
- * still implement our own (fast) version with `atomicCAS` (on `__half`),
- * search e.g. for `fastAtomicAdd` on the torch repo.
+ * NOTE: `float` and `double` are both instantiated (`atomicAdd(double*)` needs
+ * sm_60+). `__half` is not, since `atomicAdd(__half*, __half)` is not
+ * overloaded: `launch()` drops that instantiation and returns Unimplemented.
+ * We could still implement our own (fast) version with `atomicCAS`, search
+ * e.g. for `fastAtomicAdd` on the torch repo.
  */
 
 #define FOR_EACH_DTYPE_PAIR(Idx, Val)       \

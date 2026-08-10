@@ -39,9 +39,11 @@ from e3j.utils import next_pow2
 class ValDtype(Enum):
     """Scalar value dtypes supported by the e3j_ops binary."""
 
+    F16 = "float16"
     F32 = "float32"
+    F64 = "float64"
 
-    # TODO: add support for F16 and/or BF16
+    # TODO: add support for BF16
 
     def __str__(self):
         return self.value
@@ -59,6 +61,32 @@ class IdxDtype(Enum):
         return self.value
 
 
+#: Value dtypes the fused CUDA kernels dispatch on, as numpy dtype names.
+SUPPORTED_VAL_DTYPES = tuple(dtype.value for dtype in ValDtype)
+
+
+def resolve_val_dtype(input_dtype) -> str:
+    """Return the value dtype the fused CUDA kernels should run in.
+
+    Operations inherit the dtype of their operands: it drives both the operand
+    casts and the coefficient packing, so the kernel reads coefficients at the
+    stride the buffers were written at.
+
+    Args:
+        input_dtype: Promoted dtype of the operands, e.g. `jnp.result_type(x, y)`.
+
+    Raises:
+        TypeError: If `input_dtype` is not in `SUPPORTED_VAL_DTYPES`.
+    """
+    dtype = numpy.dtype(input_dtype).name
+    if dtype not in SUPPORTED_VAL_DTYPES:
+        raise TypeError(
+            f"Fused CUDA ops support value dtypes {SUPPORTED_VAL_DTYPES}, "
+            f"got {dtype!r}. Cast the operands."
+        )
+    return dtype
+
+
 @struct.dataclass
 class Coef:
     """Interface between a JAX-native BCOO format and a packed representation.
@@ -67,8 +95,8 @@ class Coef:
     This class allows to pass a packed representation of a BCOO array
     as an opaque `idx_dtype` array.
 
-    It is therefore assumed that the size of indices divides the size of values,
-    i.e. `val_dtype % idx_dtype == 0`.
+    Value and index dtypes are independent. A value smaller than one index slot
+    (`float16` next to `int32` indices) just leaves the rest of that slot empty.
 
     Note:
         The base class assumes 3D coefficients for bilinear Clebsch-Gordan
@@ -175,18 +203,14 @@ class Coef:
         )
         coef_t = cls._numpy_dtype(numpy.dtype(val_t), numpy.dtype(idx_t))
         numel = coef_t.itemsize // idx_t.itemsize
-        numval, mod = divmod(val_t.itemsize, idx_t.itemsize)
-        if mod != 0:
-            raise TypeError(
-                f"Cannot pack dtype pair: size of {idx_t} ({idx_t.itemsize}B) "
-                f"does not divide size of {val_t} ({val_t.itemsize}B) of values."
-            )
+        # Index slots `val` spans, rounded up: a narrower value still takes one.
+        numval = -(-val_t.itemsize // idx_t.itemsize)
         # Reinterpret as idx_t vector for slicing
         if isinstance(data, numpy.ndarray):
             data = data.view(dtype=idx_t).reshape(-1, numel)
-        # Slice N values
+        # Slice N slots, then keep their first value and drop the padding.
         val_as_idx = data[:, :numval]
-        val = val_as_idx.view(dtype=val_t).reshape(-1)
+        val = val_as_idx.view(dtype=val_t).reshape(val_as_idx.shape[0], -1)[:, 0]
         # Retrieve `cls.rank` index columns, skipping any trailing padding.
         idx = data[:, numval : numval + cls.rank]
         return cls(val, idx, val_dtype=val_t, idx_dtype=idx_t)

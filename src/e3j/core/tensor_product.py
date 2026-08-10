@@ -27,7 +27,7 @@ from jax.experimental import sparse
 
 import e3j.utils as utils
 from e3j.ops import CUDATensorProductParams, tensor_product
-from e3j.ops.coef import Coef
+from e3j.ops.coef import Coef, resolve_val_dtype
 from e3j.pallas_ops.tensor_product import (
     PallasMosaicTPUTensorProductParams,
     tensor_product_pallas_mosaic_tpu,
@@ -117,6 +117,13 @@ class TensorProduct(SparseMixin):
             Clebsch-Gordan tensor product.
           * `MAP` : channel-wise tensor products. Only useful with trailing
             channels layout, since leading axes are mapped over by default.
+
+        Note
+        ----
+        Operations inherit the dtype of their operands. On `FUSED_CUDA`, the
+        value dtype may be `float16`, `float32` or `float64`; `float16` needs
+        `layout="TRAILING_CHANNELS"`, since the `LEADING_CHANNELS` kernel
+        reduces with `atomicAdd`, which has no `__half` overload.
         """
         # This switch decides whether:
         # - Clebsch-Gordan coefficients should be computed and stacked
@@ -325,6 +332,11 @@ class TensorProduct(SparseMixin):
         coef: Array,
     ) -> Array:
         """Evaluate bilinear map on pair of inputs."""
+        # One kernel dtype for every buffer, coefficients included.
+        val_dtype = resolve_val_dtype(np.result_type(x, y))
+        x = x.astype(val_dtype)
+        y = y.astype(val_dtype)
+
         idx = coef.indices
         val = coef.data
         params = CUDATensorProductParams(
@@ -334,7 +346,7 @@ class TensorProduct(SparseMixin):
         )
         # Pack coefficients as opaque `idx_t` vector.
         with jax.ensure_compile_time_eval():
-            coef = Coef(val, idx, val_dtype=val.dtype, idx_dtype=idx.dtype).pack_jax()
+            coef = Coef(val, idx, val_dtype=val_dtype, idx_dtype=idx.dtype).pack_jax()
         return tensor_product(coef, x, y, params)
 
     def _mtpu_params(self, coef: sparse.BCOO | None = None):

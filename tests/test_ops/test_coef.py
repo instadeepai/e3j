@@ -12,59 +12,88 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+
+import jax
 import jax.numpy as jnp
 import numpy
 import pytest
 
 from e3j.ops.coef import Coef, Coef4D, IdxDtype, ValDtype
 
+# Packed itemsize per (val, idx) pair: the raw field size
+# `sizeof(val) + rank * sizeof(idx)`, rounded up to the next power of two.
+#
+# The CUDA side pins the same numbers with `static_assert`s, in
+# cuda/tensor_product.cuh and cuda/convolution.cuh: edit both tables together,
+# a divergence would silently misread every coefficient.
+COEF_ITEMSIZE = [
+    ("float32", "int32", 16),  # 4 + 3*4 = 16
+    ("float32", "uint8", 8),  # 4 + 3*1 =  7 ->  8
+    ("float64", "int32", 32),  # 8 + 3*4 = 20 -> 32
+    ("float64", "uint8", 16),  # 8 + 3*1 = 11 -> 16
+    ("float16", "int32", 16),  # 2 + 3*4 = 14 -> 16
+    ("float16", "uint8", 8),  # 2 + 3*1 =  5 ->  8
+]
+
+COEF4D_ITEMSIZE = [
+    ("float32", "int32", 32),  # 4 + 4*4 = 20 -> 32
+    ("float32", "uint8", 8),  # 4 + 4*1 =  8
+    ("float64", "int32", 32),  # 8 + 4*4 = 24 -> 32
+    ("float64", "uint8", 16),  # 8 + 4*1 = 12 -> 16
+    ("float16", "int32", 32),  # 2 + 4*4 = 18 -> 32
+    ("float16", "uint8", 8),  # 2 + 4*1 =  6 ->  8
+]
+
 
 class TestCoefDtypeSize:
     """Check that aligned numpy dtypes match CUDA struct sizes.
 
-    CUDA structs are padded to a multiple of the largest member's
-    alignment (float32 = 32 bits). numpy.dtype(align=True) must agree.
+    CUDA structs are padded to a multiple of their `alignas(next_pow2(...))`
+    alignment. `numpy.dtype(align=True)`, inflated to `next_pow2` by
+    `_numpy_dtype`, must agree.
     """
 
-    def test_coef_int32_is_16B(self):
-        # 32 + 32 + 32 + 32 = 128 bits, no padding needed
-        dt = Coef._numpy_dtype(numpy.dtype("float32"), numpy.dtype("int32"))
-        assert dt.itemsize == 16
+    @pytest.mark.parametrize("val_dtype, idx_dtype, itemsize", COEF_ITEMSIZE)
+    def test_coef_itemsize(self, val_dtype, idx_dtype, itemsize):
+        dt = Coef._numpy_dtype(numpy.dtype(val_dtype), numpy.dtype(idx_dtype))
+        assert dt.itemsize == itemsize
 
-    # uint16 disabled — numpy gives 12B, CUDA gives 16B (alignas(16) inflates
-    # 10 raw bytes to next power of 2). This mismatch is the bug; the test is
-    # left commented to document the Python side of it.
-    # def test_coef_uint16_is_12B(self):
-    #     dt = Coef._numpy_dtype(numpy.dtype("float32"), numpy.dtype("uint16"))
-    #     assert dt.itemsize == 12  # != 16 (CUDA sizeof) — that's the problem
+    @pytest.mark.parametrize("val_dtype, idx_dtype, itemsize", COEF4D_ITEMSIZE)
+    def test_coef4d_itemsize(self, val_dtype, idx_dtype, itemsize):
+        dt = Coef4D._numpy_dtype(numpy.dtype(val_dtype), numpy.dtype(idx_dtype))
+        assert dt.itemsize == itemsize
 
-    def test_coef_uint8_is_8B(self):
-        # 32 + 8 + 8 + 8 = 56 bits, padded to 64 (multiple of 32)
-        dt = Coef._numpy_dtype(numpy.dtype("float32"), numpy.dtype("uint8"))
-        assert dt.itemsize == 8
+    @pytest.mark.parametrize(
+        "coef_cls, table", [(Coef, COEF_ITEMSIZE), (Coef4D, COEF4D_ITEMSIZE)]
+    )
+    def test_field_offsets(self, coef_cls, table):
+        """`val` comes first, then the indices, each aligned to sizeof(idx).
 
-
-class TestCoef4DDtypeSize:
-    """Check that Coef4D numpy dtypes match CUDA alignas(next_pow2(...)) sizes."""
-
-    def test_coef4d_int32_is_32B(self):
-        # raw = 4 + 4*4 = 20B, next_pow2(20) = 32
-        dt = Coef4D._numpy_dtype(numpy.dtype("float32"), numpy.dtype("int32"))
-        assert dt.itemsize == 32
-
-    def test_coef4d_uint8_is_8B(self):
-        # raw = 4 + 4*1 = 8B, next_pow2(8) = 8
-        dt = Coef4D._numpy_dtype(numpy.dtype("float32"), numpy.dtype("uint8"))
-        assert dt.itemsize == 8
+        A value smaller than one index slot (float16 with int32 indices) leaves
+        padding, so the indices start at 4 instead of 2.
+        """
+        for val_dtype, idx_dtype, _ in table:
+            dt = coef_cls._numpy_dtype(numpy.dtype(val_dtype), numpy.dtype(idx_dtype))
+            assert dt.fields["val"][1] == 0
+            stride = numpy.dtype(idx_dtype).itemsize
+            # first index offset: sizeof(val) rounded up to the index alignment
+            base = -(-numpy.dtype(val_dtype).itemsize // stride) * stride
+            for n, name in enumerate(coef_cls.index_names):
+                assert dt.fields[name][1] == base + n * stride
 
 
 # --- Round-trip tests (shared base) ---
 
 
+# Every (value, index) combination the kernels dispatch: the two are independent.
 DTYPE_PAIRS = [
     ("float32", "int32"),
-    # ("float32", "uint16"),  # disabled: IdxDtype.U16 removed
     ("float32", "uint8"),
+    ("float64", "int32"),
+    ("float64", "uint8"),
+    ("float16", "int32"),
+    ("float16", "uint8"),
 ]
 
 
@@ -123,7 +152,11 @@ class _TestIdxDtypeRoundTrip:
     def test_unpack_from_jax(self, coef):
         """unpack() recovers original val and idx from a packed JAX array."""
         jax_arr = coef.pack_jax()
-        recovered = type(coef).unpack(jax_arr, val_dtype=coef.val_dtype)
+        # JAX only holds float64 values with x64 enabled, as in production.
+        needs_x64 = numpy.dtype(coef.val_dtype).itemsize > 4
+        ctx = jax.enable_x64() if needs_x64 else contextlib.nullcontext()
+        with ctx:
+            recovered = type(coef).unpack(jax_arr, val_dtype=coef.val_dtype)
 
         numpy.testing.assert_array_equal(
             numpy.asarray(recovered.val), numpy.asarray(coef.val)
@@ -143,6 +176,24 @@ class _TestIdxDtypeRoundTrip:
         numpy.testing.assert_array_equal(
             numpy.asarray(recovered.idx), numpy.asarray(coef.idx)
         )
+
+
+class TestNarrowValueWideIndex:
+    """A value smaller than one index slot round-trips (float16 + int32)."""
+
+    @pytest.mark.parametrize("coef_cls", [Coef, Coef4D])
+    def test_float16_int32_roundtrip(self, coef_cls):
+        rank = coef_cls.rank
+        val = numpy.array([1.0, -0.5], dtype="float16")
+        # Indices out of the uint8 range, to check int32 is really kept.
+        idx = numpy.array(
+            [[70_000 + i for i in range(rank)], [80_000 + i for i in range(rank)]],
+            dtype="int32",
+        )
+        coef = coef_cls(val, idx, val_dtype="float16", idx_dtype="int32")
+        recovered = coef_cls.unpack(coef.pack_numpy(), val_dtype="float16")
+        numpy.testing.assert_array_equal(numpy.asarray(recovered.val), val)
+        numpy.testing.assert_array_equal(numpy.asarray(recovered.idx), idx)
 
 
 class TestIdxDtypeRoundTrip(_TestIdxDtypeRoundTrip):

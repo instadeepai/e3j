@@ -352,39 +352,48 @@ e3j::Error launch(
         return e3j::Error::Unimplemented("Mode::MAP not yet supported with Layout::LEADING_CHANNELS.");
     };
 
-    switch (p.unroll_z) {
-        case 1:
-            kernel<Idx, Val, kMode, 32>
-                <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
-                (coef, x, y, out, p);
-            break;
+    // float16 is not supported yet with this layout: the kernel accumulates in
+    // shared memory with atomicAdd(__half*), which does not exist. The
+    // `if constexpr` keeps kernel<...,__half> from being instantiated at all.
+    if constexpr (std::is_same_v<Val, __half>) {
+        return e3j::Error::Unimplemented(
+            "LEADING_CHANNELS tensor product does not support float16 yet."
+        );
+    } else {
+        switch (p.unroll_z) {
+            case 1:
+                kernel<Idx, Val, kMode, 32>
+                    <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
+                    (coef, x, y, out, p);
+                break;
 
-        case 2:
-            kernel<Idx, Val, kMode, 16>
-                <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
-                (coef, x, y, out, p);
-            break;
+            case 2:
+                kernel<Idx, Val, kMode, 16>
+                    <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
+                    (coef, x, y, out, p);
+                break;
 
-        case 4:
-            kernel<Idx, Val, kMode, 8>
-                <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
-                (coef, x, y, out, p);
-            break;
+            case 4:
+                kernel<Idx, Val, kMode, 8>
+                    <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
+                    (coef, x, y, out, p);
+                break;
 
-        case 8:
-            kernel<Idx, Val, kMode, 4>
-                <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
-                (coef, x, y, out, p);
-            break;
+            case 8:
+                kernel<Idx, Val, kMode, 4>
+                    <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
+                    (coef, x, y, out, p);
+                break;
 
-        case 16:
-            kernel<Idx, Val, kMode, 2>
-                <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
-                (coef, x, y, out, p);
-            break;
+            case 16:
+                kernel<Idx, Val, kMode, 2>
+                    <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>
+                    (coef, x, y, out, p);
+                break;
 
-        default:
-            return e3j::Error::InvalidArgument("unroll parameter must be in {1,2,4,8,16}.");
+            default:
+                return e3j::Error::InvalidArgument("unroll parameter must be in {1,2,4,8,16}.");
+        }
     }
 
     cudaError_t launch_err = cudaGetLastError();

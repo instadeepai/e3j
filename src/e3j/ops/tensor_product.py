@@ -81,6 +81,14 @@ def tensor_product(
                 f"Got ({channels_x, channels_y})."
             )
 
+    # The launcher rejects it too, but only once the kernel runs.
+    if layout is Layout.LEADING_CHANNELS and x.dtype == jnp.float16:
+        raise NotImplementedError(
+            "float16 values are not supported with Layout.LEADING_CHANNELS: the "
+            "kernel reduces with atomicAdd, which has no __half overload. Use "
+            "Layout.TRAILING_CHANNELS for float16, or float32/float64 here."
+        )
+
     num_out = params.num_out
 
     # Infer output channels
@@ -271,7 +279,7 @@ def tensor_product_bwd(
     # coef_xzy / coef_yzx are the dx / dy passes; their column 0 (the output
     # index) is the set of coordinates each pass writes -- used to zero gaps.
     with jax.ensure_compile_time_eval():
-        c = Coef.unpack(coef, val_dtype="float32")
+        c = Coef.unpack(coef, val_dtype=x.dtype)
         coef_xzy = c.transpose((1, 0, 2))
         coef_yzx = c.transpose((2, 0, 1))
         coef_bwd = jnp.stack([coef_xzy.pack_jax(), coef_yzx.pack_jax()])
@@ -437,7 +445,7 @@ def _tensor_product_bwd_fallback(coef, params, res, ct_z):
     #       yield less supported mode "(1, u) -> 1".
     with jax.ensure_compile_time_eval():
         # Unpack to permute indices for transposed tensor products
-        c = Coef.unpack(coef, val_dtype="float32")
+        c = Coef.unpack(coef, val_dtype=x.dtype)
         coef_x = c.transpose((1, 0, 2)).pack_jax()
         coef_y = c.transpose((2, 0, 1)).pack_jax()
 

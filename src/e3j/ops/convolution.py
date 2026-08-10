@@ -156,7 +156,7 @@ def convolution(
         if y_parity is None:
             raise ValueError("SENDER graph ordering requires `y_parity`.")
         with jax.ensure_compile_time_eval():
-            c = Coef4D.unpack(coef, val_dtype="float32")
+            c = Coef4D.unpack(coef, val_dtype=x.dtype)
             signs = jnp.asarray(y_parity, dtype=c.val.dtype)[c.idx[:, 2]]
             coef_fwd = Coef4D(
                 c.val * signs, c.idx, val_dtype=c.val_dtype, idx_dtype=c.idx_dtype
@@ -318,7 +318,7 @@ def convolution_bwd(
         #   - dx = bigotimes(coef_dx, dm, y, s)
         #   - dy = bigotimes(coef_dy, dm, x, s)
         #   - ds = bigotimes(coef_ds, dm, y, x)
-        c = Coef4D.unpack(coef, val_dtype="float32")
+        c = Coef4D.unpack(coef, val_dtype=x.dtype)
         coef_dx = c.transpose((1, 0, 2, 3)).pack_jax()
         coef_dy = c.transpose((2, 0, 1, 3)).pack_jax()
         coef_ds = c.transpose((3, 0, 2, 1)).pack_jax()

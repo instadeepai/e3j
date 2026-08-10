@@ -6,8 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 
 ## [Unreleased]
 
+### Added
+
+- `float16` and `float64` value dtypes for the fused CUDA tensor product and
+  convolution kernels, which were float32 only. The kernels compute and
+  accumulate in that dtype, so there is no separate accumulation dtype. Value
+  and index dtypes are independent: any of them works with the `int32` or
+  `uint8` index dtype `narrow_index_dtype` picks from the coefficient table.
+  Operations inherit the dtype of their operands, which the fused path promotes
+  and packs the coefficients in, so there is no dtype option to set. `float64`
+  requires `jax_enable_x64`, see below.
+- `static_assert`s pinning the `sizeof` of the packed CUDA `Coef` and `Coef4D`
+  structs for every supported `(idx, val)` pair, mirroring the itemsize tables
+  in `tests/test_ops/test_coef.py`. A divergence between the two packings would
+  silently misread every coefficient.
+
+### Changed
+
+- **Breaking (CUDA):** the `int32` *value* dtype is no longer supported by the
+  fused kernels, `scatter_add_1` with `int32` values now returns
+  `InvalidArgument`. `int32` and `uint8` *index* dtypes are unchanged.
+- `float16` is not supported yet on the two `atomicAdd` based paths,
+  `scatter_add_1` and the `LEADING_CHANNELS` tensor product, which raise a
+  `NotImplementedError` while tracing. `float64` is supported everywhere.
+
 ### Fixed
 
+- `SparseMixin` aggregates in the dtype of its summands. `jnp.zeros` defaults to
+  float64 under `jax_enable_x64`, which promoted the output of an otherwise
+  float32 tensor product.
+- `float64` operands no longer break the fused convolution. `jax_enable_x64`
+  also makes int64 the default integer dtype, so the CSR buffers `GraphCSR`
+  derives with `jnp.bincount`, `jnp.cumsum` and `jnp.argsort` silently widened,
+  and the FFI rejected them with `expected S32 but got S64`. `GraphCSR` derives
+  them as `int32` explicitly now.
 - Misaligned SMEM access (`CUDA_ERROR_MISALIGNED_ADDRESS`) in the CUDA tensor
   product and convolution kernels: the coefficient buffer preceding the x/y/dx
   buffers in shared memory was only padded to an `N`-dependent boundary, which

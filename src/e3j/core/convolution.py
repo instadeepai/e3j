@@ -21,7 +21,7 @@ from e3j import utils
 from e3j.core.scalar_mixing import ScalarMixing
 from e3j.core.tensor_product import TensorProduct
 from e3j.data.graph import GraphCSR
-from e3j.ops.coef import Coef4D
+from e3j.ops.coef import Coef4D, resolve_val_dtype
 from e3j.ops.convolution import CUDAConvolutionParams, convolution
 from e3j.pallas_ops.convolution.mosaic_tpu import (
     PallasMosaicTPUMessagePassingConvolutionParams,
@@ -103,6 +103,12 @@ class Convolution:
             config: Global :class:`e3j.utils.config.Config` (optional) pointing
                 to the implementation path. The best available option should be
                 automatically selected based on the environment.
+
+        Note:
+            Operations inherit the dtype of their operands. On `FUSED_CUDA`, the
+            value dtype may be `float16`, `float32` or `float64`: the fused
+            convolution is trailing channels only, so it never hits the
+            `atomicAdd` float16 restriction.
         """
         # Tensor product block
         otimes = TensorProduct(
@@ -198,8 +204,26 @@ class Convolution:
             raise NotImplementedError(
                 "CUDA convolution only supports SENDER and RECEIVER ordering."
             )
+
+        # One kernel dtype for every buffer, coefficients included.
+        val_dtype = resolve_val_dtype(
+            np.result_type(node_features, edge_features, edge_scalars)
+        )
+        node_features = node_features.astype(val_dtype)
+        edge_features = edge_features.astype(val_dtype)
+        edge_scalars = edge_scalars.astype(val_dtype)
+
+        # The FFI declares the adjacency buffers as int32, while `jax_enable_x64`
+        # (required by float64) makes int64 the default integer dtype. Narrow
+        # them here, or a graph built with `jnp.arange` would be rejected.
+        senders = senders.astype(numpy.int32)
+        receivers = receivers.astype(numpy.int32)
+
         with jax.ensure_compile_time_eval():
-            coef4D_packed = self.coef.pack_jax()
+            coef = self.coef
+            coef4D_packed = Coef4D(
+                coef.val, coef.idx, val_dtype=val_dtype, idx_dtype=coef.idx_dtype
+            ).pack_jax()
 
         params = CUDAConvolutionParams(
             num_out=self.target.dim,

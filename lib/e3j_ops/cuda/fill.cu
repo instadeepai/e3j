@@ -14,6 +14,7 @@
  */
 
 #include "cuda/fill.cuh"
+#include <cuda_fp16.h>
 #include <iostream>
 
 namespace e3j {
@@ -47,7 +48,8 @@ e3j::Error launch(Val *out, Val value, Params p, cudaStream_t stream) {
 
 #define DISPATCH_VAL_DTYPE  \
     X(float)                \
-    X(std::int32_t)
+    X(double)               \
+    X(__half)
 
 #define X(Val)                                       \
 template e3j::Error launch<Val> (                    \

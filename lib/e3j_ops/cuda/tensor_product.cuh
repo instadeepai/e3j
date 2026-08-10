@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
 #include "ffi/error.h"
@@ -107,6 +108,9 @@ struct Params {
  *  rounded up to the next power of two.  This gives:
  *    Idx=int32, Val=float  ->  4+12=16  -> alignas(16) -> LDS.128
  *    Idx=uint8, Val=float  ->  4+ 3= 7  -> alignas( 8) -> LDS.64
+ *    Idx=int32, Val=double ->  8+12=20  -> alignas(32) -> 2x LDS.128
+ *    Idx=int32, Val=half   ->  2+12=14  -> alignas(16) -> LDS.128
+ *    Idx=uint8, Val=half   ->  2+ 3= 5  -> alignas( 8) -> LDS.64
  *****************************************************************/
 template<typename Idx, typename Val>
 struct alignas(next_pow2(sizeof(Val) + 3*sizeof(Idx))) Coef {
@@ -115,6 +119,16 @@ struct alignas(next_pow2(sizeof(Val) + 3*sizeof(Idx))) Coef {
     Idx j;
     Idx k;
 };
+
+// `sizeof` must match the numpy itemsize of `Coef._numpy_dtype` in
+// e3j/ops/coef.py, else every coefficient is misread. Same values as the
+// `COEF_ITEMSIZE` table in tests/test_ops/test_coef.py: edit both together.
+static_assert(sizeof(Coef<std::int32_t, float>)  == 16, "Coef(int32,float)");
+static_assert(sizeof(Coef<std::uint8_t, float>)  ==  8, "Coef(uint8,float)");
+static_assert(sizeof(Coef<std::int32_t, double>) == 32, "Coef(int32,double)");
+static_assert(sizeof(Coef<std::uint8_t, double>) == 16, "Coef(uint8,double)");
+static_assert(sizeof(Coef<std::int32_t, __half>) == 16, "Coef(int32,half)");
+static_assert(sizeof(Coef<std::uint8_t, __half>) ==  8, "Coef(uint8,half)");
 
 
 template<typename Idx, typename Val, Mode kMode>
