@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import e3nn_jax as e3nn
 import jax
 import jax.numpy as np
@@ -26,6 +28,7 @@ class _TestHarmonics:
     """Base class for harmonics polynomial tests."""
 
     out: int | str
+    normalization: str = "integral"
     batch_size: int = 4096
     _seed: int = 42
 
@@ -71,7 +74,7 @@ class _TestHarmonics:
     @pytest.fixture(scope="class")
     def e3j_module(self):
         """Our polynomial evaluation."""
-        return Harmonics(self.out, normalize=True)
+        return Harmonics(self.out, normalize=True, normalization=self.normalization)
 
     @pytest.fixture(scope="class")
     def e3nn_module(self):
@@ -82,11 +85,8 @@ class _TestHarmonics:
             out = e3nn.Irreps(self.out)
 
         def e3nn_harmonics(x: np.ndarray) -> np.ndarray:
-            # `integral` is the normalization e3nn documents as matching the
-            # standard real spherical harmonics; it is the convention `Harmonics`
-            # reproduces (unit L2 norm on the sphere).
             return e3nn.spherical_harmonics(
-                out, x, True, normalization="integral"
+                out, x, True, normalization=self.normalization
             ).array
 
         return e3nn_harmonics
@@ -132,6 +132,21 @@ class _TestHarmonics:
             print("error.std", np.std(data, axis=0), sep="\n")
             raise err
 
+    def expected_s2_norm(self, l: int) -> float:
+        """Expected `sqrt(integral_S2(Y_lm^2))` for `self.normalization`.
+
+        Mirrors e3nn's documented relationship between conventions: "integral"
+        has unit S2-integral by definition, "component" scales it by `4*pi`,
+        and "norm" scales it by `4*pi / (2l + 1)`.
+        """
+        if self.normalization == "integral":
+            return 1.0
+        if self.normalization == "component":
+            return math.sqrt(4 * math.pi)
+        if self.normalization == "norm":
+            return math.sqrt(4 * math.pi / (2 * l + 1))
+        raise NotImplementedError(self.normalization)
+
     # --- Test functions ---
 
     def test_jvp(self, inputs, tangents, e3j_module, e3nn_module):
@@ -152,13 +167,30 @@ class _TestHarmonics:
         s2_expectation = (1 / N) * np.sum(np.abs(results) ** 2, axis=0)
         s2_integral = s2_expectation * s2_mass
         s2_norm = np.sqrt(s2_integral)
-        self.assert_zero(1 - s2_norm, tol=5e-3)
+        expected = np.concatenate(
+            [
+                np.full(2 * irrep_out.l + 1, self.expected_s2_norm(irrep_out.l))
+                for _, irrep_out in e3j_module.target
+            ]
+        )
+        self.assert_zero(expected - s2_norm, tol=5e-3)
 
     def test_e3nn(self, inputs, e3j_module, e3nn_module):
         """Check that e3j and e3nn modules give the same output."""
         result = e3j_module(inputs)
         expect = e3nn_module(inputs)
         return self.assert_close(expect, result)
+
+    def test_default_normalization(self, inputs):
+        """Check that leaving `normalization` unset agrees with e3nn_jax's default."""
+        out = (
+            e3nn.Irreps([(1, (l, (-1) ** l)) for l in range(self.out + 1)])
+            if isinstance(self.out, int)
+            else e3nn.Irreps(self.out)
+        )
+        result = Harmonics(self.out, normalize=True)(inputs)
+        expect = e3nn.spherical_harmonics(out, inputs, True).array
+        self.assert_close(expect, result)
 
     def test_grad_jit(self, inputs, e3j_module):
         sum_P = jax.jit(lambda r: np.sum(e3j_module(r)))
@@ -203,3 +235,15 @@ class TestHarmonicsSP(_TestHarmonics):
 class TestHarmonics5(_TestHarmonics):
 
     out = "0e + 1o + 2e + 3o + 4e + 5o"
+
+
+class TestHarmonics5Component(_TestHarmonics):
+
+    out = "0e + 1o + 2e + 3o + 4e + 5o"
+    normalization = "component"
+
+
+class TestHarmonics5Norm(_TestHarmonics):
+
+    out = "0e + 1o + 2e + 3o + 4e + 5o"
+    normalization = "norm"
