@@ -1,8 +1,8 @@
 # 🌐 e3j
 
-This library is a fast, full-featured and platform-agnostic
-equivariance backend for GPU and TPU.
-It can be used in place of [e3nn] and [e3x] to replace slow operations
+A fast, full-featured and platform-agnostic equivariance backend for GPU and TPU!
+
+This library can be used in place of [e3nn] and [e3x] to replace slow operations
 in Machine Learned Interatomic Potentials (MLIPs), with carefully optimized
 and open-source CUDA and Pallas kernels.
 
@@ -88,7 +88,7 @@ and benchmark end to end, see [mlip]
 
 ## Contributing
 
-Although it is too early for [e3j] to accept significant external contributions, bug reports or questions are very welcome via [GitHub][e3j] issues and  discussions.
+Bug reports, questions and feature requests are welcome via [GitHub][e3j] issues and discussions.
 
 
 ## Citing
