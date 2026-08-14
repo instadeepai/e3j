@@ -1,20 +1,12 @@
 # 🌐 e3j
 
-Euclid-equivariant operations and harmonic polynomials for JAX.
-
-This library is a fast and full-featured Euclidean equivariance
-backend which can be used in place of [e3nn] and [e3x] to
-replace slow operations in Machine Learned Interatomic Potentials (MLIPs)
-with carefully optimized
-and open-source CUDA and Pallas kernels for GPU and TPU.
+This library is a fast, full-featured and platform-agnostic
+equivariance backend for GPU and TPU.
+It can be used in place of [e3nn] and [e3x] to replace slow operations
+in Machine Learned Interatomic Potentials (MLIPs), with carefully optimized
+and open-source CUDA and Pallas kernels.
 
 The equivariance backend of our MLIP library is [e3j] as of [mlip] 0.2.0.
-
-> **Note:** `e3j` is currently in pre-release (0.1.0b5),
-> with version 0.1.0 planned in July 2026.
-> Additional CUDA kernels and dedicated Pallas kernels for TPU
-> are being rolled out progressively, supporting infinite differentiability
-> and SPMD support.
 
 [e3nn]: https://github.com/e3nn/e3nn-jax
 [e3x]: https://github.com/google-research/e3x
@@ -25,7 +17,8 @@ The equivariance backend of our MLIP library is [e3j] as of [mlip] 0.2.0.
 ### Pulling from PyPI
 
 The [`e3j`][e3j-pypi] package is available on PyPI.
-It consists of a thin JAX-based Python API which can run on CPU, GPU and TPU, supporting  Python versions from 3.11 to 3.14 included.
+It consists of a thin JAX-based Python API which can run on CPU, GPU and TPU,
+supporting  Python versions from 3.11 to 3.14 included.
 
 For efficiency on GPU, our CUDA binaries are bundled as the [`e3j_ops`][e3j-ops-pypi]
 package on PyPI. The compatible version of the binaries should
@@ -63,13 +56,12 @@ ABI is reported stable.
 `e3j` provides a platform-agnostic API for GPU and TPU:
 
 - 🖥️ The same Python API on CPU, GPU and TPU, with a portable JAX fallback
-wherever the fused kernels do not apply
-- ⚛️ Equivariant building blocks: spherical harmonics (`Harmonics`),
-tensor products (`TensorProduct`, `Bigotimes`), message-passing convolutions
-(`Convolution`), scalar mixing (`ScalarMixing`) and equivariant power
-expansions (`PowerExpansion`)
-- 🔗 Parameterized operations `Linear` and `LinearIndexwise` as
-[flax.linen.Module] instances, with weight initializations matching [e3nn]
+when kernels don't apply
+- 🔗 Interoperability made easy via plain `jax.Array` semantics
+- 🌐 All equivariant building blocks: spherical harmonics (`Harmonics`),
+tensor products (`TensorProduct`, `Bigotimes`), message-passing convolution
+(`Convolution`) and learnable linear maps (`Linear`, `LinearIndexwise`)
+as [flax.linen.Module] with weight initializations matching [e3nn]
 - 🏎️ Fused CUDA kernels for GPU (tensor product, message-passing convolution,
 scatter-add), shipped as the standalone [`e3j_ops`][e3j-ops-pypi] wheel
 and dispatched through XLA-FFI
@@ -77,13 +69,15 @@ and dispatched through XLA-FFI
 scalar mixing and scatter in a single kernel
 - 🔁 Custom VJP rules for every fused kernel, so they differentiate
 under `jax.grad` like any other JAX primitive
+- 🎛️ SPMD support for muliple-device MLIP training
 - 🧱 Multiple memory layouts (leading channels, trailing channels, and a flat
 [e3nn]-compatible layout) to trade coalescing off against interoperability
-- 📐 Representation utilities: O(3) and SO(3) spaces, irreps parsing,
+- 📐 Representation utilities: O(3) and SO(3) spaces, irreps filtering and
 irrep filtering, permutations and generalized Clebsch-Gordan coefficients
 - 🔌 Full coverage of the [e3nn] and [e3x] layers used by an MLIP, kernel-backed
 or not, so an existing model can be ported over entirely — to train, simulate
 and benchmark end to end, see [mlip]
+
 
 <div align="center">
   <a href="https://instadeepai.github.io/e3j/animation.html"><img src="docs/animations/kernel_thumbnail.png" alt="Watch: E3J's Message Passing Convolution kernel on TPU" width="540"></a>
