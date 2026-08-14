@@ -50,7 +50,7 @@ uv sync --group cuda13_local --extra ops
 uv sync --group cuda13 --extra ops
 ```
 
-The Python build internally relies on CMake, scikit-build and pybind11. You can also look at the [Makefile](Makefile) for alternate recipes to build kernels,
+The Python build internally relies on CMake, [scikit-build] and pybind11. You can also look at the [Makefile](Makefile) for alternate recipes to build kernels,
 C++ tests and the Python bindings.
 
 The [e3j_ops](lib/e3j_ops/README.md)
@@ -58,23 +58,36 @@ Python package only contains our CUDA binaries and bindings
 to their associated XLA handlers. It is not meant to be used as standalone until its
 ABI is reported stable.
 
-## Project structure
+## Features
 
-The JAX primitives wrapping our custom XLA handlers are defined in the `e3j.ops` subpackage of `e3j`, provided the `e3j_ops` binaries can be found in the environment.
+`e3j` provides a platform-agnostic API for GPU and TPU:
 
-- [src/e3j](src/e3j) : Python source
-    + [core](src/e3j/core) : Non-parameterized
-    equivariant operations
-    + [linen](src/e3j/linen) : Parameterized equivariant operations as [flax.linen.Module] instances
-    + [ops](src/e3j/ops) : JAX primitives and AD rules around the XLA-FFI bindings of [e3j_ops][e3j-ops-pypi]
-- [tests](tests) : Python test suite, based on [pytest]
-    + [test_ops](tests/test_ops) : XLA-FFI bindings tests marked with `"e3j_ops"`
-- [Makefile](Makefile) : build recipes for CUDA/C++ objects and tests
-- [lib/e3j_ops](lib/e3j_ops) : CUDA/C++ source for the `e3j_ops` subpackage
-    + [cuda](lib/e3j_ops/cuda) : custom kernel implementations
-    + [ffi](lib/e3j_ops/ffi) : XLA and Python binding boilerplate
-    + [tests](lib/e3j_ops/tests) : pure C++ tests for CUDA kernels
-    + [CMakeLists.txt](lib/e3j_ops/CMakeLists.txt) : holistic build recipe for [pyproject.toml](lib/e3j_ops/pyproject.toml) integration with [scikit-build]
+- 🖥️ The same Python API on CPU, GPU and TPU, with a portable JAX fallback
+wherever the fused kernels do not apply
+- ⚛️ Equivariant building blocks: spherical harmonics (`Harmonics`),
+tensor products (`TensorProduct`, `Bigotimes`), message-passing convolutions
+(`Convolution`), scalar mixing (`ScalarMixing`) and equivariant power
+expansions (`PowerExpansion`)
+- 🔗 Parameterized operations `Linear` and `LinearIndexwise` as
+[flax.linen.Module] instances, with weight initializations matching [e3nn]
+- 🏎️ Fused CUDA kernels for GPU (tensor product, message-passing convolution,
+scatter-add), shipped as the standalone [`e3j_ops`][e3j-ops-pypi] wheel
+and dispatched through XLA-FFI
+- 🧮 Fused Pallas Mosaic-TPU kernels, computing gather, tensor product,
+scalar mixing and scatter in a single kernel
+- 🔁 Custom VJP rules for every fused kernel, so they differentiate
+under `jax.grad` like any other JAX primitive
+- 🧱 Multiple memory layouts (leading channels, trailing channels, and a flat
+[e3nn]-compatible layout) to trade coalescing off against interoperability
+- 📐 Representation utilities: O(3) and SO(3) spaces, irreps parsing,
+irrep filtering, permutations and generalized Clebsch-Gordan coefficients
+- 🔌 Full coverage of the [e3nn] and [e3x] layers used by an MLIP, kernel-backed
+or not, so an existing model can be ported over entirely — to train, simulate
+and benchmark end to end, see [mlip]
+
+<div align="center">
+  <a href="https://instadeepai.github.io/e3j/animation.html"><img src="docs/animations/kernel_thumbnail.png" alt="Watch: E3J's Message Passing Convolution kernel on TPU" width="540"></a>
+</div>
 
 [flax.linen.Module]: https://flax-linen.readthedocs.io/en/latest/api_reference/flax.linen/module.html
 
@@ -100,5 +113,4 @@ If you use [e3j] within your work, we kindly ask you to cite the following prepr
 [e3j]: https://github.com/instadeepai/e3j
 [e3j-pypi]: https://pypi.org/projects/e3j
 [e3j-ops-pypi]: https://pypi.org/projects/e3j_ops
-[pytest]: https://pytest.org
 [scikit-build]: https://scikit-build.readthedocs.io/en/latest/

@@ -17,6 +17,11 @@ of type :class:`e3j.spaces.o3.O3Array`
 Currently, parameterized operations are only integrated within the `flax.linen`_
 framework for JAX neural networks, within the `e3j.linen <api/linen.html>`_ submodule.
 
+The same API runs on CPU, GPU and TPU: :class:`e3j.utils.config.config` selects
+the default implementation of each operation from the detected platform, i.e. the
+fused CUDA kernels of `e3j_ops` on GPU, the fused Mosaic kernels on TPU, and a
+portable JAX fallback elsewhere.
+
 .. _handbook: handbook.html
 
 .. _flax.linen: https://flax-linen.readthedocs.io/en/latest/api_reference/flax.linen/index.html
