@@ -4,55 +4,45 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased]
+## [0.1.0] — 2026-08-14
 
 ### Added
 
-- `float16` and `float64` value dtypes for the fused CUDA tensor product and
-  convolution kernels, which were float32 only. The kernels compute and
-  accumulate in that dtype, so there is no separate accumulation dtype. Value
-  and index dtypes are independent: any of them works with the `int32` or
-  `uint8` index dtype `narrow_index_dtype` picks from the coefficient table.
-  Operations inherit the dtype of their operands, which the fused path promotes
-  and packs the coefficients in, so there is no dtype option to set. `float64`
-  requires `jax_enable_x64`, see below.
-- `static_assert`s pinning the `sizeof` of the packed CUDA `Coef` and `Coef4D`
-  structs for every supported `(idx, val)` pair, mirroring the itemsize tables
-  in `tests/test_ops/test_coef.py`. A divergence between the two packings would
-  silently misread every coefficient.
+- Optional `node_mask` argument in `core.Convolution`, bypassing aggregation
+  on padding edges to avoid significant overhead in simulations.
+- Support for `float64` and `float16` value dtypes in trailing channels CUDA kernels.
 
 ### Changed
 
-- **Breaking (CUDA):** the `int32` *value* dtype is no longer supported by the
-  fused kernels, `scatter_add_1` with `int32` values now returns
-  `InvalidArgument`. `int32` and `uint8` *index* dtypes are unchanged.
-- `float16` is not supported yet on the two `atomicAdd` based paths,
-  `scatter_add_1` and the `LEADING_CHANNELS` tensor product, which raise a
-  `NotImplementedError` while tracing. `float64` is supported everywhere.
+- Harmonized public API options naming patterns:
+  + `UNFUSED` now selects the plain-JAX, CPU compatible implementation while
+    `FUSED_CUDA` selects kernels from `e3j_ops` (the former `SPARSE` and `FUSED`
+    tensor product options raise an error).
+  + `TPMode` has been renamed to `MixingMode`
+  + `TPNormalization` has been renamed to `TensorProductNormalization`.
+- Various performance improvements on the Pallas MTPU kernels.
+- Dropped `int32` *value* dtypes previously used in testing from CUDA binaries.
+- The default configuration detects a `JAX_PLATFORMS="cpu"` environment override
+  and opts out of all dedicated kernels even if they are available.
+- The different evaluation methods of `TensorProduct` are now private and
+  prefixed with `_`.
 
 ### Fixed
 
-- `SparseMixin` aggregates in the dtype of its summands. `jnp.zeros` defaults to
-  float64 under `jax_enable_x64`, which promoted the output of an otherwise
-  float32 tensor product.
-- `float64` operands no longer break the fused convolution. `jax_enable_x64`
-  also makes int64 the default integer dtype, so the CSR buffers `GraphCSR`
-  derives with `jnp.bincount`, `jnp.cumsum` and `jnp.argsort` silently widened,
-  and the FFI rejected them with `expected S32 but got S64`. `GraphCSR` derives
-  them as `int32` explicitly now, and the convolution primitives narrow the
-  `sender` / `receiver` pair they are handed at the FFI boundary.
-- Misaligned SMEM access (`CUDA_ERROR_MISALIGNED_ADDRESS`) in the CUDA tensor
-  product and convolution kernels: the coefficient buffer preceding the x/y/dx
-  buffers in shared memory was only padded to an `N`-dependent boundary, which
-  left it 8-byte aligned for `N < 4` with odd coefficient counts. Padding is
-  now unified through a `utils::smem_align()` helper that always rounds up to
-  16 bytes, matching the vectorized `LDS.128` / `int4` `cp.async` accesses.
-- *Breaking Change* `e3j.core.Harmonics` now reproduces `e3nn.spherical_harmonics` value-for-value
-  (for `normalization="integral"`, under the `y, z, x` axis ordering), instead of
-  only up to a per-channel sign. The real spherical harmonics were built with a
-  phase convention that differed from e3nn / the standard (Condon-Shortley) one by
-  a fixed per-`(l, m)` sign; that sign is now applied in the real-harmonic
-  construction (`utils.spherical_harmonics.Y`).
+- Sign conventions for `e3j.core.Harmonics`, now reproducing `e3nn.spherical_harmonics`
+  numerically and supporting the same normalization arguments (generators differ with
+  0.1.0b5 by a sign).
+- Tracer leak encountered in the sender-sorted CUDA convolution primitive. The
+  `y_parity` signs are now static a numpy array.
+- Misalignment of SMEM buffers encountered with relatively larger feature dimensions
+  and `N <= 2` vectorization. Buffers are always aligned to 16B now, regardless of
+  the vectorization parameter to avoid `CUDA_ERROR_MISALIGNED_ADDRESS` with the
+  pipelined copies.
+- Methods of `e3j.Array` enforce stricter checks, and prevent `__getitem__` from
+  slicing the feature dimension. The `Array.blocks()` method returning irreducible
+  sub-arrays (with multiplicity) is fixed.
+- `core.Convolution` now parses its `layout` option and no longer fails on string
+  on TPU.
 
 ## [0.1.0b5] — 2026-07-17
 
