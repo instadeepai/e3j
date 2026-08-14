@@ -1,11 +1,12 @@
 [project]
 name = "e3j"
-version = "0.1.0b5"
-description = "Fast Euclid equivariant operations for JAX"
+version = "0.1.0"
+description = "Fast Euclid equivariant operations for GPU and TPU"
 authors = [
     { name="Olivier Peltre", email="o.peltre@instadeep.com" },
     { name="Armand Picard", email="a.picard@instadeep.com" },
-    { name="Adrien Pichard", email="a.pichard@instadeep.com" }
+    { name="Adrien Pichard", email="a.pichard@instadeep.com" },
+    { name="Miguel Bragança", email="m.braganca@instadeep.com" },
 ]
 license = {text="Apache-2.0"}
 license-files = ["LICENSE"]
@@ -25,7 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ops = [
-    "e3j_ops == 0.1.0b5",
+    "e3j_ops == 0.1.0",
     "pybind11 >= 2.13.6"
 ]
 
