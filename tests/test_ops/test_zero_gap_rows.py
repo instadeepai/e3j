@@ -32,7 +32,7 @@ import numpy.testing as testing
 
 import e3j
 from e3j.core.tensor_product import TensorProduct as CoreTP
-from e3j.ops import TensorProductParams as Params
+from e3j.ops import CUDATensorProductParams as Params
 from e3j.ops import tensor_product
 from e3j.ops.coef import Coef
 
@@ -101,7 +101,7 @@ class _TestGapRows:
     num_out: int = 23
 
     def closure(self):
-        with e3j.config.use(tensor_product="FUSED"):
+        with e3j.config.use(tensor_product="FUSED_CUDA"):
             tp = CoreTP((IN1, IN2), "0e", sort=True, layout=self.layout, mode=self.mode)
         coef = tp.coef
         idx = np.array(coef.indices).T  # (3, nnz)

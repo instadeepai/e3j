@@ -18,8 +18,10 @@
 
 #include <cuda.h>
 #include <cstdint>
+#include <type_traits>
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
+#include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
 #include <cuda_runtime_api.h>
 
@@ -31,12 +33,23 @@ namespace e3j {
 // a single variable (held in N registers). N ∈ {1, 2, 4} maps to scalar /
 // float2 / float4, emitting LDS.32 / LDS.64 / LDS.128 on shared memory loads.
 
+// float16 vector types. Members are scalar `__half` (not the packed `__half2`)
+// so the generic .x/.y-based broadcast/mul/hsum keep working, and alignment is
+// set so that `load<N>` still emits a single LDS.32 (N=2) / LDS.64 (N=4).
+// TODO: packed __half2 arithmetic could be faster, see `fmadd`.
+struct __align__(4) half2v { __half x; __half y; };
+struct __align__(8) half4v { __half x; __half y; __half z; __half w; };
+
 template<int N, typename T> struct VectType;
-template<typename T> struct VectType<1, T>          { using type = T;      };
-template<> struct VectType<2, float>                { using type = float2; };
-template<> struct VectType<2, std::int32_t>         { using type = int2;   };
-template<> struct VectType<4, float>                { using type = float4; };
-template<> struct VectType<4, std::int32_t>         { using type = int4;   };
+template<typename T> struct VectType<1, T>          { using type = T;       };
+template<> struct VectType<2, float>                { using type = float2;  };
+template<> struct VectType<4, float>                { using type = float4;  };
+// float64: built-in aligned vector types (double2 = 16B, double4 = 32B).
+template<> struct VectType<2, double>               { using type = double2; };
+template<> struct VectType<4, double>               { using type = double4; };
+// float16: see half2v / half4v above.
+template<> struct VectType<2, __half>               { using type = half2v;  };
+template<> struct VectType<4, __half>               { using type = half4v;  };
 template<typename T>
 struct VectType<2, T> {
     struct T2 {T x; T y;};
@@ -71,22 +84,28 @@ __device__ Vect<N, Val> mul(Vect<N, Val> a, Vect<N, Val> b) {
     }
 }
 
+// Scalar fused multiply-add, one overload per value dtype: FFMA, DFMA, HFMA.
+// Keeps `fmadd` below generic over the value type.
+__device__ __forceinline__ float  fma_(float a, float b, float c)    { return __fmaf_rn(a, b, c); }
+__device__ __forceinline__ double fma_(double a, double b, double c) { return __fma_rn(a, b, c); }
+__device__ __forceinline__ __half fma_(__half a, __half b, __half c) { return __hfma(a, b, c); }
+
 // Fused multiply-add: acc[i] += a[i] * b[i].
-// Uses __fmaf_rn to emit FFMA instead of FMUL+FADD, eliminating the
+// Uses `fma_` to emit a single FMA instead of MUL+ADD, eliminating the
 // intermediate prod[] register and halving FP instruction count on the
-// hot accumulation path (N=4: saves 4 FADD per coefficient iteration).
+// hot accumulation path (N=4: saves 4 ADD per coefficient iteration).
 template<int N, typename Val>
 __device__ void fmadd(Vect<N, Val> &acc, Vect<N, Val> a, Vect<N, Val> b) {
     if constexpr (N == 1) {
-        acc = __fmaf_rn(a, b, acc);
+        acc = fma_(a, b, acc);
     } else if constexpr (N == 2) {
-        acc.x = __fmaf_rn(a.x, b.x, acc.x);
-        acc.y = __fmaf_rn(a.y, b.y, acc.y);
+        acc.x = fma_(a.x, b.x, acc.x);
+        acc.y = fma_(a.y, b.y, acc.y);
     } else {
-        acc.x = __fmaf_rn(a.x, b.x, acc.x);
-        acc.y = __fmaf_rn(a.y, b.y, acc.y);
-        acc.z = __fmaf_rn(a.z, b.z, acc.z);
-        acc.w = __fmaf_rn(a.w, b.w, acc.w);
+        acc.x = fma_(a.x, b.x, acc.x);
+        acc.y = fma_(a.y, b.y, acc.y);
+        acc.z = fma_(a.z, b.z, acc.z);
+        acc.w = fma_(a.w, b.w, acc.w);
     }
 }
 
@@ -95,13 +114,13 @@ __device__ void fmadd(Vect<N, Val> &acc, Vect<N, Val> a, Vect<N, Val> b) {
 template<int N, typename Val, std::enable_if_t<(N > 1), int> = 0>
 __device__ void fmadd(Vect<N, Val> &acc, Val a, Vect<N, Val> b) {
     if constexpr (N == 2) {
-        acc.x = __fmaf_rn(a, b.x, acc.x);
-        acc.y = __fmaf_rn(a, b.y, acc.y);
+        acc.x = fma_(a, b.x, acc.x);
+        acc.y = fma_(a, b.y, acc.y);
     } else {
-        acc.x = __fmaf_rn(a, b.x, acc.x);
-        acc.y = __fmaf_rn(a, b.y, acc.y);
-        acc.z = __fmaf_rn(a, b.z, acc.z);
-        acc.w = __fmaf_rn(a, b.w, acc.w);
+        acc.x = fma_(a, b.x, acc.x);
+        acc.y = fma_(a, b.y, acc.y);
+        acc.z = fma_(a, b.z, acc.z);
+        acc.w = fma_(a, b.w, acc.w);
     }
 }
 
@@ -127,6 +146,27 @@ __device__ Val hsum(Vect<N, Val> v) {
 }
 
 namespace utils {
+
+// Rounds `x` up to the next multiple of `align` (a power of two).
+__host__ __device__ constexpr size_t round_up(size_t x, size_t align) {
+    return (x + align - 1) & ~(align - 1);
+}
+
+// Byte alignment of the SMEM buffers that follow a coefficient buffer in the
+// tensor_product / convolution kernels. They must be 16-byte aligned because
+// every access to them is a 16-byte (int4 / float4) transaction: the
+// vectorized `load<4>` reads AND the cp.async copies in `copy_pipe<4>` /
+// `copy_pipe_strided` — the latter always issuing 16-byte writes regardless
+// of N. Padding the coef buffer to a smaller `N * sizeof(Val)` boundary left
+// the buffers at an 8-byte offset for N < 4 and odd coefficient counts
+// (sizeof(Coef) == 8), which faulted with CUDA_ERROR_MISALIGNED_ADDRESS on
+// the strided path.
+constexpr size_t SMEM_BUFFER_ALIGN = 16;
+
+// Rounds `bytes` up to SMEM_BUFFER_ALIGN.
+__host__ __device__ constexpr size_t smem_align(size_t bytes) {
+    return round_up(bytes, SMEM_BUFFER_ALIGN);
+}
 
 // Simple synchronous copy.
 //
@@ -171,27 +211,40 @@ template <int N=1, typename T>
 __device__ void copy_pipe(T* dst, const T* src, const int numel) {
     int tid = threadIdx.x + threadIdx.y * blockDim.x;
     int dim = blockDim.x * blockDim.y;
-    // cp.async supports 4, 8, or 16 byte copies.
+    // cp.async supports only 4, 8, or 16 byte transfers.
     constexpr size_t cp_size = sizeof(T) * N;
-    if constexpr (cp_size > 16) {
+    if constexpr (cp_size < 4) {
+        // A single float16 is 2 B, below the cp.async floor: copy synchronously.
+        // wait_pipe() syncs the block, and an empty cp.async batch commits fine,
+        // so callers do not have to special-case this.
+        #pragma unroll 1
+        for (int i = tid; i < numel; i += dim)
+            dst[i] = src[i];
+    } else if constexpr (cp_size > 16) {
         static_assert(cp_size % 16 == 0);
-        constexpr int K = cp_size / 16;
+        // Split into 16-byte (int4) transfers, the widest cp.async supports.
+        // numel * sizeof(T) is a 16 multiple on every instantiation: T is
+        // either a 32 B Coef / Coef4D, or a double with N=4, where
+        // `get_vectorization` makes numel a multiple of 4.
         int4 *dst4 = reinterpret_cast<int4*>(dst);
         const int4 *src4 = reinterpret_cast<const int4*>(src);
+        const int n16 = (numel * (int)sizeof(T)) / 16;
         #pragma unroll 1
-        for (int i = tid * K; i < numel * K; i += dim * K) {
-            #pragma unroll
-            for (int k = 0; k < K; k++)
-                __pipeline_memcpy_async(&dst4[i + k], &src4[i + k], 16);
-        }
+        for (int i = tid; i < n16; i += dim)
+            __pipeline_memcpy_async(&dst4[i], &src4[i], 16);
     } else if constexpr (N > 1) {
         int aligned = (numel / N) * N;
         #pragma unroll 1
         for (int i = tid * N; i < aligned; i += dim * N) {
             __pipeline_memcpy_async(&dst[i], &src[i], sizeof(T) * N);
         }
+        // Tail of numel % N elements, one by one: too narrow for cp.async
+        // with float16, hence the synchronous copy again.
         for (int i = aligned + tid; i < numel; i += dim) {
-            __pipeline_memcpy_async(&dst[i], &src[i], sizeof(T));
+            if constexpr (sizeof(T) < 4)
+                dst[i] = src[i];
+            else
+                __pipeline_memcpy_async(&dst[i], &src[i], sizeof(T));
         }
     } else {
         #pragma unroll 1

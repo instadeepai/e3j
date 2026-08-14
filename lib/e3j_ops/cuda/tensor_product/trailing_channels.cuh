@@ -34,6 +34,7 @@ namespace trailing_channels {
     using utils::wait_pipe;
     using utils::fill;
     using utils::DeviceProperties;
+    using utils::smem_align;
 
     // Alias of int4, mapping threads to I/O channels.
     //
@@ -397,10 +398,10 @@ __global__ void kernel(
         copy_pipe<1>(smem_coef, coef, num_coef);
         // Overwrite reference to GMEM `coef` with SMEM buffer.
         coef = smem_coef;
-        // Align `smem_` to Vect<N, Val> for LDS.64 / LDS.128
-        constexpr size_t align = N * sizeof(Val);
+        // Advance past the coef buffer, rounding up to 16 B so the x/y buffers
+        // stay 16-byte aligned for LDS.128 and the int4 cp.async copies.
         size_t coef_bytes = (size_t)num_coef * sizeof(Coef);
-        coef_bytes =  (coef_bytes + align - 1) & ~(align - 1);
+        coef_bytes = smem_align(coef_bytes);
         smem_ = (char*)smem_coef + coef_bytes;
         // Wait for coef copy.
         __pipeline_commit();

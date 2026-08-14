@@ -43,6 +43,14 @@ def scatter_add_1(indices: Array, values: Array, out: Array) -> Array:
         The output array with the values scattered.
 
     """
+    # The launcher rejects it too, but only once the kernel runs.
+    if values.dtype == jnp.float16:
+        raise NotImplementedError(
+            "float16 values are not supported by scatter_add_1: the reduction "
+            "uses atomicAdd, which has no __half overload. Use float32/float64, "
+            "or another aggregation method."
+        )
+
     num_out = out.shape[-1]
     # GOTCHA: see e3j/ops/README.md
     args = (indices, values)

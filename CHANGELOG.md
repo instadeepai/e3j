@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [0.1.0] — 2026-08-14
+
+### Added
+
+- Optional `node_mask` argument in `core.Convolution`, bypassing aggregation
+  on padding edges to avoid significant overhead in simulations.
+- Support for `float64` and `float16` value dtypes in trailing channels CUDA kernels.
+
+### Changed
+
+- Harmonized public API options naming patterns:
+  + `UNFUSED` now selects the plain-JAX, CPU compatible implementation while
+    `FUSED_CUDA` selects kernels from `e3j_ops` (the former `SPARSE` and `FUSED`
+    tensor product options raise an error).
+  + `TPMode` has been renamed to `MixingMode`
+  + `TPNormalization` has been renamed to `TensorProductNormalization`.
+- Various performance improvements on the Pallas MTPU kernels.
+- Dropped `int32` *value* dtypes previously used in testing from CUDA binaries.
+- The default configuration detects a `JAX_PLATFORMS="cpu"` environment override
+  and opts out of all dedicated kernels even if they are available.
+- The different evaluation methods of `TensorProduct` are now private and
+  prefixed with `_`.
+
+### Fixed
+
+- Sign conventions for `e3j.core.Harmonics`, now reproducing `e3nn.spherical_harmonics`
+  numerically and supporting the same normalization arguments (generators differ with
+  0.1.0b5 by a sign).
+- Tracer leak encountered in the sender-sorted CUDA convolution primitive. The
+  `y_parity` signs are now static a numpy array.
+- Misalignment of SMEM buffers encountered with relatively larger feature dimensions
+  and `N <= 2` vectorization. Buffers are always aligned to 16B now, regardless of
+  the vectorization parameter to avoid `CUDA_ERROR_MISALIGNED_ADDRESS` with the
+  pipelined copies.
+- Methods of `e3j.Array` enforce stricter checks, and prevent `__getitem__` from
+  slicing the feature dimension. The `Array.blocks()` method returning irreducible
+  sub-arrays (with multiplicity) is fixed.
+- `core.Convolution` now parses its `layout` option and no longer fails on string
+  on TPU.
+
 ## [0.1.0b5] — 2026-07-17
 
 ### Fixed

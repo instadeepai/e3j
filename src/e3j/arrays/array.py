@@ -108,7 +108,7 @@ class Array(Generic[SpaceT]):
                 arr = self.array[..., slc, :]
             else:
                 arr = self.array[..., slc]
-            yield self.__class__(ir, arr, self.layout)
+            yield self.__class__(self.space.__class__([(mul, ir)]), arr, self.layout)
 
     @property
     def ndim(self) -> int:
@@ -122,13 +122,68 @@ class Array(Generic[SpaceT]):
         return self.__class__(self.space, array, self.layout)
 
     def __getitem__(self, idx):
-        # TODO: reindexing on feature dimension should be prevented
+        """Index into the array's leading (non-feature) axes.
+
+        Ordinary indexing is forwarded to the underlying array as long as it
+        leaves the feature axis (`self.feature_axis`) untouched, e.g.
+        selecting a subset of the batch:
+
+            >>> x = O3Array(space, jnp.ones((128, 4, 32)), "TRAILING_CHANNELS")
+            >>> x[:16]                    # first 16 batch elements
+            >>> x[jnp.array([0, 2, 5])]   # fancy-indexed batch elements
+
+        Indexing that would reorder, drop, or otherwise reindex the feature
+        axis raises a `ValueError`, since that would silently relabel
+        `self.space` without actually permuting the underlying irreps:
+
+            >>> x[:, ::-1, :]              # reverses the feature axis
+            Traceback (most recent call last):
+                ...
+            ValueError: Indexing the feature axis (1) would silently ...
+        """
+        ndim = self.ndim
+        axis = self.feature_axis % ndim
+        key = idx if isinstance(idx, tuple) else (idx,)
+        if any(k is Ellipsis for k in key):
+            ellipsis_pos = next(i for i, k in enumerate(key) if k is Ellipsis)
+            pre, post = key[:ellipsis_pos], key[ellipsis_pos + 1 :]
+            n_explicit = sum(1 for k in pre if k is not None) + sum(
+                1 for k in post if k is not None
+            )
+            key = pre + (slice(None),) * (ndim - n_explicit) + post
+        pos = 0
+        for k in key:
+            if k is None:
+                continue
+            # A boolean array consumes as many axes as its own rank (it is
+            # matched against that many corresponding axes of self.array),
+            # unlike every other index type which always consumes exactly
+            # one axis.
+            span = k.ndim if getattr(k, "dtype", None) == bool else 1
+            is_full_slice = isinstance(k, slice) and k == slice(None)
+            if pos <= axis < pos + span and not is_full_slice:
+                raise ValueError(
+                    f"Indexing the feature axis ({axis}) would silently "
+                    f"reindex the irreps of {self.space}; got index {k!r} "
+                    "at that axis."
+                )
+            pos += span
         return self._alike(self.array[idx])
 
+    def _check_alike(self, other, op="add"):
+        if (
+            not isinstance(other, self.__class__)
+            or self.space != other.space
+            or self.layout != other.layout
+        ):
+            raise ValueError(f"Can only {op} arrays that are alike {other}")
+
     def __add__(self, other):
+        self._check_alike(other, op="add")
         return self._alike(self.array + other.array)
 
     def __sub__(self, other):
+        self._check_alike(other, op="subtract")
         return self._alike(self.array - other.array)
 
     def __radd__(self, other):
@@ -139,7 +194,8 @@ class Array(Generic[SpaceT]):
             return self._alike(other * self.array)
         if isinstance(other, jax.Array):
             axis = self.feature_axis
-            if other.size == 1 or other.shape[axis] == 1:
+            feature_size = other.shape[axis] if other.ndim >= -axis else 1
+            if other.size == 1 or feature_size == 1:
                 return self._alike(other * self.array)
         raise ValueError(f"Cannot left multiply with non-scalar {other}")
 
@@ -156,7 +212,7 @@ class Array(Generic[SpaceT]):
         cls = self.__class__.__name__
         out = f"{cls} '{self.space}'"
         if self.layout != config().layout:
-            out += " {self.layout}"
+            out += f" {self.layout}"
         return out + "\n" + str(self.array)
 
 

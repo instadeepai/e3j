@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <cuda_fp16.h>  // __half (usable from host and device TUs)
 
 // X-Macros helping declare and dispatch over template parameters.
 //
@@ -59,23 +60,23 @@
 //       the dispatching.
 
 
-// Supported Idx types:
-// - int32 (JAX default int dtype)
-// - uint8 (2× memory saving: 8 bytes vs 16 per coef)
-// - uint16 (disabled: pair with float16 for 8B alignment).
-#define __FOR_EACH_DTYPE_PAIR                       \
-    FOR_EACH_DTYPE_PAIR(std::int32_t, float)        \
-    FOR_EACH_DTYPE_PAIR(std::int32_t, std::int32_t) \
-    FOR_EACH_DTYPE_PAIR(std::uint8_t, float)        \
-    // TODO: pair uint16 with float16
-    // FOR_EACH_DTYPE_PAIR(std::uint16_t, float16)
+// Supported (Idx, Val) dtype pairs, as a full cross product: the two dtypes are
+// chosen independently.
+//
+// - Idx: int32 (JAX default int dtype) or uint8 (2x memory saving per coef).
+// - Val: float, double or __half. The int32 value path is not supported.
+#define __FOR_EACH_DTYPE_PAIR                 \
+    FOR_EACH_DTYPE_PAIR(std::int32_t, float)  \
+    FOR_EACH_DTYPE_PAIR(std::uint8_t, float)  \
+    FOR_EACH_DTYPE_PAIR(std::int32_t, double) \
+    FOR_EACH_DTYPE_PAIR(std::uint8_t, double) \
+    FOR_EACH_DTYPE_PAIR(std::int32_t, __half) \
+    FOR_EACH_DTYPE_PAIR(std::uint8_t, __half)
 
 
 // Runtime dispatch over supported (Idx, Val) dtype pairs.
 //
-// Narrow index types (U8) are only paired with float values.
-// S32 indices support both float and int32 values.
-// U16 is excluded — sizeof mismatch with numpy; see __FOR_EACH_DTYPE_PAIR.
+// Idx in {S32, U8} times Val in {F32, F64, F16}, see __FOR_EACH_DTYPE_PAIR.
 //
 // Usage:
 //  - define the macro `DISPATCH_DTYPE_PAIR(IDX, VAL)`,
@@ -93,18 +94,24 @@
         DISPATCH_DTYPE_PAIR(std::int32_t, float)                            \
     }                                                                       \
     else if (IDX_T == xla::DataType::S32                                    \
-             and VAL_T == xla::DataType::S32) {                             \
-        DISPATCH_DTYPE_PAIR(std::int32_t, std::int32_t)                     \
+             and VAL_T == xla::DataType::F64) {                             \
+        DISPATCH_DTYPE_PAIR(std::int32_t, double)                           \
+    }                                                                       \
+    else if (IDX_T == xla::DataType::U8                                     \
+             and VAL_T == xla::DataType::F64) {                             \
+        DISPATCH_DTYPE_PAIR(std::uint8_t, double)                           \
+    }                                                                       \
+    else if (IDX_T == xla::DataType::S32                                    \
+             and VAL_T == xla::DataType::F16) {                             \
+        DISPATCH_DTYPE_PAIR(std::int32_t, __half)                           \
+    }                                                                       \
+    else if (IDX_T == xla::DataType::U8                                     \
+             and VAL_T == xla::DataType::F16) {                             \
+        DISPATCH_DTYPE_PAIR(std::uint8_t, __half)                           \
     }                                                                       \
     else {                                                                  \
         DISPATCH_DTYPE_PAIR_ERROR(IDX_T, VAL_T)                             \
-    }                                                                       \
-    /* TODO: pair U16 with F16                                              \
-    else if (IDX_T == xla::DataType::U16                                     \
-             and VAL_T == xla::DataType::F32) {                              \
-        DISPATCH_DTYPE_PAIR(std::uint16_t, float)                            \
-    }                                                                        \
-    */
+    }
 
 
 #define __DISPATCH_MODE(MODE)           \

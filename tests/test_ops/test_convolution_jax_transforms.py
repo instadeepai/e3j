@@ -19,11 +19,13 @@ import re
 import jax
 import jax.numpy as np
 import jax.random as random
+import numpy as onp
 import numpy.testing as testing
 import pytest
 from jax.experimental.topologies import get_topology_desc
 
 import e3j
+from e3j.core.convolution import Convolution
 from e3j.ops.coef import Coef4D
 from e3j.ops.convolution import (
     ConvolutionBatchingWarning,
@@ -115,6 +117,151 @@ def test_jit_convolution_vmap():
     assert out_vmap.shape == (2,) + out_single.shape
     testing.assert_allclose(out_vmap[0], out_single, atol=1e-5)
     testing.assert_allclose(out_vmap[1], out_single, atol=1e-5)
+
+
+# --- vmap over a padded (node_mask) graph ---
+#
+# `node_mask` marks edges touching a padding node with `DUMMY_INDEX`. Per the API
+# contract, padding nodes lie at the tail of each graph and only connect other
+# padding nodes, so masked edges sort to the tail of their graph. Folding graphs
+# for `vmap` interleaves them, but a padding edge always marks a cut between
+# disjoint batched graphs: after it the indices belong to the *next* graph, never
+# back to the current one. So, for receiver arrays:
+#     [0, 0, 1, 1, 2, 3, MASK, MASK, 6, 5, 5]   # can occur: MASK cuts to next graph
+#     [0, 0, 1, 1, 2, 3, MASK, MASK, 1, 2, 6]   # cannot: real edges resume this graph
+# The masking is symmetric across orderings, so these are parameterized over both.
+# The graph is symmetric (required by SENDER) with a masked self-loop on the
+# highest-indexed (padding) node.
+
+_MASK_NODES = 5
+_MASK_CHANNELS = 32
+_MASK_PAIRS = [(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)]
+
+
+def _masked_module(impl, ordering):
+    with e3j.config.use(convolution=impl, tensor_product=impl):
+        return Convolution(
+            ("2x0e + 1x1o", "1x0e + 1x1o"),
+            None,
+            layout="TRAILING_CHANNELS",
+            graph_ordering=ordering,
+        )
+
+
+def _masked_graph(ordering, seed=0):
+    """Symmetric padded graph and features, sorted by the ordering's CSR key.
+
+    Real nodes 0-3 are symmetrically connected; the tail node 4 is padding and
+    carries a single masked self-loop. Edges are sorted by receiver (RECEIVER) or
+    sender (SENDER), and reversed edges carry the parity-signed feature SENDER
+    assumes.
+    """
+    node_space, edge_space, scalar_space = _masked_module("UNFUSED", ordering).source
+    pad = _MASK_NODES - 1
+    edges = list(_MASK_PAIRS) + [(b, a) for a, b in _MASK_PAIRS] + [(pad, pad)]
+    sender = np.array([a for a, b in edges], np.int32)
+    receiver = np.array([b for a, b in edges], np.int32)
+    key = sender if ordering == "SENDER" else receiver
+    order = np.argsort(key, stable=True)
+    sender, receiver = sender[order], receiver[order]
+
+    parity = onp.concatenate(
+        [onp.full(m * ir.dim, float(ir.p), onp.float32) for m, ir in edge_space]
+    )
+    k = random.split(random.key(seed), 3)
+    yh = random.normal(k[0], (len(_MASK_PAIRS), edge_space.dim))
+    y = np.concatenate([yh, yh * parity[None], np.zeros((1, edge_space.dim))])[order]
+    sh = random.normal(k[1], (len(_MASK_PAIRS), scalar_space.dim, _MASK_CHANNELS))
+    s = np.concatenate([sh, sh, np.zeros((1, scalar_space.dim, _MASK_CHANNELS))])[order]
+    x = random.normal(k[2], (_MASK_NODES, node_space.dim, _MASK_CHANNELS))
+    node_mask = np.ones(_MASK_NODES, dtype=bool).at[pad].set(False)
+    return x, y, s, sender, receiver, node_mask
+
+
+def _vmap_masked(impl, ordering, x, y, s, sender, receiver, node_mask):
+    """Vmap `impl` over two copies of the same masked graph."""
+    xs, ys, ss = np.stack([x, x]), np.stack([y, y]), np.stack([s, s])
+    sm, rm = np.stack([sender, sender]), np.stack([receiver, receiver])
+    mm = np.stack([node_mask, node_mask])
+
+    def f(x, y, s, se, re, nm):
+        return _masked_module(impl, ordering)(x, y, s, se, re, node_mask=nm)
+
+    return jax.vmap(f)(xs, ys, ss, sm, rm, mm)
+
+
+@pytest.mark.parametrize("ordering", ["RECEIVER", "SENDER"])
+def test_masked_vmap_forward_matches_unfused(ordering):
+    """Fused forward over a padded, vmapped graph equals the plain-JAX path."""
+    x, y, s, sender, receiver, node_mask = _masked_graph(ordering)
+
+    with pytest.warns(ConvolutionBatchingWarning):
+        fused = _vmap_masked(
+            "FUSED_CUDA", ordering, x, y, s, sender, receiver, node_mask
+        )
+    unfused = _vmap_masked("UNFUSED", ordering, x, y, s, sender, receiver, node_mask)
+
+    testing.assert_allclose(fused, unfused, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("ordering", ["RECEIVER", "SENDER"])
+def test_masked_vmap_backward_matches_unfused(ordering):
+    """Fused gradients over a padded, vmapped graph equal the plain-JAX path."""
+    x, y, s, sender, receiver, node_mask = _masked_graph(ordering)
+
+    def loss(impl):
+        return lambda x, y, s: np.sum(
+            _vmap_masked(impl, ordering, x, y, s, sender, receiver, node_mask)
+        )
+
+    with pytest.warns(ConvolutionBatchingWarning):
+        g_fused = jax.grad(loss("FUSED_CUDA"), argnums=(0, 1, 2))(x, y, s)
+    g_unfused = jax.grad(loss("UNFUSED"), argnums=(0, 1, 2))(x, y, s)
+
+    for a, b in zip(g_fused, g_unfused):
+        testing.assert_allclose(a, b, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("ordering", ["RECEIVER", "SENDER"])
+def test_masked_forward_zeros_padding_node(ordering):
+    """Forward: a padding node's message is exact zero, matching plain JAX.
+
+    Its only edge, a masked self-loop, is dropped, so the kernel visits an empty
+    range and stores zeros.
+    """
+    x, y, s, sender, receiver, node_mask = _masked_graph(ordering)
+
+    fused = _masked_module("FUSED_CUDA", ordering)(
+        x, y, s, sender, receiver, node_mask=node_mask
+    )
+    unfused = _masked_module("UNFUSED", ordering)(
+        x, y, s, sender, receiver, node_mask=node_mask
+    )
+
+    testing.assert_array_equal(jax.device_get(fused[-1]), 0.0)
+    testing.assert_allclose(fused, unfused, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("ordering", ["RECEIVER", "SENDER"])
+def test_masked_backward_zeros_padding_dx(ordering):
+    """Backward: dx of a padding node is exact zero, matching plain JAX.
+
+    With its self-loop dropped the node has no live edge, so its feature
+    cotangent has no contribution; the kernel still writes a zeroed `dx` row.
+    """
+    x, y, s, sender, receiver, node_mask = _masked_graph(ordering)
+
+    def dx(impl):
+        module = _masked_module(impl, ordering)
+        return jax.grad(
+            lambda x: np.sum(module(x, y, s, sender, receiver, node_mask=node_mask))
+        )(x)
+
+    dx_fused = dx("FUSED_CUDA")
+    dx_unfused = dx("UNFUSED")
+
+    testing.assert_array_equal(jax.device_get(dx_fused[-1]), 0.0)
+    testing.assert_allclose(dx_fused, dx_unfused, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.multi_devices
@@ -373,9 +520,10 @@ def _batched_conv_data(batch, key):
     )
 
 
-@pytest.mark.skipif(jax.device_count() < 2, reason="requires >= 2 devices")
 def test_vmap_fwd_convolution_multi_devices_numerical():
     """Sharded forward equals single-device vmap over distinct graphs."""
+    if jax.device_count() < 2:
+        pytest.skip("requires >= 2 devices")
     coef, x, y, s, sender, receiver, params = _batched_conv_data(
         batch=2 * jax.device_count(), key=random.key(0)
     )
@@ -397,9 +545,10 @@ def test_vmap_fwd_convolution_multi_devices_numerical():
     testing.assert_array_equal(jax.device_get(out_sharded), jax.device_get(out_ref))
 
 
-@pytest.mark.skipif(jax.device_count() < 2, reason="requires >= 2 devices")
 def test_vmap_grad_convolution_multi_devices_numerical():
     """Sharded gradients equal single-device vmap gradients over distinct graphs."""
+    if jax.device_count() < 2:
+        pytest.skip("requires >= 2 devices")
     coef, x, y, s, sender, receiver, params = _batched_conv_data(
         batch=2 * jax.device_count(), key=random.key(1)
     )

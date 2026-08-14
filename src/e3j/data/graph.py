@@ -12,10 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 
 import jax.numpy as jnp
+import numpy
 from jax import Array
+from numpy import int32
+
+# Padding mask to ensure dummy edges are skipped in kernels.
+# This is important in typical static-shaped graphs, since a single
+# dummy node may carry all of the padding edges.
+DUMMY_INDEX = int32(numpy.iinfo(int32).max)
+
+#: Index dtype the CUDA FFI handlers declare. Pinned because `jax_enable_x64`,
+#: which float64 values require, would default derived buffers to int64.
+INDEX_DTYPE = jnp.int32
 
 
 class GraphCSR:
@@ -28,23 +38,29 @@ class GraphCSR:
     required by `vmap` rules to fold a batch axis into a single disjoint
     (block-diagonal) graph, both when a single graph is replicated across
     devices or when distinct homogeneous graphs are stacked.
+
+    Note:
+        Derived buffers (`receiver_ptr` and the permutations returned by `sort`
+        and `transpose`) are always :data:`INDEX_DTYPE`, under x32 and x64 alike.
     """
 
     def __init__(self, num_nodes: int, sender: Array, receiver: Array):
         self.num_nodes = num_nodes
         self.sender = sender
         self.receiver = receiver
-        num_neighbors = jnp.bincount(receiver, length=num_nodes)
-        self.receiver_ptr = jnp.append(0, jnp.cumsum(num_neighbors))
+        self.num_neighbors = jnp.bincount(receiver, length=num_nodes)
+        self.receiver_ptr = jnp.append(0, jnp.cumsum(self.num_neighbors)).astype(
+            INDEX_DTYPE
+        )
 
     @classmethod
     def sort(
         cls, num_nodes: int, sender: Array, receiver: Array
     ) -> tuple[Array, "GraphCSR", Array]:
         """Return (sigma, graph', sigma_1) sorting edges by receivers."""
-        perm = jnp.argsort(receiver)
+        perm = jnp.argsort(receiver).astype(INDEX_DTYPE)
         graph_sorted = cls(num_nodes, sender[perm], receiver[perm])
-        return perm, graph_sorted, jnp.argsort(perm)
+        return perm, graph_sorted, jnp.argsort(perm).astype(INDEX_DTYPE)
 
     def transpose(self) -> tuple[Array, "GraphCSR", Array]:
         """Return (sigma, graph_t, sigma_1) sorting edges by senders instead."""
@@ -52,6 +68,22 @@ class GraphCSR:
             self.num_nodes,
             self.receiver,
             self.sender,
+        )
+
+    @staticmethod
+    def mask_edges(
+        sender: Array, receiver: Array, node_mask: Array
+    ) -> tuple[Array, Array]:
+        """Mark edges touching a padding node with `DUMMY_INDEX`.
+
+        Padding edges are assumed to only connect trailing nodes and must lie
+        at the end of the graph. They are assigned out-of-bounds edges to ensure
+        they are skipped by the message aggregation.
+        """
+        edge_mask = node_mask[sender] & node_mask[receiver]
+        return (
+            jnp.where(edge_mask, sender, DUMMY_INDEX),
+            jnp.where(edge_mask, receiver, DUMMY_INDEX),
         )
 
     @staticmethod

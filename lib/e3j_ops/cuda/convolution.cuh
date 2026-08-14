@@ -35,6 +35,14 @@ Coef4D {
     Idx i; Idx j; Idx k; Idx l;
 };
 
+// Same numpy byte-compatibility check as on `Coef`, see cuda/tensor_product.cuh.
+static_assert(sizeof(Coef4D<std::int32_t, float>)  == 32, "Coef4D(int32,float)");
+static_assert(sizeof(Coef4D<std::uint8_t, float>)  ==  8, "Coef4D(uint8,float)");
+static_assert(sizeof(Coef4D<std::int32_t, double>) == 32, "Coef4D(int32,double)");
+static_assert(sizeof(Coef4D<std::uint8_t, double>) == 16, "Coef4D(uint8,double)");
+static_assert(sizeof(Coef4D<std::int32_t, __half>) == 32, "Coef4D(int32,half)");
+static_assert(sizeof(Coef4D<std::uint8_t, __half>) ==  8, "Coef4D(uint8,half)");
+
 // Note: only Layout::TRAILING_CHANNELS supported.
 struct Params {
     int32_t num_nodes;

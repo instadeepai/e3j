@@ -308,9 +308,8 @@ __global__ void kernel (
         // Overwrite reference to GMEM `coef` with SMEM buffer.
         coef = smem_coef;
         // Align `smem_` to Vect<N, Val> for LDS.64 / LDS.128
-        constexpr size_t align = 16;
         size_t coef_bytes = (size_t)num_coef * sizeof(Coef);
-        coef_bytes =  (coef_bytes + align - 1) & ~(align - 1);
+        coef_bytes = utils::smem_align(coef_bytes);
         smem_ = (char*)smem_coef + coef_bytes;
         // Wait for coef copy.
         __pipeline_commit();
@@ -350,11 +349,7 @@ __global__ void kernel (
 
                 int sender = adj.sender[edge];
 
-                // NOTE: temporary guard. `sender` is used below as an unchecked
-                // offset into node features (x[sender]); a value >= num_nodes
-                // reads past `x` and causes CUDA_ERROR_ILLEGAL_ADDRESS. Skipping
-                // such edges tells us whether out-of-range senders are the cause
-                // of the random segfaults. Remove once root cause is confirmed.
+                // Skip padding edges: OOB can signal padding safely
                 if (sender < 0 || sender >= num_nodes) continue;
 
                 // Load sender features, edge embeddings, and radial scalars.

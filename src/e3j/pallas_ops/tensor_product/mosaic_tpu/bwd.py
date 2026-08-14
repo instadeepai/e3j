@@ -595,7 +595,8 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
         num_channels_vmem: int,
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
-        return {yi: y_vmem[:, yi, :] for yi in yis}
+        y_t = jax.lax.transpose(y_vmem[...], (1, 0, 2))
+        return {yi: y_t[yi, :, :] for yi in yis}
 
     def write_dy(
         self,
@@ -631,8 +632,8 @@ def _tensor_product_kernel_mosaic_tpu_bwd(
 ) -> tuple[jax.Array, jax.Array]:
     """Backward pass dispatching on `params.layout`/`params.mode`."""
     if params.layout == options.Layout.TRAILING_CHANNELS:
-        if params.mode == options.TPMode.MAP:
+        if params.mode == options.MixingMode.MAP:
             return _BwdTrailingChannelMapKernel()(x, y, dz, params)
-        if params.mode == options.TPMode.OUTER:
+        if params.mode == options.MixingMode.OUTER:
             return _BwdTrailingChannelOuterKernel()(x, y, dz, params)
     raise NotImplementedError(f"Mosaic TPU TP bwd unsupported for {params}")

@@ -21,15 +21,15 @@ class TensorProduct(Enum):
     """Evaluation strategy for :class:`~e3j.core.TensorProduct`.
 
     Values:
-        SPARSE: Pull-back inputs by CG indices, multiply, then aggregate.
+        UNFUSED: Pull-back inputs by CG indices, multiply, then aggregate.
         DENSE: Evaluate via `einsum` on dense CG coefficient array.
-        FUSED: Dispatch to custom CUDA kernel via XLA-FFI (requires `e3j_ops`).
+        FUSED_CUDA: Dispatch to custom CUDA kernel via XLA-FFI (requires `e3j_ops`).
         FUSED_MOSAIC_TPU: Dispatch to the Pallas Mosaic TPU kernel.
     """
 
-    FUSED = "FUSED"
-    SPARSE = "SPARSE"
+    UNFUSED = "UNFUSED"
     DENSE = "DENSE"
+    FUSED_CUDA = "FUSED_CUDA"
     FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
 
 
@@ -118,8 +118,8 @@ class Layout(EnumOption):
     E3NN = 2
 
 
-class TPMode(EnumOption):
-    """Tensor product modes.
+class MixingMode(EnumOption):
+    """Mixing mode for bilinear tensor products.
 
     Values:
         OUTER: "u -> v -> (u,v)"
@@ -135,7 +135,7 @@ class TPMode(EnumOption):
     MAP = 2
 
 
-class TPNormalization(EnumOption):
+class TensorProductNormalization(EnumOption):
     """Tensor product normalization options of Clebsch-Gordan coefficients.
 
     Values:

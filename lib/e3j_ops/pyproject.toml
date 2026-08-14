@@ -5,10 +5,11 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "e3j_ops"
-version = "0.1.0b5"
+version = "0.1.0"
 description = "Fast Euclid equivariant operations for JAX"
 authors = [
-    { name="Olivier Peltre", email="o.peltre@instadeep.com" }
+    { name="Olivier Peltre", email="o.peltre@instadeep.com" },
+    { name="Adrien Pichard", email="a.pichard@instadeep.com" },
 ]
 license = {text="MIT"}
 readme = "README.md"

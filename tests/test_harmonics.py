@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import e3nn_jax as e3nn
 import jax
 import jax.numpy as np
@@ -26,16 +28,13 @@ class _TestHarmonics:
     """Base class for harmonics polynomial tests."""
 
     out: int | str
+    normalization: str = "integral"
     batch_size: int = 4096
     _seed: int = 42
 
     @property
     def key(self) -> jax.Array:
         return random.key(self._seed)
-
-    @pytest.fixture(scope="class")
-    def yzx(self):
-        return np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
     @pytest.fixture
     def inputs(self, normalized=True):
@@ -75,10 +74,10 @@ class _TestHarmonics:
     @pytest.fixture(scope="class")
     def e3j_module(self):
         """Our polynomial evaluation."""
-        return Harmonics(self.out, normalize=True)
+        return Harmonics(self.out, normalize=True, normalization=self.normalization)
 
     @pytest.fixture(scope="class")
-    def e3nn_module(self, yzx):
+    def e3nn_module(self):
         """Wrapper around `e3nn.spherical_harmonics`."""
         if isinstance(self.out, int):
             out = e3nn.Irreps([(1, (l, (-1) ** l)) for l in range(self.out + 1)])
@@ -86,15 +85,17 @@ class _TestHarmonics:
             out = e3nn.Irreps(self.out)
 
         def e3nn_harmonics(x: np.ndarray) -> np.ndarray:
-            return e3nn.spherical_harmonics(out, x @ yzx, True).array
+            return e3nn.spherical_harmonics(
+                out, x, True, normalization=self.normalization
+            ).array
 
         return e3nn_harmonics
 
     @pytest.fixture(scope="class")
-    def rotations(self, e3j_module, yzx) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[np.ndarray]:
         """Prepare output and input rotations."""
         rotation_in = e3nn.rand_matrix(self.key)
-        rotation_out = e3j_module.target.D_from_matrix(rotation_in)
+        rotation_out = e3j_module.target.action(rotation_in)
         return [rotation_in, rotation_out]
 
     def assert_proportional(self, expect, result, tol: int = 1e-5):
@@ -107,6 +108,21 @@ class _TestHarmonics:
             print(f"{self.__class__.__name__}.assert_proportional\n", avg_ratio)
             raise err
 
+    def assert_close(self, expect, result, tol: float = 3e-4):
+        """Assert the two outputs are equal value-for-value (not just proportional).
+
+        The tolerance accommodates TPU float32 matmul precision: e3j and e3nn
+        agree to ~1e-6 in float32 on CPU, but the ladder recursion at high ``l``
+        accumulates ~1e-4 worst-case error on TPU (even at the ``highest`` matmul
+        precision pinned in ``pytest.ini``).
+        """
+        max_abs = float(np.max(np.abs(result - expect)))
+        try:
+            assert max_abs < tol
+        except AssertionError as err:
+            print(f"{self.__class__.__name__}.assert_close max_abs={max_abs}")
+            raise err
+
     def assert_zero(self, data, tol: int = 1e-6):
         norm = float(np.sqrt(np.sum(data**2))) / data.size
         try:
@@ -116,12 +132,27 @@ class _TestHarmonics:
             print("error.std", np.std(data, axis=0), sep="\n")
             raise err
 
+    def expected_s2_norm(self, l: int) -> float:
+        """Expected `sqrt(integral_S2(Y_lm^2))` for `self.normalization`.
+
+        Mirrors e3nn's documented relationship between conventions: "integral"
+        has unit S2-integral by definition, "component" scales it by `4*pi`,
+        and "norm" scales it by `4*pi / (2l + 1)`.
+        """
+        if self.normalization == "integral":
+            return 1.0
+        if self.normalization == "component":
+            return math.sqrt(4 * math.pi)
+        if self.normalization == "norm":
+            return math.sqrt(4 * math.pi / (2 * l + 1))
+        raise NotImplementedError(self.normalization)
+
     # --- Test functions ---
 
     def test_jvp(self, inputs, tangents, e3j_module, e3nn_module):
-        expect = jax.jvp(e3nn_module, [inputs], [tangents])[0]
-        result = jax.jvp(e3j_module, [inputs], [tangents])[0]
-        self.assert_proportional(expect, result)
+        expect = jax.jvp(e3nn_module, [inputs], [tangents])[1]
+        result = jax.jvp(e3j_module, [inputs], [tangents])[1]
+        self.assert_close(expect, result)
 
     def test_jacrev_equal_jacfwd(self, small_inputs, e3j_module):
         fwd = jax.jacfwd(e3j_module)(small_inputs)
@@ -136,13 +167,30 @@ class _TestHarmonics:
         s2_expectation = (1 / N) * np.sum(np.abs(results) ** 2, axis=0)
         s2_integral = s2_expectation * s2_mass
         s2_norm = np.sqrt(s2_integral)
-        self.assert_zero(1 - s2_norm, tol=5e-3)
+        expected = np.concatenate(
+            [
+                np.full(2 * irrep_out.l + 1, self.expected_s2_norm(irrep_out.l))
+                for _, irrep_out in e3j_module.target
+            ]
+        )
+        self.assert_zero(expected - s2_norm, tol=5e-3)
 
     def test_e3nn(self, inputs, e3j_module, e3nn_module):
         """Check that e3j and e3nn modules give the same output."""
         result = e3j_module(inputs)
         expect = e3nn_module(inputs)
-        return self.assert_proportional(expect, result)
+        return self.assert_close(expect, result)
+
+    def test_default_normalization(self, inputs):
+        """Check that leaving `normalization` unset agrees with e3nn_jax's default."""
+        out = (
+            e3nn.Irreps([(1, (l, (-1) ** l)) for l in range(self.out + 1)])
+            if isinstance(self.out, int)
+            else e3nn.Irreps(self.out)
+        )
+        result = Harmonics(self.out, normalize=True)(inputs)
+        expect = e3nn.spherical_harmonics(out, inputs, True).array
+        self.assert_close(expect, result)
 
     def test_grad_jit(self, inputs, e3j_module):
         sum_P = jax.jit(lambda r: np.sum(e3j_module(r)))
@@ -156,19 +204,21 @@ class _TestHarmonics:
         dPx = jit_dP(inputs)
         assert dPx.shape == (inputs.shape[0], 3)
 
-    @pytest.mark.skip("e3nn.spherical_harmonics not equivariant")
-    def test_equivariance(self, inputs, e3j_module, rotations, yzx):
-        """Check that module commutes with SO3."""
+    def test_equivariance(self, inputs, e3j_module, rotations):
+        """Check that module commutes with SO3.
+
+        The harmonics and the Wigner-D (``target.action``) both live in the e3nn
+        (y, z, x) frame, so equivariance holds directly: rotating the output by
+        ``D(R)`` equals evaluating the harmonics on the rotated inputs.
+        """
         gfx = e3j_module(inputs) @ rotations[1]
-        fgx = e3j_module(inputs @ (yzx.T @ rotations[0] @ yzx))
+        fgx = e3j_module(inputs @ rotations[0])
         self.assert_zero(gfx - fgx)
 
-    @pytest.mark.skip("e3nn.spherical_harmonics not equivariant")
-    def test_e3nn_equivariance(self, inputs, e3nn_module, rotations, yzx):
+    def test_e3nn_equivariance(self, inputs, e3nn_module, rotations):
         """Check that e3nn module commutes with SO3."""
         gfx = e3nn_module(inputs) @ rotations[1]
-        # NOTE: e3nn_module(x) = e3nn.spherical_harmonics(x @ yzx)
-        fgx = e3nn_module(inputs @ rotations[0] @ yzx.T)
+        fgx = e3nn_module(inputs @ rotations[0])
         self.assert_zero(gfx - fgx)
 
 
@@ -185,3 +235,15 @@ class TestHarmonicsSP(_TestHarmonics):
 class TestHarmonics5(_TestHarmonics):
 
     out = "0e + 1o + 2e + 3o + 4e + 5o"
+
+
+class TestHarmonics5Component(_TestHarmonics):
+
+    out = "0e + 1o + 2e + 3o + 4e + 5o"
+    normalization = "component"
+
+
+class TestHarmonics5Norm(_TestHarmonics):
+
+    out = "0e + 1o + 2e + 3o + 4e + 5o"
+    normalization = "norm"

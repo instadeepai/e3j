@@ -14,9 +14,10 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from e3j.arrays import O3Array
+from e3j.arrays import Array, O3Array
 from e3j.spaces import O3Space
 
 
@@ -53,6 +54,16 @@ class _TestO3Array:
             O3Array(self.space, y, self.layout),
         )
 
+    def test_blocks(self, o3_inputs):
+        x, _ = o3_inputs
+        blocks = list(x.blocks())
+        assert len(blocks) == len(self.space.blocks)
+        for (mul, ir), block in zip(self.space, blocks):
+            assert isinstance(block, type(x))
+            assert block.space == type(self.space)([(mul, ir)])
+            assert block.layout == x.layout
+            assert block.shape[block.feature_axis] == ir.dim
+
     def test_add(self, o3_inputs):
         x, y = o3_inputs
         z = x + y
@@ -64,6 +75,29 @@ class _TestO3Array:
         z = x - y
         assert isinstance(z, O3Array) and z.space == self.space
         assert jnp.all(z.array == x.array - y.array)
+
+    def test_add_sub_incompatible_space_raises(self, o3_inputs):
+        x, y = o3_inputs
+        other_space = O3Space(f"{self.dim}x0e")
+        other = type(x)(other_space, y.array, self.layout)
+        with pytest.raises(ValueError):
+            x + other
+        with pytest.raises(ValueError):
+            x - other
+
+    def test_sub_incompatible_space_error_mentions_subtract(self, o3_inputs):
+        x, y = o3_inputs
+        other_space = O3Space(f"{self.dim}x0e")
+        other = type(x)(other_space, y.array, self.layout)
+        with pytest.raises(ValueError, match="subtract"):
+            x - other
+
+    def test_add_sub_non_array_raises(self, o3_inputs):
+        x, _ = o3_inputs
+        with pytest.raises(ValueError):
+            x + x.array
+        with pytest.raises(ValueError):
+            x - x.array
 
     @pytest.mark.xfail
     def test_radd(self, o3_inputs):
@@ -113,6 +147,39 @@ class _TestO3Array:
         assert isinstance(yi, O3Array) and yi.space == self.space
         assert jnp.all(yi.array == y.array[idx])
 
+    def test_getitem_numpy_index_off_feature_axis(self, o3_inputs):
+        _, y = o3_inputs
+        # A plain numpy (not jax) array index doesn't touch the feature
+        # axis, so this must index normally rather than raising from an
+        # ambiguous elementwise `==`/`!=`/`in` comparison against it.
+        idx = np.array([0, 1, 2])
+        yi = y[idx]
+        assert isinstance(yi, O3Array) and yi.space == self.space
+        assert jnp.all(yi.array == y.array[idx])
+
+    def test_getitem_feature_axis_raises(self, o3_inputs):
+        x, _ = o3_inputs
+        axis = x.feature_axis % x.ndim
+        # Same-length reversal: doesn't trip the shape/dim check in
+        # Array.__init__, so it can only be caught by an explicit guard.
+        key = [slice(None)] * x.ndim
+        key[axis] = slice(None, None, -1)
+        with pytest.raises(ValueError):
+            x[tuple(key)]
+
+    def test_getitem_multiaxis_boolean_mask_over_feature_axis_raises(self, o3_inputs):
+        x, _ = o3_inputs
+        # A boolean mask whose rank matches more than one axis (here: the
+        # leading batch axis together with the feature axis) must still be
+        # caught by the feature-axis guard, even though it is a single
+        # index-tuple element rather than one element per axis.
+        axis = x.feature_axis % x.ndim
+        mask = jnp.zeros(x.shape[: axis + 1], dtype=bool)
+        mask = mask.at[(0,) * mask.ndim].set(True)
+        mask = mask.at[(1,) + (0,) * (mask.ndim - 1)].set(True)
+        with pytest.raises(ValueError):
+            x[mask]
+
     def test_jit_return(self, o3_inputs):
         x, y = o3_inputs
 
@@ -132,3 +199,24 @@ class TestO3ArrayLeading(_TestO3Array):
 
 class TestO3ArrayTrailing(_TestO3Array):
     layout = "TRAILING_CHANNELS"
+
+
+def test_array_repr_interpolates_layout():
+    space = O3Space("0e+1o")
+    # LEADING_CHANNELS is a non-default layout (project default is
+    # TRAILING_CHANNELS), so Array.__repr__ appends the layout suffix.
+    x = O3Array(space, jnp.zeros((2, 32, 4)), "LEADING_CHANNELS")
+    # Call Array.__repr__ directly: O3Array gets its own dataclass-generated
+    # __repr__, which shadows the inherited one for plain repr(x).
+    r = Array.__repr__(x)
+    assert "{self.layout}" not in r
+    assert str(x.layout) in r
+
+
+def test_rmul_lower_rank_scalar_trailing_channels():
+    space = O3Space("0e+1o")
+    x = O3Array(space, jnp.ones((128, 4, 32)), "TRAILING_CHANNELS")
+    scalar = jnp.arange(32.0)  # per-channel scalar, fewer dims than x.array
+    result = scalar * x
+    assert isinstance(result, O3Array)
+    assert jnp.all(result.array == scalar * x.array)

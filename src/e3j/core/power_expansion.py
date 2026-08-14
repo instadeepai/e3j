@@ -21,7 +21,7 @@ from e3j.core.filter import Filter
 from e3j.core.tensor_product import TensorProduct
 from e3j.spaces import O3Space
 from e3j.utils.irreps import irrep_range
-from e3j.utils.options import Layout, TPMode
+from e3j.utils.options import Layout, MixingMode
 
 
 class PowerExpansion:
@@ -179,7 +179,7 @@ class PowerExpansion:
                 (irrep_nu, self.source),
                 irreps_out,
                 layout=self.layout,
-                mode=TPMode.MAP,
+                mode=MixingMode.MAP,
             )
             irrep_nu = otimes.target
             layers.append(otimes)

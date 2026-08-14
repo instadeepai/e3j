@@ -153,9 +153,12 @@ __global__ void kernel_bwd (
         Coef* smem_coef = reinterpret_cast<Coef*>(smem_);
         copy_pipe<1>(smem_coef, coef, 3 * num_coef);
         coef = smem_coef;
-        constexpr size_t align = N * sizeof(Val);
+        // Advance past the coef buffer, rounding up to 16 B so the dm/x/y/
+        // mix/dx buffers stay 16-byte aligned for LDS.128 and the int4
+        // cp.async copies (copy_pipe_strided always issues 16 B transactions
+        // regardless of N).
         size_t coef_bytes = (size_t)(3 * num_coef) * sizeof(Coef);
-        coef_bytes = (coef_bytes + align - 1) & ~(align - 1);
+        coef_bytes = utils::smem_align(coef_bytes);
         smem_ = (char*)smem_coef + coef_bytes;
         __pipeline_commit();
         wait_pipe();
@@ -225,6 +228,9 @@ __global__ void kernel_bwd (
             size_t edge_t = (size_t)(edge_perm ? edge_perm[edge] : edge);
 
             int receiver = adj.sender[edge];
+
+            // Skip padding edges: OOB can signal padding safely
+            if (receiver < 0 || receiver >= (int)num_nodes) continue;
 
             // Load dm[receiver], y[edge_t], s[edge_t]
             smem.dm.load<N>(dm_, receiver);

@@ -51,7 +51,7 @@ class Config(YamlConfig):
         tensor_product: Evaluation strategy for tensor products.
             See :class:`~e3j.utils.options.TensorProduct`.
         aggregation: Aggregation method for sparse reduction steps.
-            Only used if `tensor_product` option is "SPARSE".
+            Only used if `tensor_product` option is "UNFUSED".
             See :class:`~e3j.utils.options.Aggregation`.
         convolution: Evaluation strategy for convolution.
             See :class:`~e3j.utils.options.Convolution`.
@@ -63,32 +63,42 @@ class Config(YamlConfig):
     """
 
     layout: Layout = Layout.TRAILING_CHANNELS
-    tensor_product: TensorProduct = TensorProduct.SPARSE
+    tensor_product: TensorProduct = TensorProduct.UNFUSED
     aggregation: Aggregation = Aggregation.SCATTER
     convolution: Convolution = Convolution.UNFUSED
     debug_level: int = 0
 
 
+# ------ Platform-dependent defaults ------
+
+_CUDA_CONFIG = Config(
+    tensor_product=TensorProduct.FUSED_CUDA,
+    convolution=Convolution.FUSED_CUDA,
+)
+
+_TPU_CONFIG = Config(
+    tensor_product=TensorProduct.FUSED_MOSAIC_TPU,
+    convolution=Convolution.FUSED_MOSAIC_TPU,
+)
+
+
+# ------ Context manager -------------------
+
+
 class config(Config):
     """Singleton config class for e3j.
 
-    This class manages a global :class:`Config` instance. See
-    `help(e3j.config.state())` for more details on the actual configuration options.
+    This class manages a global :class:`Config` instance.
+    The global configuration can be read with `e3j.config()`
+    and overriden permanently with `e3j.config(**kwargs)`.
 
-    Usage:
+    To override with context manager scope, use:
 
-        .. code:: python
+    .. code:: python
 
-            # context manager:
-            with e3j.use(**kwargs):
-                ...
-            # get mutable global state
-            cfg = e3j.config()
-            # get copy of current global state
-            cfg = e3j.config.state()
-            # set permanently
-            e3j.config(**kwargs)
-
+        # context manager:
+        with e3j.use(**kwargs):
+            ...
     """
 
     _state: type["config"] = None
@@ -128,25 +138,21 @@ class config(Config):
         The backend detection logic can be overriden by the `$E3J_BACKEND`
         environment variable.
         """
-        # Bypass our fragile backend detection attempts with $E3J_BACKEND
+        # Bypass backend detection with JAX_PLATFORMS='cpu' or $E3J_BACKEND
         backend = os.environ.get("E3J_BACKEND")
         if not backend:
-            if _E3J_OPS_AVAILABLE:
+            jax_platforms = os.environ.get("JAX_PLATFORMS") or ""
+            if jax_platforms[:3] == "cpu":
+                backend = "cpu"
+            elif _E3J_OPS_AVAILABLE:
                 backend = "gpu"
-            if _TPU_AVAILABLE:
+            elif _TPU_AVAILABLE:
                 backend = "tpu"
 
         if backend == "gpu" and _E3J_OPS_AVAILABLE:
-            return Config(
-                tensor_product=TensorProduct.FUSED,
-                convolution=Convolution.FUSED_CUDA,
-            )
+            return _CUDA_CONFIG
         if backend == "tpu" and _TPU_AVAILABLE:
-            return Config(
-                tensor_product=TensorProduct.FUSED_MOSAIC_TPU,
-                convolution=Convolution.FUSED_MOSAIC_TPU,
-            )
-
+            return _TPU_CONFIG
         return Config()
 
     @classmethod

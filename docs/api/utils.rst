@@ -17,12 +17,12 @@ Configuration
     config.Config
     config.config
     options.Layout
-    options.TPMode
+    options.MixingMode
     options.TensorProduct
     options.Convolution
     options.GraphOrdering
     options.Aggregation
-    options.TPNormalization
+    options.TensorProductNormalization
     options.LinearInitialization
     options.LinearIndexwiseInitialization
 

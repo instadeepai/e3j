@@ -26,3 +26,4 @@ for installation and compilation instructions.
 
     overview
     api/toc
+    animation

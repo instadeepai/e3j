@@ -67,7 +67,7 @@ def _require_tpu():
 
 @pytest.fixture(autouse=True)
 def _plain_jax_reference():
-    with config.use(tensor_product=options.TensorProduct.SPARSE):
+    with config.use(tensor_product=options.TensorProduct.UNFUSED):
         yield
 
 

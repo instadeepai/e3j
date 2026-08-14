@@ -53,7 +53,7 @@ namespace op_name {
 } // namespace e3j
 ```
 
-Most kernels are templated across a range of index and/or value data types. Some [e3j] primitives automatically dispatch to narrow index dtypes (`uint8` / `uint16`) when feature spaces dimensions  are small enough. Half-precision `float16` arithmetic for values is not yet supported, but planned for a soon upcoming release.
+Most kernels are templated across a range of index and/or value data types. Some [e3j] primitives automatically dispatch to narrow index dtypes (`uint8` / `uint16`) when feature spaces dimensions  are small enough. Value dtypes are `float32`, `float64` and `float16`, each usable with any index dtype. Kernels compute and accumulate in the value dtype. `float16` is not supported yet on the `atomicAdd` based paths (`scatter_add_1` and the `LEADING_CHANNELS` tensor product), which return `Unimplemented`.
 
 ### XLA-FFI handlers
 

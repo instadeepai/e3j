@@ -17,7 +17,7 @@ try:
 
     from .jax_ffi import ffi
     from .scatter_add import scatter_add_1
-    from .tensor_product import TensorProductParams, tensor_product
+    from .tensor_product import CUDATensorProductParams, tensor_product
 
     for _name, _value in e3j_ops.get_registrations().items():
         ffi.register_ffi_target(_name, _value, platform="CUDA")
@@ -36,4 +36,4 @@ except ModuleNotFoundError:
             "Run `make e3j_ops` and add `e3j/bin` to your $PYTHONPATH."
         )
 
-    TensorProductParams = object
+    CUDATensorProductParams = object

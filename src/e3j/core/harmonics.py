@@ -12,13 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import e3nn_jax as e3nn
+import math
+
 import jax.numpy as np
 
 from e3j.core.polynomials import Polynomial
 from e3j.spaces import O3Space
 from e3j.utils.safe import safe_norm
 from e3j.utils.spherical_harmonics import Y
+
+
+def _normalization_factor(l: int, normalization: str) -> float:  # noqa: E741
+    """Scalar rescaling of the degree-l harmonics block relative to "integral".
+
+    e3j's `Y(l, ...)` is normalized so that `integral(S2) Y_lm^2 = 1` (the
+    "integral" convention). e3nn's other conventions rescale each l-block
+    by a single l-dependent constant: "component" has `||Y^l||^2 = 2l + 1`,
+    "norm" has `||Y^l|| = 1`.
+    """
+    if normalization == "integral":
+        return 1.0
+    if normalization == "component":
+        return math.sqrt(4 * math.pi)
+    if normalization == "norm":
+        return math.sqrt(4 * math.pi / (2 * l + 1))
+    raise NotImplementedError(
+        f"We don't support {normalization} normalization for now. "
+        'We only support "integral", "component" and "norm"'
+    )
 
 
 class Harmonics:
@@ -35,7 +56,10 @@ class Harmonics:
     normalize : `bool`
         whether to project inputs on the S2 sphere,
     normalization : `str`
-        momentum-dependent normalization factor,
+        momentum-dependent normalization factor, one of "component"
+        (default, matching `e3nn_jax`'s default, :math:`\|Y^l\|^2 = 2l + 1`),
+        "integral" (:math:`\int_{S^2} Y_{lm}^2 = 1`) or "norm"
+        (:math:`\|Y^l\| = 1`),
     real : `bool`
         use real spherical harmonics :math:`Y_{lm}` by default, switch off for
         complex eigenvalues :math:`Y_l^m = |lm\rangle` of :math:`J_z, J^2`.
@@ -45,7 +69,7 @@ class Harmonics:
         self,
         target: int | str,
         normalize: bool = False,
-        normalization: str = "norm",
+        normalization: str = "component",
         real: bool = True,
     ):
         """Initialise polynomials Y(l) for l in out (or l <= l_max)."""
@@ -54,7 +78,11 @@ class Harmonics:
             if isinstance(target, str)
             else O3Space([(1, (l, (-1) ** l)) for l in range(target + 1)])
         )
-        Ys = [Y(irrep_out.l, None, real=real) for mul, irrep_out in self.target]
+        Ys = [
+            _normalization_factor(irrep_out.l, normalization)
+            * Y(irrep_out.l, None, real=real)
+            for mul, irrep_out in self.target
+        ]
         self.polynomial = Polynomial.concat(Ys)
         # hack to avoid matvec prior to exponentiation
         self.polynomial.basis = "harmonics"

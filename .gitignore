@@ -21,6 +21,8 @@ notes/*
 notes.jl
 docs/_build
 docs/img/*
+docs/_static/streaming_message_passing.mp4
+site/
 outputs/
 media/
 traces/

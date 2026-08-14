@@ -26,9 +26,8 @@ from jax import Array
 from jax.experimental import sparse
 
 import e3j.utils as utils
-from e3j.ops import TensorProductParams as Params
-from e3j.ops import tensor_product
-from e3j.ops.coef import Coef
+from e3j.ops import CUDATensorProductParams, tensor_product
+from e3j.ops.coef import Coef, resolve_val_dtype
 from e3j.pallas_ops.tensor_product import (
     PallasMosaicTPUTensorProductParams,
     tensor_product_pallas_mosaic_tpu,
@@ -63,9 +62,9 @@ class TensorProduct(SparseMixin):
 
     .. code:: python
 
-        e3j.config(tensor_product="FUSED")              # CUDA
+        e3j.config(tensor_product="FUSED_CUDA")         # CUDA
         e3j.config(tensor_product="FUSED_MOSAIC_TPU")   # Pallas MTPU
-        e3j.config(tensor_product="SPARSE")             # plain JAX, all platforms
+        e3j.config(tensor_product="UNFUSED")            # plain JAX, all platforms
     """
 
     @utils.cache
@@ -86,8 +85,8 @@ class TensorProduct(SparseMixin):
         sort: bool = True,
         config: utils.Config | None = None,
         layout: str | options.Layout = "LEADING_CHANNELS",
-        mode: str | options.TPMode = "OUTER",
-        normalization: str | options.TPNormalization = "NONE",
+        mode: str | options.MixingMode = "OUTER",
+        normalization: str | options.TensorProductNormalization = "NONE",
     ):
         """
         Stack Clebsch Gordan coefficients or use explicitly given ones.
@@ -118,6 +117,13 @@ class TensorProduct(SparseMixin):
             Clebsch-Gordan tensor product.
           * `MAP` : channel-wise tensor products. Only useful with trailing
             channels layout, since leading axes are mapped over by default.
+
+        Note
+        ----
+        Operations inherit the dtype of their operands. On `FUSED_CUDA`, the
+        value dtype may be `float16`, `float32` or `float64`; `float16` needs
+        `layout="TRAILING_CHANNELS"`, since the `LEADING_CHANNELS` kernel
+        reduces with `atomicAdd`, which has no `__half` overload.
         """
         # This switch decides whether:
         # - Clebsch-Gordan coefficients should be computed and stacked
@@ -146,8 +152,8 @@ class TensorProduct(SparseMixin):
         self.config = utils.config.state() if config is None else config
         self.aggregation_method = self.config.aggregation
         self.layout = Layout.parse(layout)
-        self.mode = options.TPMode.parse(mode)
-        self.normalization = options.TPNormalization.parse(normalization)
+        self.mode = options.MixingMode.parse(mode)
+        self.normalization = options.TensorProductNormalization.parse(normalization)
 
         # --- Coefficients ---
 
@@ -160,18 +166,6 @@ class TensorProduct(SparseMixin):
             with jax.ensure_compile_time_eval():
                 other = self.sort()
                 self.target, self.coef = other.target, other.coef
-
-    @property
-    def is_dense(self):
-        return self.config.tensor_product == options.TensorProduct.DENSE
-
-    @property
-    def is_fused(self):
-        return self.config.tensor_product == options.TensorProduct.FUSED
-
-    @property
-    def is_mtpu(self):
-        return self.config.tensor_product == options.TensorProduct.FUSED_MOSAIC_TPU
 
     @classmethod
     def infer_target(
@@ -195,15 +189,16 @@ class TensorProduct(SparseMixin):
         on the coefficient tensor by permuting target coordinates.
         """
         perm = Permutation.sort(self.target)
-        if not self.is_dense:
+        if self.config.tensor_product == options.TensorProduct.DENSE:
+            coef = self.coef[perm.sigma]
+        else:
             idx_out = perm.sigma_1[self.indices[:, 0]]
             indices = np.concat(
                 (idx_out[:, None], self.indices[:, 1:]),
                 axis=-1,
             )
             coef = sparse_bcoo(self.values, indices, self.shape)
-        else:
-            coef = self.coef[perm.sigma]
+
         return self.__class__(
             self.source,
             perm.target,
@@ -216,7 +211,7 @@ class TensorProduct(SparseMixin):
         target: O3Space,
         source_1: O3Space,
         source_2: O3Space,
-        normalization: options.TPNormalization = options.TPNormalization.NONE,
+        normalization: options.TensorProductNormalization = options.TensorProductNormalization.NONE,
     ) -> sparse.BCOO:
         """
         Stack Clebsch-Gordan coefficients.
@@ -253,7 +248,7 @@ class TensorProduct(SparseMixin):
                 cg_indices = numpy.stack(nz, axis=-1)  # shape (nnz, 3)
 
                 # optionally, rescale coefficients
-                if normalization == options.TPNormalization.SQRT_DIM_OUT:
+                if normalization == options.TensorProductNormalization.SQRT_DIM_OUT:
                     cg_data = cg_data * numpy.sqrt(2 * l0 + 1)
 
                 # accumulate repeated coefficient values
@@ -285,7 +280,7 @@ class TensorProduct(SparseMixin):
 
         return sparse_bcoo(values, indices, shape)
 
-    def dense_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _dense_eval(self, x: Array, y: Array, coef: Array) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         return np.einsum("ijk, ...j, ...k -> ...i", coef, x, y)
 
@@ -309,7 +304,7 @@ class TensorProduct(SparseMixin):
             return x[..., None], y
         raise ValueError(f"Incompatible operand ranks: {x.ndim} vs {y.ndim}")
 
-    def sparse_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _sparse_eval(self, x: Array, y: Array, coef: Array) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         ijk, c_ijk = coef.indices, coef.data
         # Gather inputs
@@ -330,23 +325,28 @@ class TensorProduct(SparseMixin):
         # Note: can't be staticmethod there because of SparseMixin
         return self.aggregate(cxy_ijk, layout=self.layout)
 
-    def fused_eval(
+    def _fused_eval(
         self,
         x: Array,
         y: Array,
         coef: Array,
     ) -> Array:
         """Evaluate bilinear map on pair of inputs."""
+        # One kernel dtype for every buffer, coefficients included.
+        val_dtype = resolve_val_dtype(np.result_type(x, y))
+        x = x.astype(val_dtype)
+        y = y.astype(val_dtype)
+
         idx = coef.indices
         val = coef.data
-        params = Params(
+        params = CUDATensorProductParams(
             num_out=self.target.dim,
             layout=self.layout,
             mode=self.mode,
         )
         # Pack coefficients as opaque `idx_t` vector.
         with jax.ensure_compile_time_eval():
-            coef = Coef(val, idx, val_dtype=val.dtype, idx_dtype=idx.dtype).pack_jax()
+            coef = Coef(val, idx, val_dtype=val_dtype, idx_dtype=idx.dtype).pack_jax()
         return tensor_product(coef, x, y, params)
 
     def _mtpu_params(self, coef: sparse.BCOO | None = None):
@@ -359,7 +359,7 @@ class TensorProduct(SparseMixin):
 
         if coef is None:
             coef = self.coef
-        if self.mode not in (options.TPMode.OUTER, options.TPMode.MAP):
+        if self.mode not in (options.MixingMode.OUTER, options.MixingMode.MAP):
             raise NotImplementedError(
                 f"Mosaic TPU tensor product does not support mode {self.mode}; "
                 "use 'OUTER' or 'MAP'."
@@ -377,9 +377,8 @@ class TensorProduct(SparseMixin):
             z_space=self.target,
         )
 
-    def mtpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _mtpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
         """Evaluate bilinear map via the Pallas Mosaic TPU kernel."""
-
         params = self._mtpu_params(coef)
         return tensor_product_pallas_mosaic_tpu(x, y, params)
 
@@ -389,11 +388,14 @@ class TensorProduct(SparseMixin):
         if coef is None:
             coef = self.coef
         # Algorithm branching
-        if self.is_dense:
-            return self.dense_eval(x, y, coef)
-        if self.is_fused:
-            return self.fused_eval(x, y, coef)
-        if self.is_mtpu:
-            return self.mtpu_eval(x, y, coef)
-        else:
-            return self.sparse_eval(x, y, coef)
+        impl = self.config.tensor_product
+        match impl:
+            case options.TensorProduct.DENSE:
+                return self._dense_eval(x, y, coef)
+            case options.TensorProduct.FUSED_CUDA:
+                return self._fused_eval(x, y, coef)
+            case options.TensorProduct.FUSED_MOSAIC_TPU:
+                return self._mtpu_eval(x, y, coef)
+            case options.TensorProduct.UNFUSED:
+                return self._sparse_eval(x, y, coef)
+        raise ValueError(f"Unrecognized tensor product option: {impl}")

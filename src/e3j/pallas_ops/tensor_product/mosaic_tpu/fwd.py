@@ -429,7 +429,8 @@ class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
         num_channels_vmem: int,
         n_batch_packed_in_channel: int,
     ) -> dict[int, jax.Array]:
-        return {yi: y_vmem[:, yi, :] for yi in yis}
+        y_t = jax.lax.transpose(y_vmem[...], (1, 0, 2))
+        return {yi: y_t[yi, :, :] for yi in yis}
 
 
 def _tensor_product_kernel_mosaic_tpu_fwd(
@@ -438,8 +439,8 @@ def _tensor_product_kernel_mosaic_tpu_fwd(
     params: PallasMosaicTPUTensorProductParams,
 ) -> jax.Array:
     if params.layout == options.Layout.TRAILING_CHANNELS:
-        if params.mode == options.TPMode.MAP:
+        if params.mode == options.MixingMode.MAP:
             return _FwdTrailingChannelMapKernel()(x, y, params)
-        if params.mode == options.TPMode.OUTER:
+        if params.mode == options.MixingMode.OUTER:
             return _FwdTrailingChannelOuterKernel()(x, y, params)
     raise NotImplementedError(f"Mosaic TPU TP fwd: unsupported params {params}")

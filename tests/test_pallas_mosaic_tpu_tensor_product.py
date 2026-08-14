@@ -64,7 +64,10 @@ def _require_tpu():
 
 
 def _build_params(
-    in1: str, in2: str, out: str | None, mode: options.TPMode = options.TPMode.OUTER
+    in1: str,
+    in2: str,
+    out: str | None,
+    mode: options.MixingMode = options.MixingMode.OUTER,
 ):
     """Build TRAILING_CHANNELS kernel params from a validated `TensorProduct`."""
     tp = TensorProduct((in1, in2), out, sort=True)
@@ -167,7 +170,7 @@ def test_forward_trailing_channel_map_matches_reference(
     in1, in2, out, batch_size, channels
 ):
     """TRAILING_CHANNELS MAP: inputs are (batch, dim, channels) and (batch, dim, channels)."""
-    params = _build_params(in1, in2, out, options.TPMode.MAP)
+    params = _build_params(in1, in2, out, options.MixingMode.MAP)
     x, y = _inputs_trailing_map(params, batch_size, channels)
 
     result = tensor_product_pallas_mosaic_tpu(x, y, params)
@@ -182,7 +185,7 @@ def test_backward_trailing_channel_map_matches_reference(
     in1, in2, out, batch_size, channels
 ):
     """TRAILING_CHANNELS MAP backward: dx (batch, x_dim, channels), dy (batch, y_dim, channels)."""
-    params = _build_params(in1, in2, out, options.TPMode.MAP)
+    params = _build_params(in1, in2, out, options.MixingMode.MAP)
     x, y = _inputs_trailing_map(params, batch_size, channels)
 
     do = jax.random.normal(
@@ -208,11 +211,11 @@ def test_backward_trailing_channel_map_matches_reference(
 #
 # These exercise the public `TensorProduct.__call__` path rather than calling
 # `tensor_product_pallas_mosaic_tpu` directly: with `tensor_product` set to
-# `MOSAIC_TPU` the class must route through `mtpu_eval`. References are built
+# `MOSAIC_TPU` the class must route through `_mtpu_eval`. References are built
 # from the same `tp` (via `tp.mtpu_params()`) so coefficients stay consistent.
 
 
-def _mtpu_tp(in1: str, in2: str, out: str | None, mode: options.TPMode):
+def _mtpu_tp(in1: str, in2: str, out: str | None, mode: options.MixingMode):
     """Build a TRAILING_CHANNELS `TensorProduct` wired to the Mosaic TPU path."""
     tp = TensorProduct(
         (in1, in2),
@@ -229,7 +232,7 @@ def _mtpu_tp(in1: str, in2: str, out: str | None, mode: options.TPMode):
 def test_class_dispatch_trailing_outer_forward(in1, in2, out, batch_size, channels):
     """`TensorProduct(...)(x, y)` with MOSAIC_TPU matches the OUTER reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
-        tp = _mtpu_tp(in1, in2, out, options.TPMode.OUTER)
+        tp = _mtpu_tp(in1, in2, out, options.MixingMode.OUTER)
         params = tp._mtpu_params()
         x, y = _inputs_trailing_outer(params, batch_size, channels)
         result = tp(x, y)
@@ -243,7 +246,7 @@ def test_class_dispatch_trailing_outer_forward(in1, in2, out, batch_size, channe
 def test_class_dispatch_trailing_outer_backward(in1, in2, out, batch_size, channels):
     """Backward through `TensorProduct.__call__` matches the OUTER reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
-        tp = _mtpu_tp(in1, in2, out, options.TPMode.OUTER)
+        tp = _mtpu_tp(in1, in2, out, options.MixingMode.OUTER)
         params = tp._mtpu_params()
         x, y = _inputs_trailing_outer(params, batch_size, channels)
         do = jax.random.normal(
@@ -268,7 +271,7 @@ def test_class_dispatch_trailing_outer_backward(in1, in2, out, batch_size, chann
 def test_class_dispatch_trailing_map_forward(in1, in2, out, batch_size, channels):
     """`TensorProduct(...)(x, y)` with MOSAIC_TPU matches the MAP reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
-        tp = _mtpu_tp(in1, in2, out, options.TPMode.MAP)
+        tp = _mtpu_tp(in1, in2, out, options.MixingMode.MAP)
         params = tp._mtpu_params()
         x, y = _inputs_trailing_map(params, batch_size, channels)
         result = tp(x, y)
@@ -282,7 +285,7 @@ def test_class_dispatch_trailing_map_forward(in1, in2, out, batch_size, channels
 def test_class_dispatch_trailing_map_backward(in1, in2, out, batch_size, channels):
     """Backward through `TensorProduct.__call__` matches the MAP reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
-        tp = _mtpu_tp(in1, in2, out, options.TPMode.MAP)
+        tp = _mtpu_tp(in1, in2, out, options.MixingMode.MAP)
         params = tp._mtpu_params()
         x, y = _inputs_trailing_map(params, batch_size, channels)
         do = jax.random.normal(

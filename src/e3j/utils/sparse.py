@@ -38,8 +38,7 @@ def narrow_index_dtype(shape: tuple[int, ...]) -> np.dtype:
         (excluding 32 multiple 92) for consistency with our alignment
         on the CUDA side.
     """
-    # TODO: pair uint16 with float16 only (check from Coef class).
-    #       Always skip uint16 with 32-bit value type to avoid 92bit alignment.
+    # NOTE: the value dtype is chosen independently, see `ops.coef.ValDtype`.
     max_dim = max(shape)
     if max_dim <= np.iinfo(np.uint8).max:
         return np.uint8
@@ -198,16 +197,21 @@ class SparseMixin:
         layout = options.Layout.parse(layout)
 
         # jax.lax.scatter_add
+        # Accumulate in `values.dtype`: `np.zeros` defaults to float64 under
+        # `jax_enable_x64`, promoting the output of a float32 tensor product.
         if self.aggregation_method == options.Aggregation.SCATTER:
             if layout in (options.Layout.E3NN, options.Layout.LEADING_CHANNELS):
-                y_out = np.zeros((*values.shape[:-1], dim_out))
+                y_out = np.zeros((*values.shape[:-1], dim_out), dtype=values.dtype)
                 return y_out.at[..., idx_out].add(
                     values,
                     indices_are_sorted=False,
                     mode="promise_in_bounds",
                 )
             elif layout == options.Layout.TRAILING_CHANNELS:
-                y_out = np.zeros((*values.shape[:-2], dim_out, values.shape[-1]))
+                y_out = np.zeros(
+                    (*values.shape[:-2], dim_out, values.shape[-1]),
+                    dtype=values.dtype,
+                )
                 return y_out.at[..., idx_out, :].add(
                     values,
                     indices_are_sorted=False,
@@ -221,7 +225,7 @@ class SparseMixin:
                     "NYI: scatter-reduction kernel with trailing channels"
                 )
             assert values.ndim == 2, "values must be 2D"
-            y_out = np.zeros((values.shape[0], dim_out))
+            y_out = np.zeros((values.shape[0], dim_out), dtype=values.dtype)
             return scatter_add_1(idx_out, values, y_out)
 
     def aggregate(self, values, layout: options.Layout | str = "E3NN"):

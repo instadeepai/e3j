@@ -66,7 +66,7 @@ class _TestConvolution:
     @pytest.fixture(scope="class")
     def module(self) -> Convolution:
         """Build a Convolution capturing the unfused config at construction."""
-        with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
+        with e3j.config.use(convolution="UNFUSED", tensor_product="UNFUSED"):
             return Convolution(
                 (self.node_irreps, self.edge_irreps),
                 self.out,
@@ -170,7 +170,7 @@ class _TestConvolution:
         """`avg_num_neighbors` divides the summed messages by a constant."""
         senders, receivers = graph
         avg = 3.0
-        with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
+        with e3j.config.use(convolution="UNFUSED", tensor_product="UNFUSED"):
             scaled = Convolution(
                 (self.node_irreps, self.edge_irreps),
                 self.out,
@@ -251,7 +251,7 @@ class TestConvolutionFused(_TestConvolution):
 
     @pytest.fixture(scope="class")
     def module(self) -> Convolution:
-        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
+        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED_CUDA"):
             return Convolution(
                 (self.node_irreps, self.edge_irreps),
                 self.out,
@@ -261,7 +261,7 @@ class TestConvolutionFused(_TestConvolution):
 
     @pytest.fixture(scope="class")
     def reference(self) -> Convolution:
-        with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
+        with e3j.config.use(convolution="UNFUSED", tensor_product="UNFUSED"):
             return Convolution(
                 (self.node_irreps, self.edge_irreps),
                 self.out,
@@ -270,14 +270,14 @@ class TestConvolutionFused(_TestConvolution):
             )
 
     def test_fused_matches_unfused(self, module, reference, inputs, graph):
-        """`fused_eval` reproduces the gather/TP/mix/scatter reference."""
+        """`_fused_eval` reproduces the gather/TP/mix/scatter reference."""
         senders, receivers = graph
         result = module(*inputs, senders, receivers)
         expect = reference(*inputs, senders, receivers)
         assert_allclose(expect, result, rtol=2e-3, atol=2e-3)
 
     def test_jit_pack_jax(self, inputs, reference, graph):
-        """`coef.pack_jax()` must succeed at trace time inside fused_eval.
+        """`coef.pack_jax()` must succeed at trace time inside _fused_eval.
 
         Building the module within the traced function forces the packed
         Coef4D to be materialized during compilation, which only works if the
@@ -287,7 +287,7 @@ class TestConvolutionFused(_TestConvolution):
         senders, receivers = graph
         source = (self.node_irreps, self.edge_irreps)
 
-        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
+        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED_CUDA"):
             f = jax.jit(
                 lambda a, b, c: Convolution(
                     source, self.out, layout=self.layout, graph_ordering="RECEIVER"
@@ -370,14 +370,14 @@ class TestConvolutionFusedSender:
     @pytest.fixture(scope="class")
     def modules(self) -> tuple[Convolution, Convolution, Convolution]:
         source = (self.node_irreps, self.edge_irreps)
-        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED"):
+        with e3j.config.use(convolution="FUSED_CUDA", tensor_product="FUSED_CUDA"):
             receiver = Convolution(
                 source, self.out, layout=self.layout, graph_ordering="RECEIVER"
             )
             sender = Convolution(
                 source, self.out, layout=self.layout, graph_ordering="SENDER"
             )
-        with e3j.config.use(convolution="UNFUSED", tensor_product="SPARSE"):
+        with e3j.config.use(convolution="UNFUSED", tensor_product="UNFUSED"):
             reference = Convolution(
                 source, self.out, layout=self.layout, graph_ordering="NONE"
             )

@@ -14,13 +14,14 @@
 
 import jax
 import jax.numpy as np
-import numpy as onp
+import numpy
 from jax import Array
 
 from e3j import utils
 from e3j.core.scalar_mixing import ScalarMixing
 from e3j.core.tensor_product import TensorProduct
-from e3j.ops.coef import Coef4D
+from e3j.data.graph import GraphCSR
+from e3j.ops.coef import Coef4D, resolve_val_dtype
 from e3j.ops.convolution import CUDAConvolutionParams, convolution
 from e3j.pallas_ops.convolution.mosaic_tpu import (
     PallasMosaicTPUMessagePassingConvolutionParams,
@@ -77,9 +78,9 @@ class Convolution:
         target: O3Space | None = None,
         *,
         graph_ordering: str | options.GraphOrdering,
-        layout: Layout = Layout.TRAILING_CHANNELS,
+        layout: str | Layout = Layout.TRAILING_CHANNELS,
         avg_num_neighbors: float | None = None,
-        normalization: str | options.TPNormalization = "SQRT_DIM_OUT",
+        normalization: str | options.TensorProductNormalization = "SQRT_DIM_OUT",
         config: utils.Config | None = None,
     ):
         """
@@ -98,10 +99,16 @@ class Convolution:
             layout: Specifies the channel axis, `TRAILING_CHANNELS` is faster.
             avg_num_neighbors: If given, messages are divided by this factor.
             normalization: Normalization of the tensor product's Clebsch-Gordan
-                coefficients, see :class:`e3j.utils.options.TPNormalization`.
+                coefficients, see :class:`e3j.utils.options.TensorProductNormalization`.
             config: Global :class:`e3j.utils.config.Config` (optional) pointing
                 to the implementation path. The best available option should be
                 automatically selected based on the environment.
+
+        Note:
+            Operations inherit the dtype of their operands. On `FUSED_CUDA`, the
+            value dtype may be `float16`, `float32` or `float64`: the fused
+            convolution is trailing channels only, so it never hits the
+            `atomicAdd` float16 restriction.
         """
         # Tensor product block
         otimes = TensorProduct(
@@ -131,7 +138,7 @@ class Convolution:
         self.avg_num_neighbors = avg_num_neighbors
 
         self.config = utils.config.state() if config is None else config
-        self.layout = layout
+        self.layout = Layout.parse(layout)
         self.normalization = otimes.normalization
         self._otimes = otimes
         self._mix = mix
@@ -197,8 +204,20 @@ class Convolution:
             raise NotImplementedError(
                 "CUDA convolution only supports SENDER and RECEIVER ordering."
             )
+
+        # One kernel dtype for every buffer, coefficients included.
+        val_dtype = resolve_val_dtype(
+            np.result_type(node_features, edge_features, edge_scalars)
+        )
+        node_features = node_features.astype(val_dtype)
+        edge_features = edge_features.astype(val_dtype)
+        edge_scalars = edge_scalars.astype(val_dtype)
+
         with jax.ensure_compile_time_eval():
-            coef4D_packed = self.coef.pack_jax()
+            coef = self.coef
+            coef4D_packed = Coef4D(
+                coef.val, coef.idx, val_dtype=val_dtype, idx_dtype=coef.idx_dtype
+            ).pack_jax()
 
         params = CUDAConvolutionParams(
             num_out=self.target.dim,
@@ -211,9 +230,9 @@ class Convolution:
         y_parity = None
         if self.graph_ordering == options.GraphOrdering.SENDER:
             y_space = self._otimes.source[1]
-            y_parity = np.concatenate(
+            y_parity = numpy.concatenate(
                 [
-                    np.full(m * ir.dim, float(ir.p), dtype=np.float32)
+                    numpy.full(m * ir.dim, float(ir.p), dtype=numpy.float32)
                     for m, ir in y_space
                 ]
             )
@@ -257,8 +276,8 @@ class Convolution:
         coef = self._otimes.coef
         params = (
             PallasMosaicTPUMessagePassingConvolutionParams.build_from_sender_sorted(
-                indices=onp.array(coef.indices),
-                values=onp.array(coef.data),
+                indices=numpy.array(coef.indices),
+                values=numpy.array(coef.data),
                 x_space=O3Space(str(self._otimes.source[0])),
                 y_space=O3Space(str(self._otimes.source[1])),
                 z_space=O3Space(str(self._otimes.target)),
@@ -280,6 +299,7 @@ class Convolution:
         edge_scalars: Array,
         senders: Array,
         receivers: Array,
+        node_mask: Array | None = None,
     ) -> Array:
         """Return sum of messages on receiver nodes.
 
@@ -297,15 +317,21 @@ class Convolution:
             edge_scalars: array of shape `(num_edges, num_scalars, num_channels)`
             senders: index vector of length num_edges, in bounds [0, num_nodes)
             receivers: index vector of length num_edges, in bounds [0, num_nodes).
+            node_mask: optional boolean vector of length num_nodes, `True` for
+                real nodes and `False` for padding nodes, which *must* lie at
+                the tail of the graph. Padding edges are also assumed to only
+                connect padding nodes.
 
         Note:
-            On the CUDA convolution kernel the edges must be sorted (for the
-            sparse CSR adjacency) by the endpoint selected via `graph_ordering`:
-            monotonically increasing `receivers` under the default `RECEIVER`
-            ordering, or monotonically increasing `senders` under `SENDER`. The
-            `SENDER` ordering additionally requires the symmetry assumptions
-            documented on the class.
+            On the CUDA convolution kernel the edges must be sorted by the endpoint
+            selected via `graph_ordering`. The `SENDER` ordering additionally
+            requires the symmetry assumptions documented on the class.
         """
+        # Edges touching a padding node are excluded from every path: dropped
+        # from the CSR (no kernel work) so padding never inflates the aggregation.
+        if node_mask is not None:
+            senders, receivers = GraphCSR.mask_edges(senders, receivers, node_mask)
+
         match self.config.convolution:
             case options.Convolution.UNFUSED:
                 return self._unfused_eval(

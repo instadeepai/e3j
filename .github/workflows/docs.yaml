@@ -39,7 +39,13 @@ jobs:
         run: |
           apt-get update && apt-get install -y \
           coreutils \
-          git
+          git \
+          ffmpeg \
+          gcc \
+          pkg-config \
+          libcairo2-dev \
+          libpango1.0-dev \
+          fonts-dejavu-core
           git config --system --add safe.directory $GITHUB_WORKSPACE
 
       - name: checkout code 📦
@@ -50,6 +56,14 @@ jobs:
 
       - name: setup env
         run: uv sync --group docs --frozen
+
+      - name: render animation 🎞️
+        run: |
+          uvx manim@0.20.1 -qh --media_dir /tmp/anim \
+          docs/animations/fwd_anim.py StreamingMessagePassing
+          mkdir -p docs/_static
+          cp /tmp/anim/videos/fwd_anim/1080p60/StreamingMessagePassing.mp4 \
+          docs/_static/streaming_message_passing.mp4
 
       - name: build documentation 🔨
         run: uv run --no-sync sphinx-build -W -b html docs/ site/

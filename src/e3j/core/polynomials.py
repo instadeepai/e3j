@@ -18,14 +18,18 @@ import functools
 from typing import Optional
 
 import jax
-import jax.numpy as np
-import jax.random
-from jax.experimental import sparse
+import jax.numpy as jnp
+import numpy as np
 
 from e3j.utils.custom_jvp import CustomJVP
 
+# Static polynomial data (exponents, coefficients, coordinate matrices) is held
+# as concrete numpy arrays and manipulated with `np` (numpy) at build time;
+# only point-cloud evaluation (fwd/bwd) runs on `jnp` and yields `jax.Array`s.
+Array = jax.Array | np.ndarray
 
-def block_diagonal(a: jax.Array, b: jax.Array) -> jax.Array:
+
+def block_diagonal(a: Array, b: Array) -> Array:
     """
     Block diagonal matrix stacking blocks a and b.
     """
@@ -33,13 +37,13 @@ def block_diagonal(a: jax.Array, b: jax.Array) -> jax.Array:
     za = np.zeros((a.shape[0], b.shape[1]))
     zb = np.zeros((b.shape[0], a.shape[1]))
     # fill rows with zeros
-    row_a = np.concat((a, za), axis=-1)
-    row_b = np.concat((zb, b), axis=-1)
+    row_a = np.concatenate((a, za), axis=-1)
+    row_b = np.concatenate((zb, b), axis=-1)
     # concat rows
-    return np.concat((row_a, row_b), axis=0)
+    return np.concatenate((row_a, row_b), axis=0)
 
 
-def block_diag(*blocks: jax.Array) -> jax.Array:
+def block_diag(*blocks: Array) -> Array:
     """
     Block diagonal matrix arbitrary number of blocks
     """
@@ -51,9 +55,9 @@ def block_diag(*blocks: jax.Array) -> jax.Array:
         zl, zr = (
             np.zeros((nrows, ncols), dtype=block.dtype) for ncols in (ncols_l, ncols_r)
         )
-        row_i = np.concat((zl, block, zr), axis=1)
+        row_i = np.concatenate((zl, block, zr), axis=1)
         rows.append(row_i)
-    return np.concat(rows, axis=0)
+    return np.concatenate(rows, axis=0)
 
 
 class Monomial:
@@ -78,15 +82,15 @@ class Monomial:
     is useful for having distinct product/power implementations.
     """
 
-    def __init__(self, exp: jax.Array, coords: jax.Array | str | None = None):
+    def __init__(self, exp: Array, coords: Array | str | None = None):
         """
         Create monomials from exponents array and optional coordinate matrix.
 
         Parameters
         ----------
-            exp (`jax.Array`):
+            exp (`np.ndarray`):
                 exponents array of shape `[n, d]`
-            coords (`jax.Array | None`):
+            coords (`np.ndarray | None`):
                 an optional `[d, d]` matrix of coordinate functions.
         """
         self.exp = exp
@@ -112,19 +116,19 @@ class Monomial:
         return self.exponentiate_and_multiply(x)
 
     def eval_coords(self, r: jax.Array) -> jax.Array:
-        if self.coords == "harmonic":
+        if isinstance(self.coords, str) and self.coords == "harmonic":
             x, y, z = r[..., 0], r[..., 1], r[..., 2]
-            return np.stack([x + 1j * y, x - 1j * y, z], axis=-1)
+            return jnp.stack([x + 1j * y, x - 1j * y, z], axis=-1)
         return r if r is None else r @ self.coords
 
     @jax.profiler.annotate_function
     def exponentiate_and_multiply(self, x: jax.Array) -> jax.Array:
         # expand monomial dimension
-        x = np.expand_dims(x, -2)
+        x = jnp.expand_dims(x, -2)
         # exponentiate coordinates
         xm = x**self.exp
         # fold monomials coordinate-wise
-        return np.prod(xm, axis=-1)
+        return jnp.prod(xm, axis=-1)
 
     @classmethod
     def concat(cls, ms: tuple[Monomial]) -> Monomial:
@@ -134,13 +138,13 @@ class Monomial:
             raise NotImplementedError(
                 "Cannot concatenate monomials with different coordinates."
             )
-        exp = np.concat(tuple(m.exp for m in ms), axis=0)
+        exp = np.concatenate(tuple(m.exp for m in ms), axis=0)
         return Monomial(exp, ms[0].coords)
 
     def __or__(self, other: Monomial) -> Monomial:
         """Concatenate two monomial batches."""
         if self.coords is other.coords:
-            exp = np.concat((self.exp, other.exp), axis=0)
+            exp = np.concatenate((self.exp, other.exp), axis=0)
             return Monomial(exp, self.coords)
         raise NotImplementedError("`a.coords` is not `b.coords`")
 
@@ -187,7 +191,7 @@ class Polynomial:
     def __init__(
         self,
         monomials: Monomial,
-        coef: jax.Array | None = None,
+        coef: Array | None = None,
         shape: tuple | None = None,
     ):
         """
@@ -197,7 +201,7 @@ class Polynomial:
         ----------
         monomials : `Monomial`
             an array of `n` monomials
-        coef : `jax.Array | None`
+        coef : `np.ndarray | None`
             an optional `(k, n)` matrix of coefficients, defaults to ones.
         shape : `tuple | None`
             an optional leading shape, mostly useful to arrange outputs of
@@ -264,8 +268,8 @@ class Polynomial:
         monomials = Monomial(exp, m.coords)
         # aggregate coefficients
         m, n = exp.shape[0], self.exp.shape[0]
-        ones = np.ones(n)
-        agg = sparse.BCOO((ones, np.stack((np.arange(n), inv), axis=1)), shape=(n, m))
+        agg = np.zeros((n, m), dtype=self.coef.dtype)
+        agg[np.arange(n), inv] = 1
         coef = self.coef @ agg
         return Polynomial(monomials, coef, self.shape)
 
@@ -284,7 +288,7 @@ class Polynomial:
                 mi = m[i : i + 1]
                 mask_i = mi[0] > 0
                 # d(xi^mi) / dxi = mi . xi^(mi - 1)
-                dmi = np.concat((m[:i], (mi - 1), m[i + 1 :])).T
+                dmi = np.concatenate((m[:i], (mi - 1), m[i + 1 :])).T
                 dmi = np.where(mask_i[:, None], dmi, 0)
                 dci = mi[0] * c
                 Mi = Monomial(dmi, self.coords)
@@ -294,11 +298,11 @@ class Polynomial:
             return Polynomial.stack(diffs, axis=-1).coalesce()
 
     @property
-    def exp(self) -> jax.Array:
+    def exp(self) -> Array:
         return self.monomials.exp
 
     @property
-    def coords(self) -> jax.Array:
+    def coords(self) -> Array:
         return self.monomials.coords
 
     def __or__(self, other: Polynomial | Monomial) -> Polynomial:
@@ -319,7 +323,7 @@ class Polynomial:
         if self.monomials is other.monomials:
             return Polynomial(self.monomials, self.coef + other.coef)
         monomials = self.monomials | other.monomials
-        coef = np.concat((self.coef, other.coef), axis=-1)
+        coef = np.concatenate((self.coef, other.coef), axis=-1)
         return Polynomial(monomials, coef)
 
     def __sub__(self, other: Polynomial) -> Polynomial:
@@ -327,7 +331,7 @@ class Polynomial:
         if self.monomials is other.monomials:
             return Polynomial(self.monomials, self.coef - other.coef)
         monomials = self.monomials | other.monomials
-        coef = np.concat((self.coef, -other.coef), axis=-1)
+        coef = np.concatenate((self.coef, -other.coef), axis=-1)
         return Polynomial(monomials, coef)
 
     def __mul__(self, other: Polynomial) -> Polynomial:
@@ -377,7 +381,7 @@ class Polynomial:
         # - shape : additional dimensions for e.g. gradient coordinates
         # - 1 : dummy dimension for 3x3 @ 3x1 batch_matmul
         axes = (*range(1, len(self.shape)), -1)
-        dx_ = np.expand_dims(dx @ self.coords, axis=axes)
+        dx_ = jnp.expand_dims(dx @ self.coords, axis=axes)
         return Px, (dPx @ dx_).squeeze(-1)
 
     def __repr__(self) -> str:
@@ -410,15 +414,15 @@ class MonomialC(Monomial):
     `np.arctan2` and `np.linalg.norm`.
     """
 
-    def __init__(self, exp: jax.Array, coords: Optional[jax.Array] = None):
+    def __init__(self, exp: Array, coords: Optional[Array] = None):
         self.exp = exp
-        self.coords = np.concat((coords.real, coords.imag), axis=-1)
+        self.coords = np.concatenate((coords.real, coords.imag), axis=-1)
 
     def eval_coords(self, r: jax.Array) -> jax.Array:
-        if self.coords == "harmonic":
+        if isinstance(self.coords, str) and self.coords == "harmonic":
             x, y, z = r[..., 0], r[..., 1], r[..., 2]
-            o = np.zeros_like(z)
-            return np.stack([x, x, z, y, -y, o], axis=-1)
+            o = jnp.zeros_like(z)
+            return jnp.stack([x, x, z, y, -y, o], axis=-1)
         return r if r is None else r @ self.coords
 
     @jax.profiler.annotate_function
@@ -437,18 +441,18 @@ class MonomialC(Monomial):
         """
         a, b = x[:, :3], x[:, 3:]
         # complex module
-        r = np.sqrt(a * a + b * b)
+        r = jnp.sqrt(a * a + b * b)
         # r ** m : (..., monomials)
-        r = np.expand_dims(r, -2)
-        rm = np.prod(r**self.exp, axis=-1)
+        r = jnp.expand_dims(r, -2)
+        rm = jnp.prod(r**self.exp, axis=-1)
         # complex phase
-        phi = np.arctan2(a, b)
+        phi = jnp.arctan2(a, b)
         # phi : (..., monomials)
-        phi = np.expand_dims(phi, -2)
-        mphi = np.sum(phi * self.exp, axis=-1)
+        phi = jnp.expand_dims(phi, -2)
+        mphi = jnp.sum(phi * self.exp, axis=-1)
         # mx : (..., 2 * monomials)
-        cosm, sinm = np.cos(mphi), np.sin(mphi)
-        return np.concat(
+        cosm, sinm = jnp.cos(mphi), jnp.sin(mphi)
+        return jnp.concatenate(
             (
                 rm * cosm,
                 rm * sinm,
@@ -463,4 +467,4 @@ class PolynomialC(Polynomial):
         n_real = self.coef_t.shape[0]
         real, imag = mx[:, :n_real], mx[:, n_real:]
         return real @ self.coef_t
-        return np.concat((real @ self.coef_t, imag @ self.coef_t), axis=-1)
+        return jnp.concatenate((real @ self.coef_t, imag @ self.coef_t), axis=-1)

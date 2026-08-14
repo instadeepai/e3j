@@ -28,13 +28,13 @@ from numpy import int32
 from e3j.ops.coef import Coef
 from e3j.utils import config, is_pow2
 from e3j.utils.exceptions import ShardingError
-from e3j.utils.options import Layout, TPMode
+from e3j.utils.options import Layout, MixingMode
 
 
 @dataclass
-class TensorProductParams:
+class CUDATensorProductParams:
     num_out: int
-    mode: str | TPMode = TPMode.OUTER
+    mode: str | MixingMode = MixingMode.OUTER
     layout: str | Layout = Layout.LEADING_CHANNELS
 
 
@@ -46,7 +46,7 @@ def tensor_product(
     coef: Array,
     x: Array,
     y: Array,
-    params: TensorProductParams,
+    params: CUDATensorProductParams,
 ) -> Array:
     """Sparse tensor product kernel using parallel scatter-reduction.
 
@@ -81,21 +81,29 @@ def tensor_product(
                 f"Got ({channels_x, channels_y})."
             )
 
+    # The launcher rejects it too, but only once the kernel runs.
+    if layout is Layout.LEADING_CHANNELS and x.dtype == jnp.float16:
+        raise NotImplementedError(
+            "float16 values are not supported with Layout.LEADING_CHANNELS: the "
+            "kernel reduces with atomicAdd, which has no __half overload. Use "
+            "Layout.TRAILING_CHANNELS for float16, or float32/float64 here."
+        )
+
     num_out = params.num_out
 
     # Infer output channels
-    mode = TPMode.parse(params.mode)
+    mode = MixingMode.parse(params.mode)
 
     # The CUDA kernel doesn't implement Mode::MAP for LEADING_CHANNELS: a
     # leading channel axis is already mapped independently per row, so MAP
     # is equivalent to an OUTER tensor product with channels folded into
     # rows.
-    if mode is TPMode.MAP and layout is Layout.LEADING_CHANNELS:
+    if mode is MixingMode.MAP and layout is Layout.LEADING_CHANNELS:
         assert channels_x == channels_y
         num_rows = x.shape[0]
         x_flat = x.reshape((num_rows * channels_x, x.shape[-1]))
         y_flat = y.reshape((num_rows * channels_y, y.shape[-1]))
-        params_outer = replace(params, mode=TPMode.OUTER)
+        params_outer = replace(params, mode=MixingMode.OUTER)
         z_flat = tensor_product(coef, x_flat, y_flat, params_outer)
         return z_flat.reshape((num_rows, channels_x, num_out))
 
@@ -204,11 +212,12 @@ def tensor_product(
 
 
 def _zero_gap_rows(grad: Array, written: np.ndarray, layout: Layout) -> Array:
-    """Zero ``grad`` rows skipped by the fused backward kernel.
+    """Zero `grad` coordinates skipped by the fused backward kernel.
 
-    Only coordinates present in ``written`` are written by the backward pass;
-    the rest retain uninitialized memory. Their gradient is exactly zero, so we
-    zero them explicitly to match SPARSE/DENSE autodiff.
+    Only coordinates present in `written` are written to by the backward pass,
+    and stay uninitialized (UB) if the coefficients do not cover I/O coordinates.
+    Although the situation should normally not happen, skipped coordinates can be
+    collected at compilation time, and zeroed out explicitly for safety.
     """
     channels_trail = layout == Layout.TRAILING_CHANNELS and grad.ndim > 2
     n_coords = grad.shape[-2 if channels_trail else -1]
@@ -225,7 +234,7 @@ def tensor_product_bwd(
     x: Array,
     y: Array,
     ct_z: Array,
-    params: TensorProductParams,
+    params: CUDATensorProductParams,
 ) -> tuple[Array, Array]:
     """Backward tensor product kernel handler.
 
@@ -234,7 +243,7 @@ def tensor_product_bwd(
     """
 
     # Parse forward mode and layout: backward modes parsed on C++ side
-    mode = TPMode.parse(params.mode)
+    mode = MixingMode.parse(params.mode)
     layout = Layout.parse(params.layout)
 
     # Check current support
@@ -248,7 +257,7 @@ def tensor_product_bwd(
     channels_x = x.shape[-1] if has_cx else 1
     channels_y = y.shape[-1] if has_cy else 1
 
-    if mode != TPMode.OUTER and channels_x != channels_y:
+    if mode != MixingMode.OUTER and channels_x != channels_y:
         raise ValueError(
             "MAP and INNER modes require same number of LHS and RHS channels. "
             f"Got ({channels_x, channels_y})."
@@ -260,7 +269,7 @@ def tensor_product_bwd(
             f"channels, got ({channels_x, channels_y})."
         )
 
-    if mode == TPMode.OUTER and not (channels_x == 1 or channels_y == 1):
+    if mode == MixingMode.OUTER and not (channels_x == 1 or channels_y == 1):
         raise NotImplementedError(
             "The `tensor_product_bwd` handler requires either LHS or RHS to "
             f"have one channel for now, got ({channels_x, channels_y})."
@@ -270,7 +279,7 @@ def tensor_product_bwd(
     # coef_xzy / coef_yzx are the dx / dy passes; their column 0 (the output
     # index) is the set of coordinates each pass writes -- used to zero gaps.
     with jax.ensure_compile_time_eval():
-        c = Coef.unpack(coef, val_dtype="float32")
+        c = Coef.unpack(coef, val_dtype=x.dtype)
         coef_xzy = c.transpose((1, 0, 2))
         coef_yzx = c.transpose((2, 0, 1))
         coef_bwd = jnp.stack([coef_xzy.pack_jax(), coef_yzx.pack_jax()])
@@ -399,7 +408,7 @@ def _tensor_product_bwd_fallback(coef, params, res, ct_z):
     x, y = res
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
-    mode = TPMode.parse(params.mode)
+    mode = MixingMode.parse(params.mode)
     # with jax.ensure_compile_time_eval():
     if mode.name == "OUTER" and has_cx and has_cy:
         raise NotImplementedError(
@@ -436,7 +445,7 @@ def _tensor_product_bwd_fallback(coef, params, res, ct_z):
     #       yield less supported mode "(1, u) -> 1".
     with jax.ensure_compile_time_eval():
         # Unpack to permute indices for transposed tensor products
-        c = Coef.unpack(coef, val_dtype="float32")
+        c = Coef.unpack(coef, val_dtype=x.dtype)
         coef_x = c.transpose((1, 0, 2)).pack_jax()
         coef_y = c.transpose((2, 0, 1)).pack_jax()
 
@@ -483,6 +492,3 @@ def _tensor_product_bwd_bwd(coef, params, res, ct_xy):
 # Assign VJP rules
 tensor_product.defvjp(_tensor_product_fwd, _tensor_product_bwd)
 tensor_product_bwd.defvjp(_tensor_product_bwd_fwd, _tensor_product_bwd_bwd)
-
-
-tensor_product.Params = TensorProductParams
