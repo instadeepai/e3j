@@ -39,8 +39,8 @@ DTYPES = ["float16", "float32", "float64"]
 # `narrow_index_dtype` picks. int32 indices are covered separately.
 NUM_OUT, NUM_X, NUM_Y, NNZ, NUM_ROWS = 40, 16, 25, 120, 32
 
-# The backward pass reduces channels over a full warp, so the channel count
-# must be a multiple of 32.
+# Default channel count for the dtype grid. Channel-count coverage lives in
+# test_tensor_product_op.py.
 CHANNELS = 32
 
 

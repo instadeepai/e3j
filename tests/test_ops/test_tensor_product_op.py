@@ -30,13 +30,27 @@ e3j.config(
 )
 
 
-@pytest.fixture(scope="class", params=[32, 64, 128, 512])
-def channels(request):
-    request.cls.channels_x = request.param
+def _set_channels(request, value):
+    request.cls.channels_x = value
     if getattr(request.cls, "mode", None) in ("INNER", "MAP"):
-        request.cls.channels_y = request.param
+        request.cls.channels_y = value
     elif getattr(request.cls, "mode", None) == "OUTER":
         request.cls.channels_y = None
+
+
+@pytest.fixture(scope="class", params=[32, 64, 128, 512])
+def channels(request):
+    _set_channels(request, request.param)
+
+
+@pytest.fixture(scope="class", params=[1, 2, 16, 32])
+def narrow_channels(request):
+    """Channel counts at or below a warp's width.
+
+    `Mode::INNER` contracts the channel axis with a full-warp shuffle, so below
+    32 channels some lanes own none. 32 is kept as the boundary case.
+    """
+    _set_channels(request, request.param)
 
 
 @pytest.fixture(scope="class", params=["OUTER", "INNER", "MAP"])
@@ -316,6 +330,38 @@ class TestTensorProductOuterOneIn(_TestTensorProductOp):
     num_out = 16
     num_idx = 30
     num_rows = 64
+
+
+@pytest.mark.usefixtures("narrow_channels")
+class TestTensorProductInnerNarrow(_TestTensorProductOp):
+    """INNER with a channel axis no wider than a warp.
+
+    Regression: lanes owning no channel read past their operand row in shared
+    memory and summed the result into the warp reduction.
+    """
+
+    layout = "TRAILING_CHANNELS"
+    mode = "INNER"
+    num_x = 16
+    num_y = 25
+    num_out = 93
+    num_rows = 100
+
+
+@pytest.mark.usefixtures("narrow_channels")
+class TestTensorProductOuterNarrow(_TestTensorProductOp):
+    """Scalar-y OUTER with a narrow channel axis; its backward runs one INNER pass.
+
+    Which cotangent that pass computes depends on the channel count -- `dx` at 1
+    channel, `dy` above -- so `test_backward` checking both is what matters here.
+    """
+
+    layout = "TRAILING_CHANNELS"
+    mode = "OUTER"
+    num_x = 16
+    num_y = 25
+    num_out = 93
+    num_rows = 100
 
 
 class TestTensorProductInnerOneOut(_TestTensorProductOp):

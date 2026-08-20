@@ -21,6 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   on graphs with more than 8192 nodes or wide channels.
 - CUDA tensor product: warps without coefficients skipped a block barrier in
   INNER reductions (undefined behaviour).
+- CUDA tensor product: INNER reductions, also run by the OUTER backward, gave
+  wrong results below 32 channels.
 
 ### Added
 

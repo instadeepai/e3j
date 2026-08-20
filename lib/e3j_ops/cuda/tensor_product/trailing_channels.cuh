@@ -300,15 +300,21 @@ namespace trailing_channels {
         // Number of warps needed to sum all channels in INNER mode.
         int num_warps_x = 1 + (lhs.shape[1] - 1) / (32 * N);
 
-        // Apply threadwise channel offsets
-        lhs.data += k.x;
-        rhs.data += k.y;
+        // Threadwise channel offsets. Every INNER lane dereferences these, so a
+        // spare lane (k.z >= k.total, when the warp is wider than the channel
+        // axis) would read past its SMEM row; the modulo wraps it back onto a
+        // real row. OUTER/MAP deref only inside the k.z < k.total branch below.
+        if constexpr (kMode == Mode::INNER) {
+            lhs.data += k.x % k.total;
+            rhs.data += k.y % k.total;
+        } else {
+            lhs.data += k.x;
+            rhs.data += k.y;
+        }
 
         if constexpr (kMode == Mode::OUTER || kMode == Mode::MAP) {
-                // OOB guard hoisted outside the coefficient loop.
-                // With N chosen so channels_z/N >= 32, all threads are
-                // active (k.z < k.total) and this branch is uniform — no divergence.
-                // The guard is kept as a safety net for edge cases.
+                // Prevent lanes without a channel, or warps without a coefficient, from writing out.
+                // Hoisted out of the coefficient loop, so the branch is uniform.
                 if (k.z < k.total && has_coef) {
                     Vect<N,Val> *out_lane =
                         reinterpret_cast<Vect<N,Val>*>(out.data) + threadIdx.x;
@@ -343,9 +349,11 @@ namespace trailing_channels {
                     zi = accumulate_products<Idx,Val,kMode,N>(
                         acc, coef, col, range.end, lhs.data, rhs.data, lhs.shape[1], rhs.shape[1]
                     );
-                    // Horizontally sum N channels within each lane,
-                    // then reduce the 32-lane scalar across the warp.
-                    Val zi_scalar = sum_warp(hsum<N,Val>(zi.val), 32);
+                    // Horizontally sum N channels per lane, then reduce across
+                    // the warp. A spare lane must contribute zero, not the wrapped
+                    // row it read, since sum_warp shuffles all 32 lanes.
+                    Val zi_scalar =
+                        sum_warp((k.z < k.total) ? hsum<N,Val>(zi.val) : Val(0), 32);
                     // STS for leading threads
                     if (lane == 0) {
                         // column-major to prevent bank conflicts
