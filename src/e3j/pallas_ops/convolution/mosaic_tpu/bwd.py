@@ -642,22 +642,40 @@ class _MessagePassingBwdKernel:
                     dx_acc = {xi: zero for xi in c.xi_used}
                     dy_acc = {yi: zero for yi in c.yi_used}
                     for block, zi_group in c.cg_by_block:
-                        d_edge_scalars_acc = zero
+                        cg_dz = {}
                         for zi, paths in zi_group:
-                            with named_scope("computing es_dz"):
-                                dz_zi = dz_plane[zi, :, :]
-                                es_dz = (
-                                    edge_scalars_vmem[c.irrep_block_of_output[zi], :, :]
-                                    * dz_zi
-                                )
-                                message_zi = zero
+                            dz_zi = dz_plane[zi, :, :]
                             for xi, yi, v in paths:
-                                y_val = y_of(yi)
-                                x_val = x_plane[xi, :, :]
-                                message_zi = message_zi + v * y_val * x_val
-                                dx_acc[xi] = dx_acc[xi] + v * y_val * es_dz
-                                dy_acc[yi] = dy_acc[yi] + v * x_val * es_dz
-                            d_edge_scalars_acc = d_edge_scalars_acc + message_zi * dz_zi
+                                term = v * dz_zi
+                                cg_dz[xi, yi] = (
+                                    term
+                                    if (xi, yi) not in cg_dz
+                                    else cg_dz[xi, yi] + term
+                                )
+                        dx_ungated = {}
+                        dy_ungated = {}
+                        for (xi, yi), cg_dz_term in cg_dz.items():
+                            dx_term = y_of(yi) * cg_dz_term
+                            dx_ungated[xi] = (
+                                dx_term
+                                if xi not in dx_ungated
+                                else dx_ungated[xi] + dx_term
+                            )
+                            dy_term = x_plane[xi, :, :] * cg_dz_term
+                            dy_ungated[yi] = (
+                                dy_term
+                                if yi not in dy_ungated
+                                else dy_ungated[yi] + dy_term
+                            )
+                        edge_scalars_block = edge_scalars_vmem[block, :, :]
+                        d_edge_scalars_acc = zero
+                        for xi, dx_term in dx_ungated.items():
+                            dx_acc[xi] = dx_acc[xi] + edge_scalars_block * dx_term
+                            d_edge_scalars_acc = (
+                                d_edge_scalars_acc + x_plane[xi, :, :] * dx_term
+                            )
+                        for yi, dy_term in dy_ungated.items():
+                            dy_acc[yi] = dy_acc[yi] + edge_scalars_block * dy_term
                         d_edge_scalars_vmem[block, :, :] = d_edge_scalars_acc
                     for xi in c.xi_used:
                         dx_plane[xi, :, :] = dx_acc[xi]
