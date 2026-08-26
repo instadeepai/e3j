@@ -43,7 +43,7 @@ from e3j.pallas_ops.utils.named_scope import named_scope
 class FwdScratch(NamedTuple):
     x_stage_vmem: (
         pl.MemoryRef
-    )  # (batch_block_size, x_dim, channels): gathered x[senders]
+    )  # (x_dim, batch_block_size, channels): gathered x[senders], x_dim-major
     accumulator_vmem: (
         pl.MemoryRef
     )  # (out_dim, chunk, channels): open-group sublane partials
@@ -52,6 +52,7 @@ class FwdScratch(NamedTuple):
     mask_smem: pl.MemoryRef  # (1,) i32: remaining-transitions bitmask
     previous_position_smem: pl.MemoryRef  # (1,) i32: current segment start within chunk
     flush_pending_smem: pl.MemoryRef  # (1,) i32: async flush in flight?
+    flush_count_smem: pl.MemoryRef  # (1,) i32: flushes done (first one is a partial)
     gather_semaphore: pltpu.SemaphoreType  # DMA semaphore for the sender gathers
     flush_semaphore: pltpu.SemaphoreType  # DMA semaphore for the async flush
 
@@ -64,9 +65,10 @@ class _FwdOperands(NamedTuple):
     edge_scalars: jax.Array  # (num_blocks, n_edges, channels)
     senders: jax.Array  # (n_edges,)
     receivers: jax.Array  # (n_edges,)
-    zeros_out: (
+    zeros_out: jax.Array  # (n_nodes, out_dim, channels): zero-init, shared by cores
+    zeros_boundary: (
         jax.Array
-    )  # (num_cores, n_nodes, out_dim, channels): zero-init for the output
+    )  # (num_cores, 2, out_dim, channels): zero-init for the straddling groups
     block_order: jax.Array  # (n_blocks,) i32: walked blocks first
     n_walked_blocks: jax.Array  # (1,) i32: how many of them hold a real edge
 
@@ -95,7 +97,7 @@ class _FwdConstants(NamedTuple):
 def _scratch_shapes(c: _FwdConstants) -> FwdScratch:
     return FwdScratch(
         x_stage_vmem=pltpu.VMEM(
-            (c.batch_block_size, c.x_dim, c.channels_padded), c.dtype
+            (c.x_dim, c.batch_block_size, c.channels_padded), c.dtype
         ),
         accumulator_vmem=pltpu.VMEM(
             (c.out_dim_padded, c.chunk, c.channels_padded), c.dtype
@@ -105,6 +107,7 @@ def _scratch_shapes(c: _FwdConstants) -> FwdScratch:
         mask_smem=pltpu.SMEM((1,), jnp.int32),
         previous_position_smem=pltpu.SMEM((1,), jnp.int32),
         flush_pending_smem=pltpu.SMEM((1,), jnp.int32),
+        flush_count_smem=pltpu.SMEM((1,), jnp.int32),
         gather_semaphore=pltpu.SemaphoreType.DMA,
         flush_semaphore=pltpu.SemaphoreType.DMA,
     )
@@ -261,8 +264,9 @@ class _MessagePassingFwdKernel:
         n_blocks = n_edges_padded // batch_block_size
         dtype = x.dtype
 
-        zeros_out = jnp.zeros(
-            (num_cores, n_nodes, out_dim_padded, channels_padded), dtype=dtype
+        zeros_out = jnp.zeros((n_nodes, out_dim_padded, channels_padded), dtype=dtype)
+        zeros_boundary = jnp.zeros(
+            (num_cores, 2, out_dim_padded, channels_padded), dtype=dtype
         )
 
         dynamic_edges = edge_is_real is not None
@@ -282,6 +286,7 @@ class _MessagePassingFwdKernel:
             senders,
             receivers,
             zeros_out,
+            zeros_boundary,
             block_order,
             n_walked_blocks,
         )
@@ -342,11 +347,13 @@ class _MessagePassingFwdKernel:
             edge_scalars_hbm,  # (num_blocks, n_edges, channels)
             senders_hbm,  # (n_edges,)
             receivers_hbm,  # (n_edges,)
-            _zeros_hbm,  # (num_cores, n_nodes, out_dim, channels)
+            _zeros_hbm,  # (n_nodes, out_dim, channels)
+            _zeros_boundary_hbm,  # (num_cores, 2, out_dim, channels)
             block_order_smem,  # (n_blocks,) i32
             n_walked_blocks_smem,  # (1,) i32
-            # output:
-            out_hbm,  # (num_cores, n_nodes, out_dim, channels)
+            # outputs:
+            out_hbm,  # (n_nodes, out_dim, channels)
+            boundary_hbm,  # (num_cores, 2, out_dim, channels)
             # scratch, see FwdScratch for shapes:
             x_stage_vmem,
             accumulator_vmem,
@@ -355,6 +362,7 @@ class _MessagePassingFwdKernel:
             mask_smem,
             previous_position_smem,
             flush_pending_smem,
+            flush_count_smem,
             gather_semaphore,
             flush_semaphore,
         ):
@@ -365,6 +373,7 @@ class _MessagePassingFwdKernel:
 
             current_receiver_smem[0] = jnp.int32(-1)
             flush_pending_smem[0] = jnp.int32(0)
+            flush_count_smem[0] = jnp.int32(0)
 
             # per-receiver-group reduce + async DMA out (double-buffered).
             flush_one, drain_flush = make_group_flush(
@@ -374,6 +383,8 @@ class _MessagePassingFwdKernel:
                     accumulator_vmem=accumulator_vmem,
                     flush_pending=flush_pending_smem,
                     semaphore=flush_semaphore,
+                    boundary_hbm=boundary_hbm,
+                    flush_count=flush_count_smem,
                 ),
                 core_id,
             )
@@ -384,8 +395,8 @@ class _MessagePassingFwdKernel:
                 with named_scope("fwd_copying_senders"):
                     copies = [
                         pltpu.make_async_copy(
-                            x_hbm.at[pl.ds(senders_smem[k], 1), :, :],
-                            x_stage_vmem.at[pl.ds(k, 1), :, :],
+                            x_hbm.at[senders_smem[k]],
+                            x_stage_vmem.at[:, k, :],
                             gather_semaphore,
                         )
                         for k in range(c.batch_block_size)
@@ -396,8 +407,7 @@ class _MessagePassingFwdKernel:
                         copy.wait()
 
                 # ---- 1. Tensor product + scalar mixing ----
-                with named_scope("fwd_x_transpose"):
-                    x_plane = jnp.transpose(x_stage_vmem[:, :, :], (1, 0, 2))
+                x_plane = x_stage_vmem[:, :, :]
                 message_by_zi = {}
                 with named_scope("fwd_tp_compute"):
                     for zi, by_xi in c.cg_groups:
@@ -451,7 +461,7 @@ class _MessagePassingFwdKernel:
 
             @pl.when(final_receiver >= jnp.int32(0))
             def _final_flush():
-                flush_one(final_receiver)
+                flush_one(final_receiver, final=True)
 
             drain_flush()
 
@@ -473,26 +483,60 @@ class _MessagePassingFwdKernel:
 
         out_packed = pl.pallas_call(
             self._make_kernel(c),
-            out_shape=jax.ShapeDtypeStruct(
-                (c.num_cores, c.n_nodes, c.out_dim_padded, c.channels_padded), c.dtype
-            ),
+            out_shape=[
+                jax.ShapeDtypeStruct(
+                    (c.n_nodes, c.out_dim_padded, c.channels_padded), c.dtype
+                ),
+                jax.ShapeDtypeStruct(
+                    (c.num_cores, 2, c.out_dim_padded, c.channels_padded), c.dtype
+                ),
+            ],
             scratch_shapes=_scratch_shapes(c),
             in_specs=_call_in_specs(ops),
-            out_specs=pl.BlockSpec(
-                (c.num_cores, c.n_nodes, c.out_dim_padded, c.channels_padded),
-                memory_space=pltpu.HBM,
-            ),
+            out_specs=[
+                pl.BlockSpec(
+                    (c.n_nodes, c.out_dim_padded, c.channels_padded),
+                    memory_space=pltpu.HBM,
+                ),
+                pl.BlockSpec(
+                    (c.num_cores, 2, c.out_dim_padded, c.channels_padded),
+                    memory_space=pltpu.HBM,
+                ),
+            ],
             grid=(c.num_cores,),
-            input_output_aliases={5: 0},  # use the zero-init for the output
+            input_output_aliases={5: 0, 6: 1},  # use the zero-inits for the outputs
             name="fwd_convolution",
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
                 disable_bounds_checks=True,
             ),
         )(*ops)
+        out, boundary = out_packed
 
-        out_summed = out_packed.sum(0)
-        return out_summed[: c.n_nodes, : c.out_dim, : c.channels]
+        # Each core's first-closed and final groups may be shared with a
+        # neighbouring core, so they were parked in `boundary` instead of being
+        # written in place. Their node ids are the keys at the core's first and
+        # last edge -- known here, no need to report them from the kernel.
+        block_order = (
+            ops.block_order
+            if c.dynamic_edges
+            else jnp.arange(c.n_blocks, dtype=jnp.int32)
+        )
+        first_edge, last_edge = padding.core_edge_bounds(
+            block_order, ops.n_walked_blocks, c.num_cores, c.batch_block_size
+        )
+        for core in range(c.num_cores):
+            for slot, edge in enumerate((first_edge[core], last_edge[core])):
+                row = ops.receivers[edge].astype(jnp.int32)
+                start = (row, jnp.int32(0), jnp.int32(0))
+                current = jax.lax.dynamic_slice(
+                    out, start, (1, c.out_dim_padded, c.channels_padded)
+                )
+                out = jax.lax.dynamic_update_slice(
+                    out, current + boundary[core, slot][None], start
+                )
+
+        return out[: c.n_nodes, : c.out_dim, : c.channels]
 
 
 def _message_passing_kernel_mosaic_tpu_fwd(

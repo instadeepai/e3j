@@ -40,6 +40,27 @@ def block_order(edge_is_real: Array, n_blocks: int, batch_block_size: int) -> tu
     )
 
 
+def core_edge_bounds(
+    block_order: Array, n_walked_blocks: Array, num_cores: int, batch_block_size: int
+) -> tuple[Array, Array]:
+    """Return the first and last edge slot each core walks, as `(num_cores,)` pairs.
+
+    `emit_pipeline(core_axis=0)` hands core `i` a contiguous range of the walked grid
+    and splits any remainder one block at a time over the leading cores. The bounds
+    follow `block_order`.
+    """
+    base, remainder = jnp.divmod(jnp.reshape(n_walked_blocks, ()), num_cores)
+    core = jnp.arange(num_cores, dtype=jnp.int32)
+    walked = jnp.where(core < remainder, base + 1, base)
+    offset = jnp.where(core < remainder, core * (base + 1), core * base + remainder)
+    first_block = block_order[offset]
+    last_block = block_order[jnp.maximum(offset + walked - 1, 0)]
+    return (
+        first_block * batch_block_size,
+        last_block * batch_block_size + (batch_block_size - 1),
+    )
+
+
 def route_dummy_edges(
     node_features: Array, group_key: Array, gather_index: Array
 ) -> tuple[Array, Array, Array, Array]:

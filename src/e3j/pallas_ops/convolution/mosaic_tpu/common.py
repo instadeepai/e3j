@@ -36,43 +36,68 @@ class WalkScratch(NamedTuple):
 
 
 class FlushBuffers(NamedTuple):
-    dst_hbm: pl.MemoryRef  # (num_cores, n_rows, planes, width): per-core output
+    dst_hbm: pl.MemoryRef  # (n_rows, planes, width): shared across cores
     stage_vmem: pl.MemoryRef  # (1, planes, width): flush staging row
     accumulator_vmem: (
         pl.MemoryRef
     )  # (planes, rows_per_chunk, width): open-group partials
     flush_pending: pl.MemoryRef  # (1,) i32: async flush in flight?
     semaphore: pltpu.SemaphoreType  # DMA semaphore for the async flush
+    boundary_hbm: pl.MemoryRef  # (num_cores, 2, planes, width): straddling groups
+    flush_count: pl.MemoryRef  # (1,) i32: flushes done by this core
 
 
 def make_group_flush(bufs: FlushBuffers, core_id):
     """Double-buffered per-group reduce + async DMA out, shared by fwd/bwd.
 
     Returns `(flush_one, drain)`. `flush_one(row)` waits any in-flight copy,
-    reduces the accumulator's chunk sublanes to one row, async-DMAs it to
-    `dst_hbm[core_id, row]`, and re-zeros the accumulator. `drain()` waits the
-    last copy (call once after the pipeline).
+    reduces the accumulator's chunk sublanes to one row, async-DMAs it out, and
+    re-zeros the accumulator. `drain()` waits the last copy (call once after the
+    pipeline).
+
+    Rows go straight to the shared `dst_hbm[row]`: `emit_pipeline(core_axis=...)`
+    hands each core a *contiguous* block range, so at most one group straddles a
+    core boundary. A core's first-closed and final groups are the only ones that
+    can be shared with a neighbour, and those two go to `boundary_hbm[core_id,
+    {0,1}]` for the caller to add back.
     """
 
-    def _wait_inflight():
-        pltpu.make_async_copy(
-            bufs.stage_vmem,
-            bufs.dst_hbm.at[core_id].at[pl.ds(0, 1), :, :],
-            bufs.semaphore,
-        ).wait()
+    def _dst(row):
+        return bufs.dst_hbm.at[pl.ds(row, 1), :, :]
 
-    def flush_one(row):
+    def _wait_inflight():
+        # any destination of the same shape settles the same byte count
+        pltpu.make_async_copy(bufs.stage_vmem, _dst(0), bufs.semaphore).wait()
+
+    def _start(dst):
+        pltpu.make_async_copy(bufs.stage_vmem, dst, bufs.semaphore).start()
+
+    def flush_one(row, final: bool = False):
         @pl.when(bufs.flush_pending[0] == jnp.int32(1))
         def _wait_previous_flush():
             _wait_inflight()
 
         bufs.stage_vmem[0, :, :] = jnp.sum(bufs.accumulator_vmem[:, :, :], axis=1)
         bufs.accumulator_vmem[:, :, :] = jnp.zeros_like(bufs.accumulator_vmem[:, :, :])
-        pltpu.make_async_copy(
-            bufs.stage_vmem,
-            bufs.dst_hbm.at[core_id].at[pl.ds(row, 1), :, :],
-            bufs.semaphore,
-        ).start()
+
+        if final:
+            # the still-open group at the core's last edge: may continue into the
+            # next core, so it is a partial and never written in place.
+            _start(bufs.boundary_hbm.at[core_id].at[pl.ds(1, 1), :, :])
+        else:
+            is_first = bufs.flush_count[0] == jnp.int32(0)
+            bufs.flush_count[0] = bufs.flush_count[0] + jnp.int32(1)
+
+            @pl.when(is_first)
+            def _first_group_is_partial():
+                # opened before this core's first edge: may continue the previous
+                # core's final group.
+                _start(bufs.boundary_hbm.at[core_id].at[pl.ds(0, 1), :, :])
+
+            @pl.when(jnp.logical_not(is_first))
+            def _interior_group_owns_its_row():
+                _start(_dst(row))
+
         bufs.flush_pending[0] = jnp.int32(1)
 
     def drain():

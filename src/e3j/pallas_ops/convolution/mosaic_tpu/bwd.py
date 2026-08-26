@@ -66,6 +66,7 @@ class BwdScratch(NamedTuple):
     previous_position_smem: pl.MemoryRef  # (1,) i32: current segment start within chunk
     count_smem: pl.MemoryRef  # (1,) i32: per-core block counter
     flush_pending_smem: pl.MemoryRef  # (1,) i32: async dx flush in flight?
+    flush_count_smem: pl.MemoryRef  # (1,) i32: flushes done (first one is a partial)
     gather_semaphore: pltpu.SemaphoreType  # DMA semaphore: x/dz gathers
     stage_semaphore: pltpu.SemaphoreType  # DMA semaphore: senders/receivers row stages
     flush_semaphore: pltpu.SemaphoreType  # DMA semaphore: async dx flush
@@ -101,7 +102,12 @@ class _BwdOperands(NamedTuple):
     edge_scalars: jax.Array  # (num_blocks, n_edges, channels)
     senders: jax.Array  # (n_blocks, batch_block_size)
     receivers: jax.Array  # (n_blocks, batch_block_size)
-    zeros_dx: jax.Array  # (num_cores, n_nodes, x_dim_padded, num_lanes): dx zero-init
+    zeros_dx: (
+        jax.Array
+    )  # (n_nodes, x_dim_padded, num_lanes): dx zero-init, shared by cores
+    zeros_boundary: (
+        jax.Array
+    )  # (num_cores, 2, x_dim_padded, num_lanes): zero-init for the straddling groups
     block_order: jax.Array  # (n_blocks,) i32: walked blocks first
     n_walked_blocks: jax.Array  # (1,) i32: how many of them hold a real edge
 
@@ -147,6 +153,7 @@ def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
         previous_position_smem=pltpu.SMEM((1,), jnp.int32),
         count_smem=pltpu.SMEM((1,), jnp.int32),
         flush_pending_smem=pltpu.SMEM((1,), jnp.int32),
+        flush_count_smem=pltpu.SMEM((1,), jnp.int32),
         gather_semaphore=pltpu.SemaphoreType.DMA,
         stage_semaphore=pltpu.SemaphoreType.DMA,
         flush_semaphore=pltpu.SemaphoreType.DMA,
@@ -265,10 +272,11 @@ class _MessagePassingBwdKernel:
     PARALLEL semantics, operands and outputs in HBM. `emit_pipeline` walks `n_blocks`
     edge tiles of `batch_block_size` edges each (`core_axis=0` distributes tiles across
     cores; `batch_block_size` fits the double-buffered VMEM working set, see
-    `_bwd_planes`). `dx` is accumulated into a per-core
-    `(num_cores, n_nodes, x_dim, num_lanes)` HBM buffer (zero-initialised via
-    `input_output_aliases`) summed over cores at the end, so cores never race on a
-    shared sender; `dy` and `d_edge_scalars` are written per edge.
+    `_bwd_planes`). `core_axis=0` gives each core a contiguous block range, so at most
+    one sender group straddles a core boundary: `dx` groups are written in place to a
+    shared `(n_nodes, x_dim, num_lanes)` buffer and only each core's first-closed and
+    final groups go to a `(num_cores, 2, ...)` side buffer, added back in the epilogue.
+    `dy` and `d_edge_scalars` are written per edge.
 
     Per pipeline step (body), working in VMEM:
       1. Gather per edge: async DMA `x[senders[k]]` and `dz[receivers[k]]` into
@@ -392,7 +400,8 @@ class _MessagePassingBwdKernel:
         blocks_per_core = n_blocks // num_cores
         senders = senders.reshape(n_blocks, batch_block_size)
         receivers = receivers.reshape(n_blocks, batch_block_size)
-        zeros_dx = jnp.zeros((num_cores, n_nodes, x_dim_padded, num_lanes), dtype)
+        zeros_dx = jnp.zeros((n_nodes, x_dim_padded, num_lanes), dtype)
+        zeros_boundary = jnp.zeros((num_cores, 2, x_dim_padded, num_lanes), dtype)
 
         dynamic_edges = edge_is_real is not None
         if dynamic_edges:
@@ -412,6 +421,7 @@ class _MessagePassingBwdKernel:
             senders,
             receivers,
             zeros_dx,
+            zeros_boundary,
             block_order,
             n_walked_blocks,
         )
@@ -497,12 +507,14 @@ class _MessagePassingBwdKernel:
             senders_hbm,
             receivers_hbm,
             _z,
+            _z_boundary,
             block_order_smem,
             n_walked_blocks_smem,
             # outputs:
             d_edge_scalars_hbm,
             dy_hbm,
             dx_hbm,
+            boundary_hbm,
             # scratch, see BwdScratch for shapes:
             x_stage,
             dz_stage,
@@ -516,6 +528,7 @@ class _MessagePassingBwdKernel:
             previous_position_smem,
             count_smem,
             flush_pending_smem,
+            flush_count_smem,
             gather_semaphore,
             stage_semaphore,
             flush_semaphore,
@@ -538,6 +551,7 @@ class _MessagePassingBwdKernel:
             current_sender_smem[0] = jnp.int32(-1)
             count_smem[0] = jnp.int32(0)
             flush_pending_smem[0] = jnp.int32(0)
+            flush_count_smem[0] = jnp.int32(0)
 
             # per-sender-group dx reduce + async DMA out (double-buffered).
             flush_one, drain_flush = make_group_flush(
@@ -547,6 +561,8 @@ class _MessagePassingBwdKernel:
                     accumulator_vmem=accumulator,
                     flush_pending=flush_pending_smem,
                     semaphore=flush_semaphore,
+                    boundary_hbm=boundary_hbm,
+                    flush_count=flush_count_smem,
                 ),
                 core_id,
             )
@@ -708,7 +724,7 @@ class _MessagePassingBwdKernel:
 
             @pl.when(final_sender >= jnp.int32(0))
             def _flush_final_group():
-                flush_one(final_sender)
+                flush_one(final_sender, final=True)
 
             drain_flush()
 
@@ -729,15 +745,16 @@ class _MessagePassingBwdKernel:
             x, y, edge_scalars, senders, receivers, dz, params, edge_is_real
         )
 
-        d_edge_scalars_packed, dy_packed, dx_cores = pl.pallas_call(
+        d_edge_scalars_packed, dy_packed, dx_packed, dx_boundary = pl.pallas_call(
             self._make_kernel(c),
             out_shape=[
                 jax.ShapeDtypeStruct(
                     (c.num_blocks, c.n_edges_padded, c.num_lanes), c.dtype
                 ),
                 jax.ShapeDtypeStruct((c.n_edges_padded, c.num_lanes), c.dtype),
+                jax.ShapeDtypeStruct((c.n_nodes, c.x_dim_padded, c.num_lanes), c.dtype),
                 jax.ShapeDtypeStruct(
-                    (c.num_cores, c.n_nodes, c.x_dim_padded, c.num_lanes), c.dtype
+                    (c.num_cores, 2, c.x_dim_padded, c.num_lanes), c.dtype
                 ),
             ],
             scratch_shapes=_scratch_shapes(c),
@@ -749,12 +766,16 @@ class _MessagePassingBwdKernel:
                 ),
                 pl.BlockSpec((c.n_edges_padded, c.num_lanes), memory_space=pltpu.HBM),
                 pl.BlockSpec(
-                    (c.num_cores, c.n_nodes, c.x_dim_padded, c.num_lanes),
+                    (c.n_nodes, c.x_dim_padded, c.num_lanes),
+                    memory_space=pltpu.HBM,
+                ),
+                pl.BlockSpec(
+                    (c.num_cores, 2, c.x_dim_padded, c.num_lanes),
                     memory_space=pltpu.HBM,
                 ),
             ],
             grid=(c.num_cores,),
-            input_output_aliases={6: 2},  # use the zero-init for dx
+            input_output_aliases={6: 2, 7: 3},  # use the zero-inits for the outputs
             name="bwd_convolution",
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
@@ -771,8 +792,31 @@ class _MessagePassingBwdKernel:
                 c,
             )
 
-        dx_sum = dx_cores.sum(0)
-        dx = dx_sum[:, : c.x_dim, : c.channels]  # (n_nodes, x_dim, channels)
+        # Each core's first-closed and final groups may be shared with a
+        # neighbouring core, so they were parked in `dx_boundary` instead of being
+        # written in place. Their node ids are the senders at the core's first and
+        # last edge -- known here, no need to report them from the kernel.
+        flat_senders = ops.senders.reshape(-1)
+        block_order = (
+            ops.block_order
+            if c.dynamic_edges
+            else jnp.arange(c.n_blocks, dtype=jnp.int32)
+        )
+        first_edge, last_edge = padding.core_edge_bounds(
+            block_order, ops.n_walked_blocks, c.num_cores, c.batch_block_size
+        )
+        for core in range(c.num_cores):
+            for slot, edge in enumerate((first_edge[core], last_edge[core])):
+                row = flat_senders[edge].astype(jnp.int32)
+                start = (row, jnp.int32(0), jnp.int32(0))
+                current = jax.lax.dynamic_slice(
+                    dx_packed, start, (1, c.x_dim_padded, c.num_lanes)
+                )
+                dx_packed = jax.lax.dynamic_update_slice(
+                    dx_packed, current + dx_boundary[core, slot][None], start
+                )
+
+        dx = dx_packed[:, : c.x_dim, : c.channels]  # (n_nodes, x_dim, channels)
 
         dy = dy_packed.reshape(c.n_edges_padded, c.channels_padded)[
             : c.n_edges, : c.y_dim
