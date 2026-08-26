@@ -23,7 +23,7 @@ from jax import Array, custom_vjp
 from jax.ffi import ffi_call
 from numpy import int32
 
-from e3j.data.graph import DUMMY_INDEX, INDEX_DTYPE, GraphCSR
+from e3j.data.graph import INDEX_DTYPE, GraphCSR, is_dummy_edge, is_dummy_index
 from e3j.ops.coef import Coef4D
 from e3j.utils import config, is_pow2
 from e3j.utils.options import GraphOrdering
@@ -40,7 +40,7 @@ def _wrap_global_index(index: Array, num_nodes: int) -> Array:
     int32 while `jax_enable_x64` defaults integers to int64. `DUMMY_INDEX` is
     `INT32_MAX`, so the sentinel survives the cast.
     """
-    local = jnp.where(index == DUMMY_INDEX, index, index % num_nodes)
+    local = jnp.where(is_dummy_index(index), index, index % num_nodes)
     return local.astype(INDEX_DTYPE)
 
 
@@ -66,8 +66,8 @@ def _fold_endpoints(
     """
     node_offsets = jnp.arange(axis_size, dtype=receiver.dtype)[:, None] * num_nodes
     last_node = node_offsets + (num_nodes - 1)
-    receiver = jnp.where(receiver == DUMMY_INDEX, last_node, receiver + node_offsets)
-    sender = jnp.where(sender == DUMMY_INDEX, sender, sender + node_offsets)
+    receiver = jnp.where(is_dummy_index(receiver), last_node, receiver + node_offsets)
+    sender = jnp.where(is_dummy_index(sender), sender, sender + node_offsets)
     return receiver.reshape(-1), sender.reshape(-1)
 
 
@@ -379,7 +379,7 @@ def convolution_bwd(
         # Dummy edges are skipped by the kernel guard, so their per-edge
         # cotangents are never written; zero them explicitly. Edges keep their
         # original order (no regroup), so the mask applies directly.
-        dummy = (sender == DUMMY_INDEX) | (receiver == DUMMY_INDEX)
+        dummy = is_dummy_edge(sender, receiver)
         dy = jnp.where(dummy[:, None], 0, dy)
         ds = jnp.where(dummy[:, None, None], 0, ds)
         return dx, dy, ds

@@ -28,6 +28,7 @@ import pytest
 from jax.sharding import Mesh
 
 from e3j.core.convolution import Convolution
+from e3j.data.graph import GraphCSR
 from e3j.spaces import O3Space
 from e3j.utils import config, options
 from e3j.utils.options import Layout
@@ -249,6 +250,275 @@ def test_force_training_double_backward(x_ir, y_ir, o_ir, channels):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
 
 
+N_REAL = 8
+N_PAD = 3
+
+
+def _padded_inputs(conv, channels, seed: int = 0):
+    """Contract-valid graph plus padding nodes and tail dummy edges of junk data."""
+    node, sph, es, senders, receivers = _contract_valid_inputs(
+        conv, N_REAL, channels, seed
+    )
+    rng = np.random.default_rng(seed + 1)
+
+    def junk(shape):
+        return jnp.asarray(rng.standard_normal(shape), jnp.float32)
+
+    pad_nodes = range(N_REAL, N_REAL + N_PAD)
+    dummy = sorted((i, j) for i in pad_nodes for j in pad_nodes)
+    padded = (
+        jnp.concatenate([node, junk((N_PAD, *node.shape[1:]))]),
+        jnp.concatenate([sph, junk((len(dummy), *sph.shape[1:]))]),
+        jnp.concatenate([es, junk((len(dummy), *es.shape[1:]))]),
+        jnp.concatenate([senders, jnp.asarray([s for s, _ in dummy], jnp.int32)]),
+        jnp.concatenate([receivers, jnp.asarray([r for _, r in dummy], jnp.int32)]),
+    )
+    node_mask = jnp.arange(N_REAL + N_PAD) < N_REAL
+    return (node, sph, es, senders, receivers), padded, node_mask
+
+
+def _marked(padded, node_mask):
+    """Padded operands with dummy endpoints replaced by the `DUMMY_INDEX` sentinel."""
+    node, sph, es, senders, receivers = padded
+    return (node, sph, es, *GraphCSR.mask_edges(senders, receivers, node_mask))
+
+
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
+def test_dummy_edges_forward_leaves_real_nodes_untouched(x_ir, y_ir, o_ir, channels):
+    """`DUMMY_INDEX`-marked edges contribute nothing: the real messages match the
+    unpadded graph and the padding nodes stay at exactly zero."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    real, padded, node_mask = _padded_inputs(conv, channels)
+
+    got = jax.jit(conv._fused_mosaic_tpu_eval)(*_marked(padded, node_mask), node_mask)
+    expected = jax.jit(conv._fused_mosaic_tpu_eval)(*real)
+
+    assert got.shape[0] == N_REAL + N_PAD
+    np.testing.assert_allclose(
+        np.asarray(got[:N_REAL]), np.asarray(expected), rtol=RTOL, atol=ATOL
+    )
+    np.testing.assert_array_equal(np.asarray(got[N_REAL:]), 0.0)
+
+
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
+def test_dummy_edges_cotangents_vanish(x_ir, y_ir, o_ir, channels):
+    """Dummy edges get zero cotangents, and the real ones match the unpadded graph."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    real, padded, node_mask = _padded_inputs(conv, channels)
+    n_real_edges = real[1].shape[0]
+
+    def grads(conv_fn, node, sph, es, senders, receivers):
+        return jax.grad(
+            lambda n, s, e: jnp.sum(conv_fn(n, s, e, senders, receivers) ** 2),
+            (0, 1, 2),
+        )(node, sph, es)
+
+    got = grads(
+        lambda *a: conv._fused_mosaic_tpu_eval(*a, node_mask),
+        *_marked(padded, node_mask),
+    )
+    expected = grads(conv._fused_mosaic_tpu_eval, *real)
+
+    for name, a, b, n_kept in zip(
+        ("d_node_feats", "d_sph", "d_edge_scalars"),
+        got,
+        expected,
+        (N_REAL, n_real_edges, n_real_edges),
+    ):
+        assert _rel(a[:n_kept], b) < RTOL, f"{name} mismatch on real rows"
+        np.testing.assert_array_equal(np.asarray(a[n_kept:]), 0.0, err_msg=name)
+
+
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+def test_dummy_edges_double_backward(x_ir, y_ir, o_ir, channels):
+    """Force training over a padded graph matches the unpadded one; the second-order
+    cotangents of dummy edges vanish too."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    real, padded, node_mask = _padded_inputs(conv, channels)
+    n_real_edges = real[1].shape[0]
+
+    def second_grads(conv_fn, node, sph, es, senders, receivers):
+        def loss(n, s, e):
+            g = jax.grad(
+                lambda nn: jnp.sum(conv_fn(nn, s, e, senders, receivers) ** 2)
+            )(n)
+            return jnp.sum(g**2)
+
+        return jax.grad(loss, (0, 1, 2))(node, sph, es)
+
+    got = second_grads(
+        lambda *a: conv._fused_mosaic_tpu_eval(*a, node_mask),
+        *_marked(padded, node_mask),
+    )
+    expected = second_grads(conv._fused_mosaic_tpu_eval, *real)
+
+    for name, a, b, n_kept in zip(
+        ("dd_node", "dd_sph", "dd_edge_scalars"),
+        got,
+        expected,
+        (N_REAL, n_real_edges, n_real_edges),
+    ):
+        assert _rel(a[:n_kept], b) < RTOL, f"{name} mismatch on real rows"
+        np.testing.assert_array_equal(np.asarray(a[n_kept:]), 0.0, err_msg=name)
+
+
+SPLIT_SENDER = 3
+GROUP_START = SPLIT_SENDER * (N_REAL - 1)
+PLACEMENTS = [GROUP_START + 3, GROUP_START + (N_REAL - 1)]
+PLACEMENT_IDS = ["inside_sender_group", "sender_group_end"]
+
+
+def _graph_with_one_padding_edge(conv, channels, position, seed: int = 0):
+    """Real graph plus one (real sender -> padding node) edge spliced at `position`."""
+    node, sph, es, senders, receivers = _contract_valid_inputs(
+        conv, N_REAL, channels, seed
+    )
+    rng = np.random.default_rng(seed + 1)
+
+    def junk(shape):
+        return jnp.asarray(rng.standard_normal(shape), jnp.float32)
+
+    def splice(array, row):
+        return jnp.concatenate([array[:position], row[None], array[position:]])
+
+    padded = (
+        jnp.concatenate([node, junk((N_PAD, *node.shape[1:]))]),
+        splice(sph, junk(sph.shape[1:])),
+        splice(es, junk(es.shape[1:])),
+        splice(senders, jnp.asarray(SPLIT_SENDER, jnp.int32)),
+        splice(receivers, jnp.asarray(N_REAL, jnp.int32)),
+    )
+    assert bool((jnp.diff(padded[3]) >= 0).all()), "sender ordering broken by splice"
+    node_mask = jnp.arange(N_REAL + N_PAD) < N_REAL
+    return (node, sph, es, senders, receivers), padded, node_mask
+
+
+@pytest.mark.parametrize("position", PLACEMENTS, ids=PLACEMENT_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+def test_dummy_edge_splitting_a_sender_group(x_ir, y_ir, o_ir, channels, position):
+    """A dummy edge anywhere inside a real sender's group must not fragment it: the
+    group flush overwrites its node row, so a reopened group loses its first
+    partial and one node comes out silently wrong."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    real, padded, node_mask = _graph_with_one_padding_edge(conv, channels, position)
+
+    got = jax.jit(conv._fused_mosaic_tpu_eval)(*_marked(padded, node_mask), node_mask)
+    expected = jax.jit(conv._fused_mosaic_tpu_eval)(*real)
+
+    assert _rel(got[:N_REAL], expected) < RTOL
+    np.testing.assert_array_equal(np.asarray(got[N_REAL:]), 0.0)
+
+
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+def test_dummy_edges_under_vmap(x_ir, y_ir, o_ir, channels):
+    """Batching merges each graph's dummy tail into the middle of the edge list, so
+    the runtime edge bound is dropped there; results must still match per graph."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    per_graph = [_padded_inputs(conv, channels, seed=g) for g in range(2)]
+    marked = [_marked(padded, mask) for _, padded, mask in per_graph]
+    batched = tuple(jnp.stack([m[i] for m in marked]) for i in range(5))
+    node_mask = per_graph[0][2]  # same padding layout for every graph
+
+    def fused(node, sph, es, senders, receivers):
+        return conv._fused_mosaic_tpu_eval(node, sph, es, senders, receivers, node_mask)
+
+    got = jax.jit(jax.vmap(fused))(*batched)
+    for g, single in enumerate(marked):
+        expected = jax.jit(fused)(*single)
+        assert _rel(got[g], expected) < RTOL, f"graph {g} mismatch"
+
+
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+def test_node_mask_dispatch_matches_unfused(x_ir, y_ir, o_ir, channels):
+    """`Convolution.__call__(node_mask=...)` marks the dummy edges for the kernel."""
+    kwargs = dict(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    with config.use(convolution=options.Convolution.FUSED_MOSAIC_TPU):
+        fused = Convolution(**kwargs)
+    with config.use(convolution=options.Convolution.UNFUSED):
+        unfused = Convolution(**kwargs)
+
+    _, padded, node_mask = _padded_inputs(fused, channels)
+
+    got = jax.jit(fused.__call__)(*padded, node_mask)
+    expected = unfused(*padded, node_mask)
+    np.testing.assert_allclose(
+        np.asarray(got), np.asarray(expected), rtol=RTOL, atol=ATOL
+    )
+
+
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+def test_all_real_mask_leaves_no_tail(x_ir, y_ir, o_ir, channels):
+    """An all-real mask stops the pipeline at the last block, leaving nothing to zero."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    real = _contract_valid_inputs(conv, N_REAL, channels)
+    node_mask = jnp.ones(N_REAL, bool)
+
+    def grads(mask):
+        senders, receivers = (
+            GraphCSR.mask_edges(*real[3:], mask) if mask is not None else real[3:]
+        )
+        return jax.grad(
+            lambda n, s, e: jnp.sum(
+                conv._fused_mosaic_tpu_eval(n, s, e, senders, receivers, mask) ** 2
+            ),
+            (0, 1, 2),
+        )(*real[:3])
+
+    for name, got, expected in zip(
+        ("d_node_feats", "d_sph", "d_edge_scalars"), grads(node_mask), grads(None)
+    ):
+        assert _rel(got, expected) < RTOL, f"{name} mismatch"
+
+
 def _batch_valid_inputs(conv, n_nodes, channels, n_graphs):
     """Stack `n_graphs` independent contract-valid graphs along a leading axis."""
     per = [
@@ -368,6 +638,33 @@ def test_vmap_multidevice_backward_matches_per_graph(x_ir, y_ir, o_ir, channels)
         got = jax.jit(jax.vmap(grads))(*batched)
     for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), got, expected):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
+
+
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+def test_vmap_multidevice_masked_matches_per_graph(x_ir, y_ir, o_ir, channels):
+    """A padded batch under a device mesh: every shard builds its own block order,
+    so the walked blocks must still cover exactly its graphs' real edges."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    mesh = _device_mesh()
+    per_graph = [_padded_inputs(conv, channels, seed=g)[1:] for g in range(mesh.size)]
+    marked = [_marked(padded, node_mask) for padded, node_mask in per_graph]
+    batched = tuple(jnp.stack([m[i] for m in marked]) for i in range(5))
+    node_mask = per_graph[0][1]  # same padding layout for every graph
+
+    def fused(node, sph, es, senders, receivers):
+        return conv._fused_mosaic_tpu_eval(node, sph, es, senders, receivers, node_mask)
+
+    expected = jnp.stack([jax.jit(fused)(*single) for single in marked])
+    with jax.sharding.set_mesh(mesh):
+        got = jax.jit(jax.vmap(fused))(*batched)
+    assert _rel(got, expected) < RTOL
 
 
 def _assertion_conv() -> Convolution:

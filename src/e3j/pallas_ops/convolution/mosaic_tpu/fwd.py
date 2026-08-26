@@ -25,6 +25,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from e3j.pallas_ops.convolution.mosaic_tpu import padding
 from e3j.pallas_ops.convolution.mosaic_tpu.common import (
     FlushBuffers,
     WalkScratch,
@@ -66,6 +67,8 @@ class _FwdOperands(NamedTuple):
     zeros_out: (
         jax.Array
     )  # (num_cores, n_nodes, out_dim, channels): zero-init for the output
+    block_order: jax.Array  # (n_blocks,) i32: walked blocks first
+    n_walked_blocks: jax.Array  # (1,) i32: how many of them hold a real edge
 
 
 class _FwdConstants(NamedTuple):
@@ -86,6 +89,7 @@ class _FwdConstants(NamedTuple):
     dtype: Any
     cg_groups: tuple  # ((zi, ((xi, ((yi, v), ...)), ...)), ...)
     irrep_block_of_output: tuple  # zi -> edge-scalar block
+    dynamic_edges: bool  # walk only the blocks holding a real edge
 
 
 def _scratch_shapes(c: _FwdConstants) -> FwdScratch:
@@ -107,8 +111,11 @@ def _scratch_shapes(c: _FwdConstants) -> FwdScratch:
 
 
 def _call_in_specs(ops: _FwdOperands) -> list[pl.BlockSpec]:
-    """All operands live in HBM; blocks are the full arrays."""
-    return [pl.BlockSpec(a.shape, memory_space=pltpu.HBM) for a in ops]
+    """Array operands live in HBM as whole blocks; the edge bound lives in SMEM."""
+    return [
+        *(pl.BlockSpec(a.shape, memory_space=pltpu.HBM) for a in ops[:-2]),
+        *(pl.BlockSpec(memory_space=pltpu.SMEM) for _ in ops[-2:]),
+    ]
 
 
 class _MessagePassingFwdKernel:
@@ -179,6 +186,7 @@ class _MessagePassingFwdKernel:
         senders: jax.Array,
         receivers: jax.Array,
         params: PallasMosaicTPUMessagePassingConvolutionParams,
+        edge_is_real: jax.Array | None = None,
     ) -> tuple[_FwdOperands, _FwdConstants]:
         """Host-side prep: pad operands, group CG coefficients, size the tiling."""
         tpu_info = pltpu.get_tpu_info()
@@ -257,7 +265,26 @@ class _MessagePassingFwdKernel:
             (num_cores, n_nodes, out_dim_padded, channels_padded), dtype=dtype
         )
 
-        ops = _FwdOperands(x, y, edge_scalars, senders, receivers, zeros_out)
+        dynamic_edges = edge_is_real is not None
+        if dynamic_edges:
+            block_order, n_walked_blocks = padding.block_order(
+                edge_is_real, n_blocks, batch_block_size
+            )
+        else:
+            block_order = jnp.zeros((1,), jnp.int32)  # unread: index maps stay static
+            n_walked_blocks = jnp.int32(n_blocks)
+        n_walked_blocks = jnp.reshape(n_walked_blocks.astype(jnp.int32), (1,))
+
+        ops = _FwdOperands(
+            x,
+            y,
+            edge_scalars,
+            senders,
+            receivers,
+            zeros_out,
+            block_order,
+            n_walked_blocks,
+        )
         constants = _FwdConstants(
             num_cores=num_cores,
             n_blocks=n_blocks,
@@ -274,31 +301,37 @@ class _MessagePassingFwdKernel:
             dtype=dtype,
             cg_groups=cg_groups,
             irrep_block_of_output=irrep_block_of_output,
+            dynamic_edges=dynamic_edges,
         )
         return ops, constants
 
     def _make_kernel(self, c: _FwdConstants):
         """Build the `pallas_call` kernel closing over the static `c`."""
 
-        def _pipeline_in_specs(c: _FwdConstants) -> list[pl.BlockSpec]:
+        def _pipeline_in_specs(
+            c: _FwdConstants, block_order_smem
+        ) -> list[pl.BlockSpec]:
             """emit_pipeline in_specs for (y, edge_scalars, senders, receivers)."""
+            walked_block = (
+                (lambda i: block_order_smem[i]) if c.dynamic_edges else (lambda i: i)
+            )
             return [
                 pl.BlockSpec(
                     block_shape=(c.y_dim_padded, c.batch_block_size),
-                    index_map=lambda i: (0, i),
+                    index_map=lambda i: (0, walked_block(i)),
                 ),
                 pl.BlockSpec(
                     block_shape=(c.num_blocks, c.batch_block_size, c.channels_padded),
-                    index_map=lambda i: (0, i, 0),
+                    index_map=lambda i: (0, walked_block(i), 0),
                 ),
                 pl.BlockSpec(
                     block_shape=(c.batch_block_size,),
-                    index_map=lambda i: (i,),
+                    index_map=lambda i: (walked_block(i),),
                     memory_space=pltpu.SMEM,
                 ),
                 pl.BlockSpec(
                     block_shape=(c.batch_block_size,),
-                    index_map=lambda i: (i,),
+                    index_map=lambda i: (walked_block(i),),
                     memory_space=pltpu.SMEM,
                 ),
             ]
@@ -310,6 +343,8 @@ class _MessagePassingFwdKernel:
             senders_hbm,  # (n_edges,)
             receivers_hbm,  # (n_edges,)
             _zeros_hbm,  # (num_cores, n_nodes, out_dim, channels)
+            block_order_smem,  # (n_blocks,) i32
+            n_walked_blocks_smem,  # (1,) i32
             # output:
             out_hbm,  # (num_cores, n_nodes, out_dim, channels)
             # scratch, see FwdScratch for shapes:
@@ -400,10 +435,12 @@ class _MessagePassingFwdKernel:
                         ),
                     )
 
+            n_blocks = n_walked_blocks_smem[0] if c.dynamic_edges else c.n_blocks
+
             pltpu.emit_pipeline(
                 body,
-                grid=(c.n_blocks,),
-                in_specs=_pipeline_in_specs(c),
+                grid=(n_blocks,),
+                in_specs=_pipeline_in_specs(c, block_order_smem),
                 out_specs=[],
                 core_axis=0,
                 dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
@@ -428,8 +465,11 @@ class _MessagePassingFwdKernel:
         senders: jax.Array,
         receivers: jax.Array,
         params: PallasMosaicTPUMessagePassingConvolutionParams,
+        edge_is_real: jax.Array | None = None,
     ) -> jax.Array:
-        ops, c = self._prolog(x, y, edge_scalars, senders, receivers, params)
+        ops, c = self._prolog(
+            x, y, edge_scalars, senders, receivers, params, edge_is_real
+        )
 
         out_packed = pl.pallas_call(
             self._make_kernel(c),
@@ -462,5 +502,8 @@ def _message_passing_kernel_mosaic_tpu_fwd(
     senders: jax.Array,
     receivers: jax.Array,
     params: PallasMosaicTPUMessagePassingConvolutionParams,
+    edge_is_real: jax.Array | None = None,
 ) -> jax.Array:
-    return _MessagePassingFwdKernel()(x, y, edge_scalars, senders, receivers, params)
+    return _MessagePassingFwdKernel()(
+        x, y, edge_scalars, senders, receivers, params, edge_is_real
+    )

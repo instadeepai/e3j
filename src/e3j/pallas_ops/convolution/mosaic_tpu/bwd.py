@@ -28,6 +28,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from e3j.pallas_ops.convolution.mosaic_tpu import padding
 from e3j.pallas_ops.convolution.mosaic_tpu.common import (
     FlushBuffers,
     WalkScratch,
@@ -101,6 +102,8 @@ class _BwdOperands(NamedTuple):
     senders: jax.Array  # (n_blocks, batch_block_size)
     receivers: jax.Array  # (n_blocks, batch_block_size)
     zeros_dx: jax.Array  # (num_cores, n_nodes, x_dim_padded, num_lanes): dx zero-init
+    block_order: jax.Array  # (n_blocks,) i32: walked blocks first
+    n_walked_blocks: jax.Array  # (1,) i32: how many of them hold a real edge
 
 
 class _BwdConstants(NamedTuple):
@@ -127,6 +130,7 @@ class _BwdConstants(NamedTuple):
     xi_used: tuple  # input indices with CG contributions
     yi_used: tuple  # spherical-harmonic indices with CG contributions
     irrep_block_of_output: tuple  # zi -> edge-scalar block
+    dynamic_edges: bool  # walk only the blocks holding a real edge
 
 
 def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
@@ -149,9 +153,78 @@ def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
     )
 
 
+def _zero_unwalked_blocks(
+    d_edge_scalars: jax.Array,
+    dy: jax.Array,
+    block_order: jax.Array,
+    n_walked_blocks: jax.Array,
+    c: _BwdConstants,
+) -> tuple[jax.Array, jax.Array]:
+    """Zero the per-edge cotangent blocks the bwd pipeline did not walk."""
+
+    def kernel(
+        block_order_smem,
+        n_walked_blocks_smem,
+        _d_edge_scalars,
+        _dy,
+        d_edge_scalars_hbm,
+        dy_hbm,
+    ):
+        n_walked_blocks = n_walked_blocks_smem[0]
+        unwalked_block = lambda i: block_order_smem[n_walked_blocks + i]  # noqa: E731
+
+        def body(d_edge_scalars_vmem, dy_vmem):
+            d_edge_scalars_vmem[...] = jnp.zeros_like(d_edge_scalars_vmem)
+            dy_vmem[...] = jnp.zeros_like(dy_vmem)
+
+        pltpu.emit_pipeline(
+            body,
+            grid=(c.n_blocks - n_walked_blocks,),
+            in_specs=[],
+            out_specs=[
+                pl.BlockSpec(
+                    (c.num_blocks, c.batch_block_size, c.num_lanes),
+                    lambda i: (0, unwalked_block(i), 0),
+                ),
+                pl.BlockSpec(
+                    (c.batch_block_size, c.num_lanes), lambda i: (unwalked_block(i), 0)
+                ),
+            ],
+            core_axis=0,
+            dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
+        )(d_edge_scalars_hbm, dy_hbm)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=[
+            jax.ShapeDtypeStruct(d_edge_scalars.shape, c.dtype),
+            jax.ShapeDtypeStruct(dy.shape, c.dtype),
+        ],
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(d_edge_scalars.shape, memory_space=pltpu.HBM),
+            pl.BlockSpec(dy.shape, memory_space=pltpu.HBM),
+        ],
+        out_specs=[
+            pl.BlockSpec(d_edge_scalars.shape, memory_space=pltpu.HBM),
+            pl.BlockSpec(dy.shape, memory_space=pltpu.HBM),
+        ],
+        grid=(c.num_cores,),
+        input_output_aliases={2: 0, 3: 1},
+        name="bwd_convolution_zero_unwalked_blocks",
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
+        ),
+    )(block_order, n_walked_blocks, d_edge_scalars, dy)
+
+
 def _call_in_specs(ops: _BwdOperands) -> list[pl.BlockSpec]:
-    """All operands live in HBM; blocks are the full arrays."""
-    return [pl.BlockSpec(a.shape, memory_space=pltpu.HBM) for a in ops]
+    """Array operands live in HBM as whole blocks; the edge bound lives in SMEM."""
+    return [
+        *(pl.BlockSpec(a.shape, memory_space=pltpu.HBM) for a in ops[:-2]),
+        *(pl.BlockSpec(memory_space=pltpu.SMEM) for _ in ops[-2:]),
+    ]
 
 
 class _MessagePassingBwdKernel:
@@ -223,6 +296,7 @@ class _MessagePassingBwdKernel:
         receivers: jax.Array,
         dz: jax.Array,
         params: PallasMosaicTPUMessagePassingConvolutionParams,
+        edge_is_real: jax.Array | None = None,
     ) -> tuple[_BwdOperands, _BwdConstants]:
         """Host-side prep: pad operands, group CG coefficients, size the tiling."""
         tpu_info = pltpu.get_tpu_info()
@@ -320,7 +394,27 @@ class _MessagePassingBwdKernel:
         receivers = receivers.reshape(n_blocks, batch_block_size)
         zeros_dx = jnp.zeros((num_cores, n_nodes, x_dim_padded, num_lanes), dtype)
 
-        ops = _BwdOperands(x, dz, y, edge_scalars, senders, receivers, zeros_dx)
+        dynamic_edges = edge_is_real is not None
+        if dynamic_edges:
+            block_order, n_walked_blocks = padding.block_order(
+                edge_is_real, n_blocks, batch_block_size
+            )
+        else:
+            block_order = jnp.zeros((1,), jnp.int32)  # unread: index maps stay static
+            n_walked_blocks = jnp.int32(n_blocks)
+        n_walked_blocks = jnp.reshape(n_walked_blocks.astype(jnp.int32), (1,))
+
+        ops = _BwdOperands(
+            x,
+            dz,
+            y,
+            edge_scalars,
+            senders,
+            receivers,
+            zeros_dx,
+            block_order,
+            n_walked_blocks,
+        )
         constants = _BwdConstants(
             num_cores=num_cores,
             n_blocks=n_blocks,
@@ -343,6 +437,7 @@ class _MessagePassingBwdKernel:
             xi_used=xi_used,
             yi_used=yi_used,
             irrep_block_of_output=irrep_block_of_output,
+            dynamic_edges=dynamic_edges,
         )
         return ops, constants
 
@@ -353,29 +448,43 @@ class _MessagePassingBwdKernel:
         only binds as `kernel`'s parameters.
         """
 
-        def _pipeline_in_specs(c: _BwdConstants) -> list[pl.BlockSpec]:
+        def _pipeline_in_specs(
+            c: _BwdConstants, block_order_smem
+        ) -> list[pl.BlockSpec]:
             """emit_pipeline in_specs for (y, edge_scalars, senders, receivers,
             senders_next, receivers_next)."""
+            walked_block = (
+                (lambda i: block_order_smem[i]) if c.dynamic_edges else (lambda i: i)
+            )
+            next_walked_block = lambda i: walked_block(  # noqa: E731
+                jnp.minimum(i + 1, c.n_blocks - 1)
+            )
             return [
-                pl.BlockSpec((c.batch_block_size, c.num_lanes), lambda i: (i, 0)),
+                pl.BlockSpec(
+                    (c.batch_block_size, c.num_lanes), lambda i: (walked_block(i), 0)
+                ),
                 pl.BlockSpec(
                     (c.num_blocks, c.batch_block_size, c.num_lanes),
-                    lambda i: (0, i, 0),
-                ),
-                pl.BlockSpec(
-                    (1, c.batch_block_size), lambda i: (i, 0), memory_space=pltpu.SMEM
-                ),
-                pl.BlockSpec(
-                    (1, c.batch_block_size), lambda i: (i, 0), memory_space=pltpu.SMEM
+                    lambda i: (0, walked_block(i), 0),
                 ),
                 pl.BlockSpec(
                     (1, c.batch_block_size),
-                    lambda i: (jnp.minimum(i + 1, c.n_blocks - 1), 0),
+                    lambda i: (walked_block(i), 0),
+                    memory_space=pltpu.SMEM,
+                ),
+                pl.BlockSpec(
+                    (1, c.batch_block_size),
+                    lambda i: (walked_block(i), 0),
+                    memory_space=pltpu.SMEM,
+                ),
+                pl.BlockSpec(
+                    (1, c.batch_block_size),
+                    lambda i: (next_walked_block(i), 0),
                     memory_space=pltpu.SMEM,
                 ),  # prefetch next senders
                 pl.BlockSpec(
                     (1, c.batch_block_size),
-                    lambda i: (jnp.minimum(i + 1, c.n_blocks - 1), 0),
+                    lambda i: (next_walked_block(i), 0),
                     memory_space=pltpu.SMEM,
                 ),  # prefetch next receivers
             ]
@@ -388,6 +497,8 @@ class _MessagePassingBwdKernel:
             senders_hbm,
             receivers_hbm,
             _z,
+            block_order_smem,
+            n_walked_blocks_smem,
             # outputs:
             d_edge_scalars_hbm,
             dy_hbm,
@@ -410,6 +521,16 @@ class _MessagePassingBwdKernel:
             flush_semaphore,
         ):
             core_id = pl.program_id(0)
+
+            if c.dynamic_edges:
+                n_blocks = n_walked_blocks_smem[0]
+                base = n_blocks // c.num_cores
+                blocks_this_core = base + jnp.where(
+                    core_id < n_blocks - base * c.num_cores, 1, 0
+                )
+            else:
+                n_blocks = c.n_blocks
+                blocks_this_core = jnp.int32(c.blocks_per_core)
 
             # zero the accumulator so the first group's += starts clean (flushes re-zero after)
             accumulator[:, :, :] = jnp.zeros_like(accumulator[:, :, :])
@@ -487,7 +608,7 @@ class _MessagePassingBwdKernel:
                 count_smem[0] = block_idx + 1
 
                 # prefetch the next block's gathers now
-                @pl.when(block_idx < jnp.int32(c.blocks_per_core - 1))
+                @pl.when(block_idx < blocks_this_core - 1)
                 def _prefetch():
                     for copy in gather_copies(senders_next_read, receivers_next_read):
                         copy.start()
@@ -551,16 +672,22 @@ class _MessagePassingBwdKernel:
                         ),
                     )
 
+            walked_block = (
+                (lambda i: block_order_smem[i]) if c.dynamic_edges else (lambda i: i)
+            )
             pipe = pltpu.emit_pipeline(
                 body,
-                grid=(c.n_blocks,),
-                in_specs=_pipeline_in_specs(c),
+                grid=(n_blocks,),
+                in_specs=_pipeline_in_specs(c, block_order_smem),
                 out_specs=[
                     pl.BlockSpec(
                         (c.num_blocks, c.batch_block_size, c.num_lanes),
-                        lambda i: (0, i, 0),
+                        lambda i: (0, walked_block(i), 0),
                     ),
-                    pl.BlockSpec((c.batch_block_size, c.num_lanes), lambda i: (i, 0)),
+                    pl.BlockSpec(
+                        (c.batch_block_size, c.num_lanes),
+                        lambda i: (walked_block(i), 0),
+                    ),
                 ],
                 core_axis=0,
                 dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
@@ -596,8 +723,11 @@ class _MessagePassingBwdKernel:
         receivers: jax.Array,
         dz: jax.Array,
         params: PallasMosaicTPUMessagePassingConvolutionParams,
+        edge_is_real: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        ops, c = self._prolog(x, y, edge_scalars, senders, receivers, dz, params)
+        ops, c = self._prolog(
+            x, y, edge_scalars, senders, receivers, dz, params, edge_is_real
+        )
 
         d_edge_scalars_packed, dy_packed, dx_cores = pl.pallas_call(
             self._make_kernel(c),
@@ -632,6 +762,15 @@ class _MessagePassingBwdKernel:
             ),
         )(*ops)
 
+        if c.dynamic_edges:
+            d_edge_scalars_packed, dy_packed = _zero_unwalked_blocks(
+                d_edge_scalars_packed,
+                dy_packed,
+                ops.block_order,
+                ops.n_walked_blocks,
+                c,
+            )
+
         dx_sum = dx_cores.sum(0)
         dx = dx_sum[:, : c.x_dim, : c.channels]  # (n_nodes, x_dim, channels)
 
@@ -655,7 +794,8 @@ def _message_passing_kernel_mosaic_tpu_bwd(
     receivers: jax.Array,
     dz: jax.Array,
     params: PallasMosaicTPUMessagePassingConvolutionParams,
+    edge_is_real: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     return _MessagePassingBwdKernel()(
-        x, y, edge_scalars, senders, receivers, dz, params
+        x, y, edge_scalars, senders, receivers, dz, params, edge_is_real
     )

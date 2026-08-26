@@ -30,6 +30,7 @@ from e3j.pallas_ops.convolution.mosaic_tpu.bwd import (
 from e3j.pallas_ops.convolution.mosaic_tpu.fwd import (
     _message_passing_kernel_mosaic_tpu_fwd as _fwd_impl,
 )
+from e3j.pallas_ops.convolution.mosaic_tpu.padding import route_dummy_edges
 from e3j.pallas_ops.convolution.mosaic_tpu.params import (
     PallasMosaicTPUMessagePassingConvolutionParams,
 )
@@ -92,22 +93,27 @@ def _run_kernel_data_parallel(
     mesh, axes = _active_mesh_axes()
     if not axes:
         return impl(*arrays)
-    in_specs = tuple(_batch_partition_spec(a.ndim, axes) for a in arrays)
+    # Optional operands arrive as `None` and carry no shardable axis.
+    supplied_argnums = [i for i, a in enumerate(arrays) if a is not None]
+    supplied_arrays = tuple(arrays[i] for i in supplied_argnums)
+    in_specs = tuple(_batch_partition_spec(a.ndim, axes) for a in supplied_arrays)
     out_specs = tuple(_batch_partition_spec(nd, axes) for nd in out_ndims)
     if len(out_specs) == 1:
         out_specs = out_specs[0]
 
     def _sharded_op(*shard_arrays):
+        shard_operands = [None] * len(arrays)
+        for argnum, shard_array in zip(supplied_argnums, shard_arrays):
+            shard_operands[argnum] = shard_array
         if edge_argnums:
-            base = _shard_index(mesh, axes) * shard_arrays[0].shape[0]
-            shard_arrays = list(shard_arrays)
+            base = _shard_index(mesh, axes) * shard_operands[0].shape[0]
             for i in edge_argnums:
-                shard_arrays[i] = shard_arrays[i] - base
-        return impl(*shard_arrays)
+                shard_operands[i] = shard_operands[i] - base
+        return impl(*shard_operands)
 
     return jax.shard_map(
         _sharded_op, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
-    )(*arrays)
+    )(*supplied_arrays)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,47 +138,58 @@ def _shift_edges(senders, receivers, n_nodes: int):
     return senders + offsets, receivers + offsets
 
 
-def _fwd_vmappable(x, y, s, senders, receivers, params):
+def _fwd_vmappable(x, y, s, senders, receivers, params, edge_is_real=None):
     """Forward kernel call, vmappable for data-parallel training."""
 
     @jax.custom_batching.custom_vmap
-    def _impl(x, y, s, senders, receivers):
-        return _fwd_impl(x, y, s, senders, receivers, params)
+    def _impl(x, y, s, senders, receivers, is_real):
+        return _fwd_impl(x, y, s, senders, receivers, params, is_real)
 
     @_impl.def_vmap
-    def _rule(axis_size, in_batched, x, y, s, senders, receivers):
+    def _rule(axis_size, in_batched, x, y, s, senders, receivers, is_real):
         _assert_graphs_divide_shards(axis_size)
-        args = [x, y, s, senders, receivers]
-        for i, b in enumerate(in_batched):
-            if not b:
+        args = [x, y, s, senders, receivers, is_real]
+        for i, b in enumerate(in_batched[: len(args)]):
+            if args[i] is not None and not b:
                 args[i] = jnp.broadcast_to(args[i][None], (axis_size,) + args[i].shape)
         args[3], args[4] = _shift_edges(args[3], args[4], args[0].shape[1])
-        merged = tuple(_merge_leading_into_batch(a) for a in args)
-        # z: (V*N, out_dim, channels)
-        z = _run_kernel_data_parallel(_impl, merged, (3,), edge_argnums=(3, 4))
+        merged = tuple(
+            _merge_leading_into_batch(a) if a is not None else None for a in args
+        )
+        z = _run_kernel_data_parallel(
+            lambda *a: _fwd_vmappable(*a[:5], params, a[5]),
+            merged,
+            (3,),
+            edge_argnums=(3, 4),
+        )
         return _split_batch_to_leading(z, axis_size), True
 
-    return _impl(x, y, s, senders, receivers)
+    return _impl(x, y, s, senders, receivers, edge_is_real)
 
 
-def _bwd_vmappable(x, y, s, senders, receivers, dm, params):
+def _bwd_vmappable(x, y, s, senders, receivers, dm, params, edge_is_real=None):
     """Backward kernel call, vmappable for data-parallel training."""
 
     @jax.custom_batching.custom_vmap
-    def _impl(x, y, s, senders, receivers, dm):
-        return _bwd_impl(x, y, s, senders, receivers, dm, params)
+    def _impl(x, y, s, senders, receivers, dm, is_real):
+        return _bwd_impl(x, y, s, senders, receivers, dm, params, is_real)
 
     @_impl.def_vmap
-    def _rule(axis_size, in_batched, x, y, s, senders, receivers, dm):
+    def _rule(axis_size, in_batched, x, y, s, senders, receivers, dm, is_real):
         _assert_graphs_divide_shards(axis_size)
-        args = [x, y, s, senders, receivers, dm]
-        for i, b in enumerate(in_batched):
-            if not b:
+        args = [x, y, s, senders, receivers, dm, is_real]
+        for i, b in enumerate(in_batched[: len(args)]):
+            if args[i] is not None and not b:
                 args[i] = jnp.broadcast_to(args[i][None], (axis_size,) + args[i].shape)
         args[3], args[4] = _shift_edges(args[3], args[4], args[0].shape[1])
-        merged = tuple(_merge_leading_into_batch(a) for a in args)
+        merged = tuple(
+            _merge_leading_into_batch(a) if a is not None else None for a in args
+        )
         dx, dy, ds = _run_kernel_data_parallel(
-            _impl, merged, (3, 2, 3), edge_argnums=(3, 4)
+            lambda *a: _bwd_vmappable(*a[:6], params, a[6]),
+            merged,
+            (3, 2, 3),
+            edge_argnums=(3, 4),
         )
         return (
             _split_batch_to_leading(dx, axis_size),
@@ -180,7 +197,7 @@ def _bwd_vmappable(x, y, s, senders, receivers, dm, params):
             _split_batch_to_leading(ds, axis_size),
         ), (True, True, True)
 
-    return _impl(x, y, s, senders, receivers, dm)
+    return _impl(x, y, s, senders, receivers, dm, edge_is_real)
 
 
 # --------------------------------------------------------------------------- #
@@ -195,10 +212,19 @@ def convolution_mosaic_tpu(
     senders: jax.Array,
     receivers: jax.Array,
     params: PallasMosaicTPUMessagePassingConvolutionParams,
+    has_dummy_edges: bool = False,
+    edge_is_real: jax.Array | None = None,
 ) -> jax.Array:
+    """Set `has_dummy_edges` when endpoints may carry the `DUMMY_INDEX` sentinel."""
+    n_nodes = x.shape[0]
+    if has_dummy_edges:
+        x, senders, receivers, edge_is_real = route_dummy_edges(x, senders, receivers)
+
     @jax.custom_vjp
     def _fwd_differentiable(x, y, s):
-        return _fwd_vmappable(x, y, s, receivers, senders, params.swapped())
+        return _fwd_vmappable(
+            x, y, s, receivers, senders, params.swapped(), edge_is_real
+        )
 
     def _fwd(x, y, s):
         z = _fwd_differentiable(x, y, s)
@@ -206,10 +232,11 @@ def convolution_mosaic_tpu(
 
     def _bwd(residuals, dm):
         x, y, s, senders, receivers = residuals
-        return _convolution_bwd(x, y, s, senders, receivers, params, dm)
+        return _convolution_bwd(x, y, s, senders, receivers, params, dm, edge_is_real)
 
     _fwd_differentiable.defvjp(_fwd, _bwd)
-    return _fwd_differentiable(x, y, s)
+    z = _fwd_differentiable(x, y, s)
+    return z[:n_nodes] if has_dummy_edges else z
 
 
 # --------------------------------------------------------------------------- #
@@ -217,10 +244,13 @@ def convolution_mosaic_tpu(
 # --------------------------------------------------------------------------- #
 
 
-def _convolution_bwd(x, y, s, senders, receivers, params, dm):
+def _convolution_bwd(x, y, s, senders, receivers, params, dm, edge_is_real=None):
+    def _bwd_call(x, y, s, dm):
+        return _bwd_vmappable(x, y, s, senders, receivers, dm, params, edge_is_real)
+
     @jax.custom_vjp
     def _bwd_differentiable(x, y, s, dm):
-        return _bwd_vmappable(x, y, s, senders, receivers, dm, params)
+        return _bwd_call(x, y, s, dm)
 
     def _fwd(x, y, s, dm):
         out = _bwd_differentiable(x, y, s, dm)
@@ -229,17 +259,19 @@ def _convolution_bwd(x, y, s, senders, receivers, params, dm):
     def _bwd(residuals, cts):
         x, y, s, dm, senders, receivers = residuals
         Ddx, Ddy, Dds = cts  # cotangents on (dx, dy, ds)
-        A = _bwd_vmappable(Ddx, y, s, senders, receivers, dm, params)  # A[1], A[2]
-        B = _bwd_vmappable(x, Ddy, s, senders, receivers, dm, params)  # B[0], B[2]
-        C = _bwd_vmappable(x, y, Dds, senders, receivers, dm, params)  # C[0], C[1]
+        A = _bwd_call(Ddx, y, s, dm)  # A[1], A[2]
+        B = _bwd_call(x, Ddy, s, dm)  # B[0], B[2]
+        C = _bwd_call(x, y, Dds, dm)  # C[0], C[1]
         Dx = B[0] + C[0]
         Dy = A[1] + C[1]
         Ds = A[2] + B[2]
-        Ddz = (
-            convolution_mosaic_tpu(Ddx, y, s, senders, receivers, params)
-            + convolution_mosaic_tpu(x, Ddy, s, senders, receivers, params)
-            + convolution_mosaic_tpu(x, y, Dds, senders, receivers, params)
-        )
+
+        def conv(x, y, s):
+            return convolution_mosaic_tpu(
+                x, y, s, senders, receivers, params, edge_is_real=edge_is_real
+            )
+
+        Ddz = conv(Ddx, y, s) + conv(x, Ddy, s) + conv(x, y, Dds)
         return Dx, Dy, Ds, Ddz
 
     _bwd_differentiable.defvjp(_fwd, _bwd)
