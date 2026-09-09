@@ -376,25 +376,11 @@ class TestTensorProductLeadingMap(_TestTensorProductOp):
     num_rows = 100
 
 
-# --- regression: MAP + TRAILING_CHANNELS with a small `num_out` ---
-#
-# `find_coef_bounds` (`details.cuh`) distributes the sorted coefficient array
-# across `blockDim.y` warps by output-index boundary. When `num_out` is small
-# relative to the number of warps (e.g. MACE's readout symmetric contraction,
-# which reduces down to a single scalar `0e` via `num_out=4`), several warps
-# find no valid boundary and default to an *empty* `[c, c)` range. Before the
-# fix, `otimes()`'s `while (col <= range.end)` loop still ran once on such an
-# empty range and spuriously rewrote whatever output index `coef[range.begin]`
-# belongs to, racing the warp that actually owns it -- a rare, transient,
-# large-magnitude corruption (not the ordinary float rounding noise other
-# tests tolerate), observed only over many repeated calls at a large enough
-# `num_rows` for the race window to be hit.
-
-
-def _map_trailing_small_num_out_inputs(num_rows=3375, num_out=4, dim=16, channels=32, nnz=16):
-    """A MAP/TRAILING_CHANNELS closure shaped like MACE's readout symmetric
-    contraction (`num_out=4`), at a `num_rows` large enough to reliably
-    reproduce the pre-fix race.
+def _map_trailing_small_num_out_inputs(
+    num_rows=3375, num_out=4, dim=16, channels=32, nnz=16
+):
+    """MAP/TRAILING_CHANNELS closure shaped like MACE's readout symmetric
+    contraction, sized to reliably reproduce the pre-fix race.
     """
     keys = list(random.split(random.key(0), 6))
 
@@ -417,29 +403,27 @@ def _map_trailing_small_num_out_inputs(num_rows=3375, num_out=4, dim=16, channel
     return idx, val, x, y, num_out
 
 
-def test_map_trailing_small_num_out_matches_reference():
-    """Forward value sanity check for the small-`num_out` MAP shape."""
+@pytest.mark.parametrize("mode", ["MAP", "INNER"])
+def test_trailing_small_num_out_matches_reference(mode):
+    """Forward value sanity check for the small-`num_out` shape."""
     idx, val, x, y, num_out = _map_trailing_small_num_out_inputs()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, mode="MAP", layout="TRAILING_CHANNELS")
+    params = Params(num_out=num_out, mode=mode, layout="TRAILING_CHANNELS")
     expect = tensor_product_reference(
-        idx, val, x, y, num_out, mode="MAP", layout="TRAILING_CHANNELS"
+        idx, val, x, y, num_out, mode=mode, layout="TRAILING_CHANNELS"
     )
     result = tensor_product(coef, x, y, params)
     assert_allclose(expect, result, atol=5e-5, rtol=5e-5)
 
 
-def test_map_trailing_small_num_out_is_deterministic():
-    """Regression test for the empty-warp-range race in `otimes()`.
-
-    Repeats the same jitted call many times and requires every repeat to be
-    bitwise identical to the first: the kernel has no atomics and no other
-    source of legitimate run-to-run variation, so any divergence here is the
-    empty-range write race, not ordinary float non-associativity.
+@pytest.mark.parametrize("mode", ["MAP", "INNER"])
+def test_trailing_small_num_out_is_deterministic(mode):
+    """Repeated calls must be bitwise identical: the kernel has no atomics
+    or other source of legitimate run-to-run variation.
     """
     idx, val, x, y, num_out = _map_trailing_small_num_out_inputs()
     coef = pack_coef(val, idx)
-    params = Params(num_out=num_out, mode="MAP", layout="TRAILING_CHANNELS")
+    params = Params(num_out=num_out, mode=mode, layout="TRAILING_CHANNELS")
     fused = jax.jit(lambda x, y: tensor_product(coef, x, y, params))
 
     base = fused(x, y)

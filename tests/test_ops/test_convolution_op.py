@@ -239,20 +239,6 @@ class TestConvolution256(_TestConvolutionOp):
     channels_x = 256
 
 
-# --- regression: small `num_out` relative to blockDim.y ---
-#
-# `find_coef_bounds` (`tensor_product/details.cuh`, shared with convolution)
-# distributes the sorted coefficient array across `blockDim.y` warps by
-# output-index boundary. When `num_out` is small, several warps find no
-# valid boundary and default to an empty `[c, c)` range. Before the fix,
-# `bigotimes()`'s `while (col <= range.end)` loop (`convolution/fwd.cuh`)
-# still ran once on such an empty range and spuriously rewrote whatever
-# output index `coef[range.begin]` belongs to, racing the warp that
-# actually owns it in the shared accumulator (`smem.out` forward,
-# `smem.dx` backward) -- a rare, transient, large-magnitude corruption,
-# observed only over many repeated calls at a graph large enough for the
-# race window to be hit. Same class of bug as the tensor_product
-# `otimes()` fix (see `test_tensor_product_op.py`).
 class TestConvolutionSmallNumOutRegression(_TestConvolutionOp):
     num_idx = 64
     num_x = 16
@@ -280,10 +266,9 @@ class TestConvolutionSmallNumOutRegression(_TestConvolutionOp):
 
     def test_backward_is_deterministic(self):
         x, y, s = self.inputs()
-        # Capture `fwd_op` once outside the jit boundary: unlike `fwd_op`,
-        # the `bwd_op` property builds a lambda that re-invokes the
-        # `fwd_op` *property* (re-running `pack_coef4d`) on every call,
-        # which breaks once traced under `jax.jit`.
+        # Capture `fwd_op` once: `bwd_op` rebuilds its grad wrapper (and
+        # re-runs `pack_coef4d`) on every access, so `jax.jit(self.bwd_op)`
+        # would retrace on each repeat below.
         fwd = self.fwd_op
         bwd = jax.jit(jax.grad(lambda x, y, s: np.sum(fwd(x, y, s)), argnums=(0, 1, 2)))
         base = bwd(x, y, s)

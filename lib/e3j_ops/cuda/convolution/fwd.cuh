@@ -188,6 +188,8 @@ __device__ void bigotimes(
     Coef c = coef[col];
     IdxVal zi,
            acc = {c.i, broadcast<N,Val>(Val(0))};
+    // Warps that found no coefficient boundary of their own must skip the loop entirely.
+    bool has_coef = range.begin < range.end;
 
     int lane = threadIdx.x % 32;
     int warp = threadIdx.x / 32;
@@ -205,7 +207,7 @@ __device__ void bigotimes(
     if constexpr (kMode == Mode::OUTER || kMode == Mode::MAP) {
         // Prevent OOB threads from writing out.
         // With N chosen so channels_z/N >= 32, all threads are active.
-        if (threadIdx.x * N < out.shape[1] && range.begin < range.end) {
+        if (threadIdx.x * N < out.shape[1] && has_coef) {
             Vect<N,Val> *out_lane =
                 reinterpret_cast<Vect<N,Val>*>(out.data) + threadIdx.x;
             int stride_out = out.shape[1] / N;
@@ -239,23 +241,25 @@ __device__ void bigotimes(
         // NOTE: partial warp sums have to be accumulated in SMEM
         //       as we can't synchronize over blockDim.y without
         //       reaching deadlock within the loop over coefficients.
-        while (col <= range.end) {
-            // Sum out[i] over 32 channels at a time
-            zi = accumulate_trilinear<Idx,Val,kMode,N>(
-                acc, coef, col, range.end,
-                x1.data, x2.data, x3.data,
-                x1.shape[1], x2.shape[1], x3.shape[1]
-            );
-            // Horizontally sum N channels within each lane,
-            // then reduce the 32-lane scalar across the warp.
-            Val zi_scalar = tp::sum_warp(hsum<N,Val>(zi.val), 32);
-            // STS for leading threads
-            if (lane == 0) {
-                // column-major to prevent bank conflicts
-                if constexpr (accumulate)
-                    scratch[warp * out.shape[0] + zi.i] += zi_scalar;
-                else
-                    scratch[warp * out.shape[0] + zi.i] = zi_scalar;
+        if (has_coef) {
+            while (col <= range.end) {
+                // Sum out[i] over 32 channels at a time
+                zi = accumulate_trilinear<Idx,Val,kMode,N>(
+                    acc, coef, col, range.end,
+                    x1.data, x2.data, x3.data,
+                    x1.shape[1], x2.shape[1], x3.shape[1]
+                );
+                // Horizontally sum N channels within each lane,
+                // then reduce the 32-lane scalar across the warp.
+                Val zi_scalar = tp::sum_warp(hsum<N,Val>(zi.val), 32);
+                // STS for leading threads
+                if (lane == 0) {
+                    // column-major to prevent bank conflicts
+                    if constexpr (accumulate)
+                        scratch[warp * out.shape[0] + zi.i] += zi_scalar;
+                    else
+                        scratch[warp * out.shape[0] + zi.i] = zi_scalar;
+                }
             }
         }
         if constexpr (!accumulate) {

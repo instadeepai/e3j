@@ -287,6 +287,8 @@ namespace trailing_channels {
         Coef c = coef[col];
         IdxVal zi,
                acc = {c.i, broadcast<N,Val>(Val(0))};
+        // Warps that found no coefficient boundary of their own must skip
+        bool has_coef = range.begin < range.end;
 
         int lane = threadIdx.x % 32;
         int warp = threadIdx.x / 32;
@@ -302,7 +304,7 @@ namespace trailing_channels {
                 // With N chosen so channels_z/N >= 32, all threads are
                 // active (k.z < k.total) and this branch is uniform — no divergence.
                 // The guard is kept as a safety net for edge cases.
-                if (k.z < k.total && range.begin < range.end) {
+                if (k.z < k.total && has_coef) {
                     Vect<N,Val> *out_lane =
                         reinterpret_cast<Vect<N,Val>*>(out.data) + threadIdx.x;
                     int stride_out = out.shape[1] / N;
@@ -331,21 +333,23 @@ namespace trailing_channels {
                 // NOTE: partial warp sums have to be accumulated in SMEM
                 //       as we can't synchronize over blockDim.y without
                 //       reaching deadlock within the loop over coefficients.
-                while (col <= range.end) {
-                    // Sum z[i] over 32 channels at a time
-                    zi = accumulate_products<Idx,Val,kMode,N>(
-                        acc, coef, col, range.end, lhs.data, rhs.data, lhs.shape[1], rhs.shape[1]
-                    );
-                    // Horizontally sum N channels within each lane,
-                    // then reduce the 32-lane scalar across the warp.
-                    Val zi_scalar = sum_warp(hsum<N,Val>(zi.val), 32);
-                    // STS for leading threads
-                    if (lane == 0) {
-                        // column-major to prevent bank conflicts
-                        if constexpr (accumulate)
-                            scratch[warp * out.shape[0] + zi.i] += zi_scalar;
-                        else
-                            scratch[warp * out.shape[0] + zi.i] = zi_scalar;
+                if (has_coef) {
+                    while (col <= range.end) {
+                        // Sum z[i] over 32 channels at a time
+                        zi = accumulate_products<Idx,Val,kMode,N>(
+                            acc, coef, col, range.end, lhs.data, rhs.data, lhs.shape[1], rhs.shape[1]
+                        );
+                        // Horizontally sum N channels within each lane,
+                        // then reduce the 32-lane scalar across the warp.
+                        Val zi_scalar = sum_warp(hsum<N,Val>(zi.val), 32);
+                        // STS for leading threads
+                        if (lane == 0) {
+                            // column-major to prevent bank conflicts
+                            if constexpr (accumulate)
+                                scratch[warp * out.shape[0] + zi.i] += zi_scalar;
+                            else
+                                scratch[warp * out.shape[0] + zi.i] = zi_scalar;
+                        }
                     }
                 }
                 if constexpr (!accumulate) {
