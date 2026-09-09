@@ -205,7 +205,7 @@ __device__ void bigotimes(
     if constexpr (kMode == Mode::OUTER || kMode == Mode::MAP) {
         // Prevent OOB threads from writing out.
         // With N chosen so channels_z/N >= 32, all threads are active.
-        if (threadIdx.x * N < out.shape[1]) {
+        if (threadIdx.x * N < out.shape[1] && range.begin < range.end) {
             Vect<N,Val> *out_lane =
                 reinterpret_cast<Vect<N,Val>*>(out.data) + threadIdx.x;
             int stride_out = out.shape[1] / N;

@@ -302,7 +302,7 @@ namespace trailing_channels {
                 // With N chosen so channels_z/N >= 32, all threads are
                 // active (k.z < k.total) and this branch is uniform — no divergence.
                 // The guard is kept as a safety net for edge cases.
-                if (k.z < k.total) {
+                if (k.z < k.total && range.begin < range.end) {
                     Vect<N,Val> *out_lane =
                         reinterpret_cast<Vect<N,Val>*>(out.data) + threadIdx.x;
                     int stride_out = out.shape[1] / N;
