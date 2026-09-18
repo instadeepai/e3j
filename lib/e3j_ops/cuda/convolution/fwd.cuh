@@ -241,25 +241,26 @@ __device__ void bigotimes(
         // NOTE: partial warp sums have to be accumulated in SMEM
         //       as we can't synchronize over blockDim.y without
         //       reaching deadlock within the loop over coefficients.
-        if (has_coef) {
-            while (col <= range.end) {
-                // Sum out[i] over 32 channels at a time
-                zi = accumulate_trilinear<Idx,Val,kMode,N>(
-                    acc, coef, col, range.end,
-                    x1.data, x2.data, x3.data,
-                    x1.shape[1], x2.shape[1], x3.shape[1]
-                );
-                // Horizontally sum N channels within each lane,
-                // then reduce the 32-lane scalar across the warp.
-                Val zi_scalar = tp::sum_warp(hsum<N,Val>(zi.val), 32);
-                // STS for leading threads
-                if (lane == 0) {
-                    // column-major to prevent bank conflicts
-                    if constexpr (accumulate)
-                        scratch[warp * out.shape[0] + zi.i] += zi_scalar;
-                    else
-                        scratch[warp * out.shape[0] + zi.i] = zi_scalar;
-                }
+        if (!has_coef) {
+            return
+        }
+        while (col <= range.end) {
+            // Sum out[i] over 32 channels at a time
+            zi = accumulate_trilinear<Idx,Val,kMode,N>(
+                acc, coef, col, range.end,
+                x1.data, x2.data, x3.data,
+                x1.shape[1], x2.shape[1], x3.shape[1]
+            );
+            // Horizontally sum N channels within each lane,
+            // then reduce the 32-lane scalar across the warp.
+            Val zi_scalar = tp::sum_warp(hsum<N,Val>(zi.val), 32);
+            // STS for leading threads
+            if (lane == 0) {
+                // column-major to prevent bank conflicts
+                if constexpr (accumulate)
+                    scratch[warp * out.shape[0] + zi.i] += zi_scalar;
+                else
+                    scratch[warp * out.shape[0] + zi.i] = zi_scalar;
             }
         }
         if constexpr (!accumulate) {
