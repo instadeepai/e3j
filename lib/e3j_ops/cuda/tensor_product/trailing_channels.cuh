@@ -334,7 +334,7 @@ namespace trailing_channels {
                 //       as we can't synchronize over blockDim.y without
                 //       reaching deadlock within the loop over coefficients.
                 if (!has_coef) {
-                    return
+                    return;
                 }
                 while (col <= range.end) {
                     // Sum z[i] over 32 channels at a time

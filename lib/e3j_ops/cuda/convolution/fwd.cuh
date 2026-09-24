@@ -242,7 +242,7 @@ __device__ void bigotimes(
         //       as we can't synchronize over blockDim.y without
         //       reaching deadlock within the loop over coefficients.
         if (!has_coef) {
-            return
+            return;
         }
         while (col <= range.end) {
             // Sum out[i] over 32 channels at a time
