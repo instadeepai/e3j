@@ -256,6 +256,7 @@ class Convolution:
         edge_scalars: Array,
         senders: Array,
         receivers: Array,
+        node_mask: Array | None = None,
     ) -> Array:
         """Mosaic TPU implementation.
 
@@ -290,6 +291,7 @@ class Convolution:
             senders,
             receivers,
             params,
+            node_mask is not None,
         )
 
     def __call__(
@@ -320,7 +322,9 @@ class Convolution:
             node_mask: optional boolean vector of length num_nodes, `True` for
                 real nodes and `False` for padding nodes, which *must* lie at
                 the tail of the graph. Padding edges are also assumed to only
-                connect padding nodes.
+                connect padding nodes. The Mosaic TPU kernels additionally stop
+                their edge pipeline after the last real edge, so the saving is
+                granular to one edge block.
 
         Note:
             On the CUDA convolution kernel the edges must be sorted by the endpoint
@@ -356,6 +360,7 @@ class Convolution:
                     edge_scalars,
                     senders,
                     receivers,
+                    node_mask,
                 )
             case _:
                 raise RuntimeError("Unknow convolution implementation.")

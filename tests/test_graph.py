@@ -20,8 +20,8 @@ from conftest import assert_allclose
 
 import e3j
 from e3j.core.convolution import Convolution
-from e3j.data.graph import GraphCSR
-from e3j.ops.convolution import DUMMY_INDEX, _wrap_global_index
+from e3j.data.graph import DUMMY_INDEX, GraphCSR
+from e3j.ops.convolution import _wrap_global_index
 
 # A small receiver-sorted graph over `num_nodes` nodes, plus `num_dummy`
 # padding edges. All dummy endpoints carry `DUMMY_INDEX` so they should be
@@ -39,6 +39,25 @@ def _padded_graph():
     sender = np.concatenate([sender_real, dummy])
     receiver = np.concatenate([receiver_real, dummy])
     return sender, receiver
+
+
+class TestMaskEdges:
+    """`mask_edges` selects the edges a `node_mask` gather would, for the trailing
+    padding it documents, and leaves an all-real graph untouched."""
+
+    @pytest.mark.parametrize("real", range(num_nodes + 1))
+    def test_matches_the_endpoint_gather(self, real):
+        node_mask = np.arange(num_nodes) < real
+        expected = node_mask[sender_real] & node_mask[receiver_real]
+        sender, receiver = GraphCSR.mask_edges(sender_real, receiver_real, node_mask)
+        masked = (sender == DUMMY_INDEX) | (receiver == DUMMY_INDEX)
+        numpy.testing.assert_array_equal(masked, ~expected)
+
+    def test_all_real_is_identity(self):
+        node_mask = np.ones(num_nodes, dtype=bool)
+        sender, receiver = GraphCSR.mask_edges(sender_real, receiver_real, node_mask)
+        numpy.testing.assert_array_equal(sender, sender_real)
+        numpy.testing.assert_array_equal(receiver, receiver_real)
 
 
 class TestWrapGlobalIndex:

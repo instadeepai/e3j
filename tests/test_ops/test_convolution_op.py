@@ -237,3 +237,42 @@ class TestConvolution256(_TestConvolutionOp):
     num_out = 16
     num_scalars = 4
     channels_x = 256
+
+
+class TestConvolutionSmallNumOutRegression(_TestConvolutionOp):
+    num_idx = 64
+    num_x = 16
+    num_y = 16
+    num_out = 4
+    num_scalars = 4
+    channels_x = 32
+    num_nodes = 128
+    num_edges = 4096
+
+    def test_forward(self):
+        # Looser tolerance than the base class: ~32 edges/node here vs. 3
+        # in the other fixtures, so float32 accumulation noise is larger.
+        x, y, s = self.inputs()
+        expect = self.fwd_ref(x, y, s)
+        result = self.fwd_op(x, y, s)
+        assert_allclose(expect, result, rtol=2e-4, atol=2e-4)
+
+    def test_forward_is_deterministic(self):
+        x, y, s = self.inputs()
+        fwd = jax.jit(self.fwd_op)
+        base = fwd(x, y, s)
+        for _ in range(50):
+            assert_allclose(base, fwd(x, y, s), atol=0, rtol=0)
+
+    def test_backward_is_deterministic(self):
+        x, y, s = self.inputs()
+        # Capture `fwd_op` once: `bwd_op` rebuilds its grad wrapper (and
+        # re-runs `pack_coef4d`) on every access, so `jax.jit(self.bwd_op)`
+        # would retrace on each repeat below.
+        fwd = self.fwd_op
+        bwd = jax.jit(jax.grad(lambda x, y, s: np.sum(fwd(x, y, s)), argnums=(0, 1, 2)))
+        base = bwd(x, y, s)
+        for _ in range(50):
+            out = bwd(x, y, s)
+            for expect, result in zip(base, out):
+                assert_allclose(expect, result, atol=0, rtol=0)

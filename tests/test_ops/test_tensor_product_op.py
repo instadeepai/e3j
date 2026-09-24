@@ -374,3 +374,59 @@ class TestTensorProductLeadingMap(_TestTensorProductOp):
     channels_y = 256
     num_out = 93
     num_rows = 100
+
+
+def _map_trailing_small_num_out_inputs(
+    num_rows=3375, num_out=4, dim=16, channels=32, nnz=16
+):
+    """MAP/TRAILING_CHANNELS closure shaped like MACE's readout symmetric
+    contraction, sized to reliably reproduce the pre-fix race.
+    """
+    keys = list(random.split(random.key(0), 6))
+
+    def make_idx(d, n, key):
+        idx_all = np.arange(d)
+        idx_rdm = random.randint(key, (n - d,), 0, d - 1)
+        return np.concat((idx_all, idx_rdm))
+
+    indices = [
+        make_idx(num_out, nnz, keys[0]),
+        make_idx(dim, nnz, keys[1]),
+        make_idx(dim, nnz, keys[2]),
+    ]
+    sigma = np.argsort(indices[0])
+    idx = np.stack(indices)[:, sigma]
+    idx = idx.astype(narrow_index_dtype((num_out, dim, dim)))
+    val = random.normal(keys[3], (nnz,))
+    x = random.normal(keys[4], (num_rows, dim, channels))
+    y = random.normal(keys[5], (num_rows, dim, channels))
+    return idx, val, x, y, num_out
+
+
+@pytest.mark.parametrize("mode", ["MAP", "INNER"])
+def test_trailing_small_num_out_matches_reference(mode):
+    """Forward value sanity check for the small-`num_out` shape."""
+    idx, val, x, y, num_out = _map_trailing_small_num_out_inputs()
+    coef = pack_coef(val, idx)
+    params = Params(num_out=num_out, mode=mode, layout="TRAILING_CHANNELS")
+    expect = tensor_product_reference(
+        idx, val, x, y, num_out, mode=mode, layout="TRAILING_CHANNELS"
+    )
+    result = tensor_product(coef, x, y, params)
+    assert_allclose(expect, result, atol=5e-5, rtol=5e-5)
+
+
+@pytest.mark.parametrize("mode", ["MAP", "INNER"])
+def test_trailing_small_num_out_is_deterministic(mode):
+    """Repeated calls must be bitwise identical: the kernel has no atomics
+    or other source of legitimate run-to-run variation.
+    """
+    idx, val, x, y, num_out = _map_trailing_small_num_out_inputs()
+    coef = pack_coef(val, idx)
+    params = Params(num_out=num_out, mode=mode, layout="TRAILING_CHANNELS")
+    fused = jax.jit(lambda x, y: tensor_product(coef, x, y, params))
+
+    base = fused(x, y)
+    for _ in range(100):
+        out = fused(x, y)
+        assert_allclose(base, out, atol=0, rtol=0)

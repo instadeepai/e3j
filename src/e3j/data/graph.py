@@ -18,9 +18,6 @@ import numpy
 from jax import Array
 from numpy import int32
 
-# Padding mask to ensure dummy edges are skipped in kernels.
-# This is important in typical static-shaped graphs, since a single
-# dummy node may carry all of the padding edges.
 DUMMY_INDEX = int32(numpy.iinfo(int32).max)
 
 #: Index dtype the CUDA FFI handlers declare. Pinned because `jax_enable_x64`,
@@ -28,16 +25,21 @@ DUMMY_INDEX = int32(numpy.iinfo(int32).max)
 INDEX_DTYPE = jnp.int32
 
 
+def is_dummy_index(index: Array) -> Array:
+    """Return where a single endpoint carries the `DUMMY_INDEX` sentinel."""
+    return index == DUMMY_INDEX
+
+
+def is_dummy_edge(sender: Array, receiver: Array) -> Array:
+    """Return where either endpoint carries the `DUMMY_INDEX` sentinel."""
+    return is_dummy_index(sender) | is_dummy_index(receiver)
+
+
 class GraphCSR:
     """Compressed Sparse Row (CSR) directed-graph adjacency.
 
     Edges are grouped by receiver so the convolution kernel can reduce
     messages per receiver without atomics.
-
-    Beyond construction and transposition, this class owns index arithmetic
-    required by `vmap` rules to fold a batch axis into a single disjoint
-    (block-diagonal) graph, both when a single graph is replicated across
-    devices or when distinct homogeneous graphs are stacked.
 
     Note:
         Derived buffers (`receiver_ptr` and the permutations returned by `sort`
@@ -78,63 +80,12 @@ class GraphCSR:
 
         Padding edges are assumed to only connect trailing nodes and must lie
         at the end of the graph. They are assigned out-of-bounds edges to ensure
-        they are skipped by the message aggregation.
+        they are skipped by the message aggregation. Trailing padding makes the
+        real nodes those below `count_nonzero(node_mask)`.
         """
-        edge_mask = node_mask[sender] & node_mask[receiver]
+        num_real_nodes = jnp.count_nonzero(node_mask)
+        edge_mask = (sender < num_real_nodes) & (receiver < num_real_nodes)
         return (
             jnp.where(edge_mask, sender, DUMMY_INDEX),
             jnp.where(edge_mask, receiver, DUMMY_INDEX),
         )
-
-    @staticmethod
-    def fold_adjacency(
-        axis_size: int,
-        num_nodes: int,
-        num_edges: int,
-        sender: Array,
-        receiver_ptr: Array,
-        batched: bool,
-    ) -> tuple[Array, Array]:
-        """Fold a batch axis of `(sender, receiver_ptr)` into one disjoint graph.
-
-        Args:
-            axis_size: Size of the leading batch axis.
-            num_nodes: Number of nodes in one graph.
-            num_edges: Number of edges in one graph.
-            sender: Sender node indices, relative to each graph.
-            receiver_ptr: Receiver CSR pointers, relative to each graph.
-            batched: When false, replicates a single graph for SPMD. If
-                true, distinct graphs are batched and `axis_size` should
-                match the leading dimensions of `sender` and `receiver_ptr`.
-
-        Returns:
-            A `(sender, receiver_ptr)` pair representing a graph with
-            `axis_size * num_nodes` nodes and `axis_size * num_edges` edges.
-        """
-        if not batched:
-            sender = jnp.broadcast_to(sender, (axis_size,) + sender.shape)
-            receiver_ptr = jnp.broadcast_to(
-                receiver_ptr, (axis_size,) + receiver_ptr.shape
-            )
-        node_offsets = jnp.arange(axis_size, dtype=sender.dtype)[:, None] * num_nodes
-        edge_offsets = (
-            jnp.arange(axis_size, dtype=receiver_ptr.dtype)[:, None] * num_edges
-        )
-        sender_folded = (sender + node_offsets).reshape(-1)
-        ptr_body = (receiver_ptr[:, :num_nodes] + edge_offsets).reshape(-1)
-        receiver_ptr_folded = jnp.append(ptr_body, axis_size * num_edges)
-        return sender_folded, receiver_ptr_folded
-
-    @staticmethod
-    def fold_permutation(
-        axis_size: int, num_edges: int, perm: Array, batched: bool
-    ) -> Array:
-        """Fold a batch axis of an edge permutation into one disjoint graph.
-
-        Offsets each element by `b * num_edges` so it indexes the correct
-        segment of the concatenated edge array.
-        """
-        if not batched:
-            perm = jnp.broadcast_to(perm, (axis_size,) + perm.shape)
-        edge_offsets = jnp.arange(axis_size, dtype=perm.dtype)[:, None] * num_edges
-        return (perm + edge_offsets).reshape(-1)

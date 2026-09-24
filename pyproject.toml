@@ -1,6 +1,6 @@
 [project]
 name = "e3j"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast Euclid equivariant operations for GPU and TPU"
 authors = [
     { name="Olivier Peltre", email="o.peltre@instadeep.com" },
@@ -15,18 +15,15 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     "numpy >= 1.26.4",
     "jax >= 0.6.2",
-    "gitpython ~= 3.1.43",
     "e3nn-jax >= 0.20.6",
     "flax ~= 0.12.0",
-    "pandas ~= 2.2.2",
-    "matplotlib >= 3.9.0",
     "setuptools>=75.8,<78.2",
-    "pydantic>=2.13.3",
+    "pydantic>=2.13.3, <3",
 ]
 
 [project.optional-dependencies]
 ops = [
-    "e3j_ops == 0.1.0",
+    "e3j_ops == 0.1.1",
     "pybind11 >= 2.13.6"
 ]
 
