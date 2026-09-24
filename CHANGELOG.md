@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+## [0.1.1] — 2026-09-24
+
+### Fixed
+
+- Fixed an undefined behaviour occuring with the CUDA tensor product kernel in PowerExpansion,
+  when some warps had an empty coefficient range.
+- Dropped unnecessary dependencies from the main group (#11).
+
+### Removed
+
+- `GraphCSR.fold_adjacency` and `GraphCSR.fold_permutation`.
+
+### Changed
+
+- Mosaic TPU convolution kernels improvements:
+  - skip fully padded edge blocks
+  - factor out edge scalars of the coefficient loop in the backward pass.
+
+
 ## [0.1.0] — 2026-08-14
 
 ### Added
