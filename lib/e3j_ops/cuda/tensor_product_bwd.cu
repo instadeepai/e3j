@@ -37,14 +37,17 @@ e3j::Error launch_bwd(
     Val *dy,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *coef_ranges
 ) {
     ModeBwd mode = GetModeBwd(
         p.mode, p.channels_x, p.channels_y
     );
     #define DISPATCH_MODE_PAIR(MODE_LHS, MODE_RHS)       \
     return launch_bwd<Idx, Val, MODE_LHS, MODE_RHS>(     \
-        coef, x, y, z, dx, dy, p, stream, debug          \
+        coef, x, y, z, dx, dy, p, stream, debug,         \
+        block_y, coef_ranges                             \
     );
 
     #define DISPATCH_MODE_PAIR_ERROR(MODE_LHS, MODE_RHS) \
@@ -67,7 +70,9 @@ template e3j::Error launch_bwd<Idx, Val>(           \
     Val *dy,                                        \
     Params p,                                       \
     cudaStream_t stream,                            \
-    int debug                                       \
+    int debug,                                      \
+    int block_y,                                    \
+    const int *coef_ranges                          \
 );
 __FOR_EACH_DTYPE_PAIR
 #undef FOR_EACH_DTYPE_PAIR

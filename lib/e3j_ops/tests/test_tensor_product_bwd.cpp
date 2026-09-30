@@ -266,6 +266,7 @@ int test_tensor_product_bwd (Params p, int num_strips=NUM_STRIPS) {
 
     CoefT *coef_d;
     float *x_d, *y_d, *dz_d, *dx_d, *dy_d;
+    int *coef_ranges_d;
 
     int cz = p.channels_out();
 
@@ -280,6 +281,7 @@ int test_tensor_product_bwd (Params p, int num_strips=NUM_STRIPS) {
 	cudaMalloc((void**)&dz_d, size_z);
 	cudaMalloc((void**)&dx_d, size_x);
 	cudaMalloc((void**)&dy_d, size_y);
+	cudaMalloc((void**)&coef_ranges_d, 2 * sizeof(int));
 
 	cudaMemcpy(coef_d, args.coef.data(), size_coef, H2D);
 	cudaMemcpy(x_d, args.x.data(), size_x, H2D);
@@ -287,6 +289,12 @@ int test_tensor_product_bwd (Params p, int num_strips=NUM_STRIPS) {
 	cudaMemcpy(dz_d, args.dz.data(), size_z, H2D);
 	cudaMemcpy(dx_d, args.dx.data(), size_x, H2D);
 	cudaMemcpy(dy_d, args.dy.data(), size_y, H2D);
+    // Single-warp coefficient ranges [0, num_idx) for both the dx, dy passes:
+    // no host-side balancing, this test only exercises kernel correctness
+    // (see `e3j.ops.coef_ranges` for the balanced partition used by the
+    // JAX-facing op).
+    int coef_ranges_h[2] = { p.num_idx, p.num_idx };
+    cudaMemcpy(coef_ranges_d, coef_ranges_h, 2 * sizeof(int), H2D);
 
     cudaDeviceSynchronize();
 
@@ -296,7 +304,8 @@ int test_tensor_product_bwd (Params p, int num_strips=NUM_STRIPS) {
         coef_d,
         x_d, y_d, dz_d,
         dx_d, dy_d,
-        p, cudaStream_t(0), DEBUG
+        p, cudaStream_t(0), DEBUG,
+        /*block_y=*/1, coef_ranges_d
     );
 
     cudaDeviceSynchronize();
@@ -323,18 +332,26 @@ int test_tensor_product_bwd (Params p, int num_strips=NUM_STRIPS) {
     CoefT *coef_dx = coef_d,
           *coef_dy = coef_d + p.num_idx;
 
+    // Single-warp coefficient range [0, num_idx), same reasoning as the
+    // main kernel_bwd call above.
+    int *fwd_coef_ranges_d;
+    cudaMalloc((void**)&fwd_coef_ranges_d, sizeof(int));
+    cudaMemcpy(fwd_coef_ranges_d, &p.num_idx, sizeof(int), H2D);
+
     // Call two TP kernels.
     cudaDeviceSynchronize();
 
     launch<Idx, float>(
         coef_dx,
         dz_d, y_d, dx_d,
-        p_dx, cudaStream_t(0), DEBUG
+        p_dx, cudaStream_t(0), DEBUG,
+        /*block_y=*/1, fwd_coef_ranges_d
     );
     launch<Idx, float>(
         coef_dy,
         dz_d, x_d, dy_d,
-        p_dy, cudaStream_t(0), DEBUG
+        p_dy, cudaStream_t(0), DEBUG,
+        /*block_y=*/1, fwd_coef_ranges_d
     );
 
     // Collect expected results
@@ -375,6 +392,8 @@ int test_tensor_product_bwd (Params p, int num_strips=NUM_STRIPS) {
     cudaFree(dz_d);
     cudaFree(dx_d);
     cudaFree(dy_d);
+    cudaFree(coef_ranges_d);
+    cudaFree(fwd_coef_ranges_d);
     return 0;
 }
 

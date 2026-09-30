@@ -126,6 +126,7 @@ xla::Error TensorProductHandler(
     xla::AnyBuffer coef,
     xla::AnyBuffer x,
     xla::AnyBuffer y,
+    xla::BufferR1<xla::DataType::S32> coef_ranges,
     xla::Result<xla::AnyBuffer> out,
     int32_t num_out,
     int32_t _mode,
@@ -207,12 +208,19 @@ xla::Error TensorProductHandler(
             .mode = mode,                                       \
             .layout = layout                                    \
         };                                                      \
+                                                                \
+        /* Empty for LEADING_CHANNELS. */                       \
+        int32_t block_y = coef_ranges.element_count();          \
+        const int *coef_ranges_ptr =                            \
+            coef_ranges.element_count()                         \
+                ? coef_ranges.typed_data() : nullptr;           \
+                                                                \
         return e3j::tensor_product::launch<Idx, Val>(           \
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
             y.typed_data<Val>(),                                \
             out->typed_data<Val>(),                             \
-            params, stream, debug                               \
+            params, stream, debug, block_y, coef_ranges_ptr     \
         ).to_xla();
 
     // The packed buffer is typed as idx_t but holds Coef<idx_t, val_t> structs.
@@ -235,6 +243,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // coef (packed Coef<Idx,Val> as idx_t vector)
         .Arg<xla::AnyBuffer>()   // x
         .Arg<xla::AnyBuffer>()   // y
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // coef_ranges
         .Ret<xla::AnyBuffer>()
         .Attr<int32_t>("num_out")
         .Attr<int32_t>("mode")
@@ -252,6 +261,7 @@ xla::Error TensorProductBwdHandler(
     xla::AnyBuffer x,
     xla::AnyBuffer y,
     xla::AnyBuffer dz,
+    xla::BufferR1<xla::DataType::S32> coef_ranges,
     xla::Result<xla::AnyBuffer> dx,
     xla::Result<xla::AnyBuffer> dy,
     int32_t _mode_fwd,
@@ -322,6 +332,10 @@ xla::Error TensorProductBwdHandler(
             coef.typed_data<Idx>()                              \
         );                                                      \
                                                                 \
+        /* One range per warp and pass (dx, dy). */             \
+        int32_t block_y = coef_ranges.element_count() / 2;      \
+        const int *coef_ranges_ptr = coef_ranges.typed_data();  \
+                                                                \
         return launch_bwd<Idx, Val>(                            \
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
@@ -329,7 +343,8 @@ xla::Error TensorProductBwdHandler(
             dz.typed_data<Val>(),                               \
             dx->typed_data<Val>(),                              \
             dy->typed_data<Val>(),                              \
-            params_fwd, stream, debug                           \
+            params_fwd, stream, debug,                          \
+            block_y, coef_ranges_ptr                            \
         ).to_xla();
 
     __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
@@ -349,6 +364,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // x
         .Arg<xla::AnyBuffer>()   // y
         .Arg<xla::AnyBuffer>()   // z
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // coef_ranges
         .Ret<xla::AnyBuffer>()   // dx
         .Ret<xla::AnyBuffer>()   // dy
         .Attr<int32_t>("mode")
