@@ -235,6 +235,7 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     CoefT *coef_d;
     float *x_d, *y_d, *r_d, *out_d;
     int32 *sender_d, *receiver_ptr_d;
+    int *coef_ranges_d;
 
     cudaMalloc((void**)&coef_d, size_coef);
     cudaMalloc((void**)&x_d, size_x);
@@ -243,6 +244,7 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     cudaMalloc((void**)&sender_d, sizeof(int32) * num_edges);
     cudaMalloc((void**)&receiver_ptr_d, sizeof(int32) * (p.num_nodes + 1));
     cudaMalloc((void**)&out_d, size_out);
+    cudaMalloc((void**)&coef_ranges_d, sizeof(int));
 
     cudaMemcpy(coef_d, args.coef.data(), size_coef, H2D);
     cudaMemcpy(x_d, args.x.data(), size_x, H2D);
@@ -252,6 +254,10 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     cudaMemcpy(receiver_ptr_d, args.receiver_ptr.data(),
                sizeof(int32) * (p.num_nodes + 1), H2D);
     cudaMemcpy(out_d, args.out.data(), size_out, H2D);
+    // Single-warp coefficient range [0, num_coef): no host-side balancing,
+    // this test only exercises kernel correctness (see `e3j.ops.coef_ranges`
+    // for the balanced partition used by the JAX-facing op).
+    cudaMemcpy(coef_ranges_d, &p.num_coef, sizeof(int), H2D);
 
     cudaDeviceSynchronize();
 
@@ -261,13 +267,15 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
 
     e3j::Error err = e3j::convolution::launch<Idx, float>(
         coef_d, x_d, y_d, r_d, adj, out_d,
-        p, cudaStream_t(0), DEBUG
+        p, cudaStream_t(0), DEBUG,
+        /*block_y=*/1, coef_ranges_d
     );
 
     if (err.failure()) {
         printf("Launch error: %s\n", err.message().c_str());
         cudaFree(coef_d); cudaFree(x_d); cudaFree(y_d); cudaFree(r_d);
         cudaFree(sender_d); cudaFree(receiver_ptr_d); cudaFree(out_d);
+        cudaFree(coef_ranges_d);
         return 1;
     }
 
@@ -299,6 +307,7 @@ int test_convolution(Params p, int num_strips, bool scale_r = false) {
     cudaFree(sender_d);
     cudaFree(receiver_ptr_d);
     cudaFree(out_d);
+    cudaFree(coef_ranges_d);
 
     return match ? 0 : 1;
 }

@@ -344,6 +344,14 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     int num_edges = NUM_EDGES;
     int num_coef = p.num_coef;
 
+    // Per-warp coefficient ranges computed on the host, as in Python.
+    // blockDim.y = coef_ranges.size() / 3, at most 16.
+    int min_rows = std::min({p.num_x, p.num_y, p.num_scalars});
+    int block_y = std::max(1, std::min(min_rows, 16));
+    std::vector<int> coef_ranges =
+        e3j::convolution::pack_coef_ranges<Idx, float>(
+            args.coef_packed.data(), num_coef, block_y);
+
     size_t size_coef   = sizeof(CoefT) * 3 * num_coef;
     size_t size_x      = sizeof(float) * p.num_nodes * p.num_x * p.channels_x;
     size_t size_y      = sizeof(float) * num_edges * p.num_y;
@@ -356,7 +364,9 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     CoefT *coef_d;
     float *x_d, *y_d, *dz_d, *mix_d, *dx_d, *dy_d, *dmix_d;
     int32 *receiver_t_d, *sender_ptr_d, *perm_d;
+    int *coef_ranges_d;
 
+    cudaMalloc((void**)&coef_ranges_d, sizeof(int) * coef_ranges.size());
     cudaMalloc((void**)&coef_d, size_coef);
     cudaMalloc((void**)&x_d, size_x);
     cudaMalloc((void**)&y_d, size_y);
@@ -369,6 +379,8 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     cudaMalloc((void**)&dy_d, size_dy);
     cudaMalloc((void**)&dmix_d, size_dmix);
 
+    cudaMemcpy(coef_ranges_d, coef_ranges.data(),
+               sizeof(int) * coef_ranges.size(), H2D);
     cudaMemcpy(coef_d, args.coef_packed.data(), size_coef, H2D);
     cudaMemcpy(x_d, args.x.data(), size_x, H2D);
     cudaMemcpy(y_d, args.y.data(), size_y, H2D);
@@ -395,11 +407,12 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
     e3j::Error err = e3j::convolution::launch_bwd<Idx, float>(
         coef_d, x_d, y_d, mix_d, dz_d, adj_t, perm_d,
         dx_d, dy_d, dmix_d,
-        p, cudaStream_t(0), DEBUG
+        p, cudaStream_t(0), DEBUG, block_y, coef_ranges_d
     );
 
     if (err.failure()) {
         printf("Launch error: %s\n", err.message().c_str());
+        cudaFree(coef_ranges_d);
         cudaFree(coef_d); cudaFree(x_d); cudaFree(y_d); cudaFree(dz_d);
         cudaFree(mix_d);
         cudaFree(receiver_t_d); cudaFree(sender_ptr_d); cudaFree(perm_d);
@@ -474,6 +487,7 @@ int test_convolution_bwd(Params p, int num_strips, bool scale_r = false) {
                        NUM_EDGES * p.num_scalars, p.channels_x);
     }
 
+    cudaFree(coef_ranges_d);
     cudaFree(coef_d);
     cudaFree(x_d);
     cudaFree(y_d);

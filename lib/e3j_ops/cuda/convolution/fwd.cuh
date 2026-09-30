@@ -36,7 +36,6 @@ using utils::fill;
 using tensor_product::Coef;
 using tensor_product::CoefRange;
 using tensor_product::Mode;
-using tensor_product::find_coef_bounds;
 
 namespace tp = tensor_product::trailing_channels;
 
@@ -180,16 +179,17 @@ __device__ void bigotimes(
     Val *scratch
 ) {
 
-    // NOTE: consumes p.num_out, p.unroll_{x,y}, p.channels_x.
     using Coef = Coef4D<Idx, Val>;
     using IdxVal = tp::IdxVal<Idx, Val, N>;
 
-    int col = range.begin;
-    Coef c = coef[col];
-    IdxVal zi,
-           acc = {c.i, broadcast<N,Val>(Val(0))};
-    // Warps that found no coefficient boundary of their own must skip the loop entirely.
     bool has_coef = range.begin < range.end;
+
+    int col = range.begin;
+    IdxVal zi;
+    IdxVal acc = {
+       has_coef ? coef[col].i : Idx(0),
+       broadcast<N,Val>(Val(0))
+    };
 
     int lane = threadIdx.x % 32;
     int warp = threadIdx.x / 32;
@@ -241,10 +241,7 @@ __device__ void bigotimes(
         // NOTE: partial warp sums have to be accumulated in SMEM
         //       as we can't synchronize over blockDim.y without
         //       reaching deadlock within the loop over coefficients.
-        if (!has_coef) {
-            return;
-        }
-        while (col <= range.end) {
+        while (has_coef && col <= range.end) {
             // Sum out[i] over 32 channels at a time
             zi = accumulate_trilinear<Idx,Val,kMode,N>(
                 acc, coef, col, range.end,
@@ -287,7 +284,8 @@ __global__ void kernel (
     CuArray2D<Val> m,
     int num_nodes,
     int num_coef,
-    dim3 unroll
+    dim3 unroll,
+    const int *coef_ranges
 ) {
     // Forward coefficients for (x, y, s) trilinear mixing,
     // matching the public convolution API.
@@ -323,11 +321,11 @@ __global__ void kernel (
     // Allocate SMEM buffer addresses.
     smem.to_shared(smem_);
 
-    // Distribute coefficients across blockDim.y, without m-index overlap.
-    // Reuses lhs buffer (not yet populated) as int[blockDim.y + 1] scratch.
-    CoefRange coef_range = find_coef_bounds<Idx, Val, Coef4D>(
-        reinterpret_cast<int*>(smem.lhs.data), coef, num_coef, m.shape[0]
-    );
+    // Per-warp coefficient range, precomputed on the host.
+    CoefRange coef_range = {
+        threadIdx.y ? coef_ranges[threadIdx.y - 1] : 0,
+        coef_ranges[threadIdx.y]
+    };
 
     // First receiver for this block.
     m.data += blockIdx.x * size_out;

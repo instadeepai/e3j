@@ -24,6 +24,7 @@
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
 #include <cuda_runtime_api.h>
+#include "cuda/device_properties.h"
 
 namespace e3j {
 
@@ -73,6 +74,7 @@ __device__ Vect<N, Val> broadcast(Val x) {
     }
 }
 
+// Vectorized FMUL
 template<int N, typename Val>
 __device__ Vect<N, Val> mul(Vect<N, Val> a, Vect<N, Val> b) {
     if constexpr (N == 1) {
@@ -84,11 +86,32 @@ __device__ Vect<N, Val> mul(Vect<N, Val> a, Vect<N, Val> b) {
     }
 }
 
+// Vectorized FMUL with broadcast
+template<int N, typename Val, std::enable_if_t<(N > 1), int> = 0>
+__device__ Vect<N, Val> mul(Vect<N, Val> a, Val b) {
+    if constexpr (N == 2)
+        return {a.x * b, a.y * b};
+    if constexpr (N == 4)
+        return {
+            a.x * b,
+            a.y * b,
+            a.z * b,
+            a.w * b
+        };
+}
+
+template<int N, typename Val, std::enable_if_t<(N > 1), int> = 0>
+__device__ Vect<N, Val> mul(Val a, Vect<N,Val> b) {
+    return mul<N,Val>(b, a);
+}
+
+
 // Scalar fused multiply-add, one overload per value dtype: FFMA, DFMA, HFMA.
 // Keeps `fmadd` below generic over the value type.
 __device__ __forceinline__ float  fma_(float a, float b, float c)    { return __fmaf_rn(a, b, c); }
 __device__ __forceinline__ double fma_(double a, double b, double c) { return __fma_rn(a, b, c); }
 __device__ __forceinline__ __half fma_(__half a, __half b, __half c) { return __hfma(a, b, c); }
+
 
 // Fused multiply-add: acc[i] += a[i] * b[i].
 // Uses `fma_` to emit a single FMA instead of MUL+ADD, eliminating the
@@ -208,7 +231,7 @@ __device__ void wait_pipe() {
 // Caller must __pipeline_commit() + __pipeline_wait_prior(K)
 // + __syncthreads() before reading dst.
 template <int N=1, typename T>
-__device__ void copy_pipe(T* dst, const T* src, const int numel) {
+__device__ __noinline__ void copy_pipe(T* dst, const T* src, const int numel) {
     int tid = threadIdx.x + threadIdx.y * blockDim.x;
     int dim = blockDim.x * blockDim.y;
     // cp.async supports only 4, 8, or 16 byte transfers.
@@ -266,7 +289,7 @@ __device__ void copy_pipe(T* dst, const T* src, const int numel) {
 // destination, issuing one 16-byte LDGSTS per thread per iteration.
 // Caller must __pipeline_commit() + __pipeline_wait_prior(0) + __syncthreads().
 template <typename T>
-__device__ void copy_pipe_strided (
+__device__ __noinline__ void copy_pipe_strided (
     T* dst,
     const T* src,
     unsigned int num_rows,
@@ -328,7 +351,7 @@ __device__ void fill(T* dst, const T value, const int numel) {
 
 // Vectorized fill (N-wide stores, full 2D block).
 template <int N, typename T>
-__device__ void fill(T* dst, const T value, const int numel) {
+__device__ __noinline__ void fill(T* dst, const T value, const int numel) {
     int tid = threadIdx.x + threadIdx.y * blockDim.x;
     int dim = blockDim.x * blockDim.y;
     if constexpr (N > 1) {
@@ -345,25 +368,6 @@ __device__ void fill(T* dst, const T value, const int numel) {
     }
 }
 
-// Helper to query useful device properties
-struct DeviceProperties {
-
-    int device = 0;
-    int smem_max = 0;
-    int smem_opt_in = 0;
-
-    static DeviceProperties query() {
-        DeviceProperties out;
-        cudaGetDevice(&out.device);
-        cudaDeviceGetAttribute(
-            &out.smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, out.device
-        );
-        cudaDeviceGetAttribute(
-            &out.smem_opt_in, cudaDevAttrMaxSharedMemoryPerBlock, out.device
-        );
-        return out;
-    }
-};
 
 } // namespace utils
 } // namespace e3j
