@@ -407,7 +407,8 @@ def test_vmap_fwd_convolution_multi_devices():
         r"f32\[24,4\]\{1,0\}, "  # y (edge embeddings)
         r"f32\[24,2,32\]\{2,1,0\}, "  # s (edge scalars)
         r"s32\[24\]\{0\}, "  # sender (COO, sharded edge-wise)
-        r"s32\[9\]\{0\}\}",  # receiver_ptr (shard-local CSR)
+        r"s32\[9\]\{0\}, "  # receiver_ptr (shard-local CSR)
+        r"s32\[2\]\{0\}\}",  # coef_ranges (1 pass * blockDim.y=2)
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(hlo))) == 1, (
@@ -477,7 +478,8 @@ def test_vmap_grad_convolution_multi_devices():
         r"f32\[8,4,32\]\{2,1,0\}, "  # dm (output cotangent)
         r"s32\[24\]\{0\}, "  # sender_t (shard-local transposed CSR)
         r"s32\[9\]\{0\}, "  # receiver_ptr_t
-        r"s32\[24\]\{0\}\}",  # perm (edge permutation)
+        r"s32\[24\]\{0\}, "  # perm (edge permutation)
+        r"s32\[6\]\{0\}\}",  # coef_ranges (3 passes * blockDim.y=2)
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(hlo))) == 1, (
@@ -570,6 +572,28 @@ def test_vmap_grad_convolution_multi_devices_numerical():
 
     for ref, shard in zip(g_ref, g_sharded):
         testing.assert_array_equal(jax.device_get(shard), jax.device_get(ref))
+
+
+# --- gradient ---
+
+
+def test_grad_convolution_matches_reference():
+    """Gradients match the reference with reordered backward coefficients."""
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    def f_op(x, y, s):
+        return np.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
+
+    def f_ref(x, y, s):
+        z = convolution_reference(
+            idx, val, x, y, s, s_index, sender, receiver, params.num_out
+        )
+        return np.sum(z**2)
+
+    g_op = jax.grad(f_op, argnums=(0, 1, 2))(x, y, s)
+    g_ref = jax.grad(f_ref, argnums=(0, 1, 2))(x, y, s)
+    for a, b in zip(g_op, g_ref):
+        testing.assert_allclose(a, b, atol=1e-4, rtol=1e-4)
 
 
 # --- Hessian (jacrev ∘ grad) ---

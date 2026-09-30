@@ -26,6 +26,12 @@ from jax.ffi import ffi_call
 from numpy import int32
 
 from e3j.ops.coef import Coef
+from e3j.ops.coef_ranges import (
+    balance_coef_ranges,
+    choose_block_y,
+    estimate_smem_bytes,
+    launch_threads_x,
+)
 from e3j.utils import config, is_pow2
 from e3j.utils.exceptions import ShardingError
 from e3j.utils.options import Layout, MixingMode
@@ -125,12 +131,51 @@ def tensor_product(
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
+    # Balance coefficients across blockDim.y, in a single pass.
+    # LEADING_CHANNELS takes an empty `coef_ranges`.
+    with jax.ensure_compile_time_eval():
+        if layout is Layout.TRAILING_CHANNELS:
+            c = Coef.unpack(coef, val_dtype=x.dtype)
+            num_coef = int(c.idx.shape[0])
+            out_idx = [np.asarray(c.idx[:, 0])]
+            channels_for_threads = (
+                channels_x * channels_y if mode.name == "OUTER" else channels_x
+            )
+            # Shared memory at blockDim.y = 1: [coef | x | y], with INNER scratch.
+            val_bytes = np.dtype(c.val_dtype).itemsize
+            threads_x, N = launch_threads_x(channels_for_threads)
+            extra = 0
+            if mode.name == "INNER":
+                extra = val_bytes * num_out * (1 + (channels_x - 1) // (32 * N))
+            smem = estimate_smem_bytes(
+                [
+                    min(threads_x * N, channels_x) * x.shape[1],
+                    min(threads_x * N, channels_y) * y.shape[1],
+                ],
+                num_coef,
+                c.dtype.itemsize,
+                val_bytes=val_bytes,
+                extra_bytes=extra,
+            )
+            block_y = choose_block_y(
+                out_idx,
+                num_coef,
+                channels_for_threads,
+                max_block_size=256,
+                smem_bytes=smem,
+            )
+            (perm,), ranges = balance_coef_ranges(out_idx, num_coef, block_y)
+            coef = coef[perm]
+            coef_ranges = jnp.asarray(ranges)
+        else:
+            coef_ranges = jnp.zeros((0,), jnp.int32)
+
     # We need to redefine a functions for vmap because
     # custom_vmap doesn't support static arguments.
     @jax.custom_batching.custom_vmap
-    def _tensor_product_impl(coef, x, y):
+    def _tensor_product_impl(coef, x, y, coef_ranges):
         @jax.experimental.custom_partitioning.custom_partitioning
-        def __tensor_product_impl(coef, x, y):
+        def __tensor_product_impl(coef, x, y, coef_ranges):
             num_rows = x.shape[0]
 
             # Infer output shape
@@ -148,6 +193,7 @@ def tensor_product(
                 coef,
                 x,
                 y,
+                coef_ranges,
                 num_out=int32(num_out),
                 mode=int32(mode.value),
                 layout=int32(layout.value),
@@ -155,7 +201,9 @@ def tensor_product(
             )
 
         def partition(mesh, arg_shapes, result_shape):
-            assert len(arg_shapes) == 3, "Expected three arguments: coef, x, y"
+            assert (
+                len(arg_shapes) == 4
+            ), "Expected four arguments: coef, x, y, coef_ranges"
             assert len(arg_shapes[1].shape) in (
                 2,
                 3,
@@ -164,7 +212,7 @@ def tensor_product(
                 2,
                 3,
             ), f"Expected y rank 2 or 3, got {arg_shapes[2].shape}"
-            coef_shape, x_shape, y_shape = arg_shapes
+            coef_shape, x_shape, y_shape, coef_ranges_shape = arg_shapes
 
             result_sharding = result_shape.sharding
 
@@ -172,26 +220,31 @@ def tensor_product(
                 mesh,
                 __tensor_product_impl,
                 (result_sharding),
-                (coef_shape.sharding, x_shape.sharding, y_shape.sharding),
+                (
+                    coef_shape.sharding,
+                    x_shape.sharding,
+                    y_shape.sharding,
+                    coef_ranges_shape.sharding,
+                ),
             )
 
         x_rule = "a b" if has_cx else "a"
         y_rule = "c d" if has_cy else "c"
         out_rule = " ".join(["e", "f", "g"][: len(channels_z) + 1])
 
-        sharding_rule = f"u v, ... {x_rule}, ... {y_rule} -> ... {out_rule}"
+        sharding_rule = f"u v, ... {x_rule}, ... {y_rule}, r -> ... {out_rule}"
 
-        # Make sure coef are replicated
+        # Make sure coef and coef_ranges are replicated
         __tensor_product_impl.def_partition(
             partition=partition,
             sharding_rule=sharding_rule,
-            need_replication_factors=("u", "v"),
+            need_replication_factors=("u", "v", "r"),
         )
-        return __tensor_product_impl(coef, x, y)
+        return __tensor_product_impl(coef, x, y, coef_ranges)
 
     @_tensor_product_impl.def_vmap
-    def _tensor_product_vmap_rule(axis_size, in_batched, coef, x, y):
-        coef_b, x_b, y_b = in_batched
+    def _tensor_product_vmap_rule(axis_size, in_batched, coef, x, y, coef_ranges):
+        coef_b, x_b, y_b, _coef_ranges_b = in_batched
         if coef_b:
             raise ValueError("Batching over the coef argument is not supported.")
         # Typically both (or neither) of x, y are batched together, but
@@ -204,11 +257,11 @@ def tensor_product(
         num_rows = x.shape[1]
         x = x.reshape((axis_size * num_rows,) + x.shape[2:])
         y = y.reshape((axis_size * num_rows,) + y.shape[2:])
-        out = _tensor_product_impl(coef, x, y)
+        out = _tensor_product_impl(coef, x, y, coef_ranges)
 
         return out.reshape((axis_size, num_rows) + out.shape[1:]), True
 
-    return _tensor_product_impl(coef, x, y)
+    return _tensor_product_impl(coef, x, y, coef_ranges)
 
 
 def _zero_gap_rows(grad: Array, written: np.ndarray, layout: Layout) -> Array:
@@ -282,14 +335,61 @@ def tensor_product_bwd(
         c = Coef.unpack(coef, val_dtype=x.dtype)
         coef_xzy = c.transpose((1, 0, 2))
         coef_yzx = c.transpose((2, 0, 1))
-        coef_bwd = jnp.stack([coef_xzy.pack_jax(), coef_yzx.pack_jax()])
         written_x = np.asarray(coef_xzy.idx[:, 0])
         written_y = np.asarray(coef_yzx.idx[:, 0])
 
+        # Balance the dx, dy passes independently, as a barrier separates them.
+        num_coef = int(coef_xzy.idx.shape[0])
+        passes = [written_x, written_y]
+        channels_for_threads = (
+            channels_x * channels_y if mode == MixingMode.OUTER else channels_x
+        )
+        if mode == MixingMode.OUTER:
+            channels_out = channels_x * channels_y
+        elif mode == MixingMode.INNER:
+            channels_out = 1
+        else:
+            channels_out = channels_x
+        # Shared memory at blockDim.y = 1: [z | x | y].
+        val_bytes = np.dtype(coef_xzy.val_dtype).itemsize
+        threads_x, N = launch_threads_x(channels_for_threads)
+        # Cross-warp reduction scratch of the INNER backward pass.
+        extra = 0
+        if mode == MixingMode.OUTER and channels_x == 1:
+            extra = val_bytes * x.shape[1] * (1 + (channels_y - 1) // (32 * N))
+        elif mode == MixingMode.OUTER and channels_y == 1:
+            extra = val_bytes * y.shape[1] * (1 + (channels_x - 1) // (32 * N))
+        smem = estimate_smem_bytes(
+            [
+                min(threads_x * N, channels_out) * ct_z.shape[1],
+                min(threads_x * N, channels_x) * x.shape[1],
+                min(threads_x * N, channels_y) * y.shape[1],
+            ],
+            2 * num_coef,
+            coef_xzy.dtype.itemsize,
+            val_bytes=val_bytes,
+            extra_bytes=extra,
+        )
+        block_y = choose_block_y(
+            passes,
+            num_coef,
+            channels_for_threads,
+            max_block_size=256,
+            smem_bytes=smem,
+            barrier_between_passes=True,
+        )
+        perms, ranges = balance_coef_ranges(
+            passes, num_coef, block_y, barrier_between_passes=True
+        )
+        coef_bwd = jnp.stack(
+            [arr.pack_jax()[perm] for arr, perm in zip((coef_xzy, coef_yzx), perms)]
+        )
+        coef_ranges = jnp.asarray(ranges)
+
     @jax.custom_batching.custom_vmap
-    def _tensor_product_bwd_impl(coef_bwd, x, y, ct_z):
+    def _tensor_product_bwd_impl(coef_bwd, x, y, ct_z, coef_ranges):
         @jax.experimental.custom_partitioning.custom_partitioning
-        def __tensor_product_bwd_impl(coef_bwd, x, y, ct_z):
+        def __tensor_product_bwd_impl(coef_bwd, x, y, ct_z, coef_ranges):
             shapes_out = (
                 jax.ShapeDtypeStruct(x.shape, x.dtype),
                 jax.ShapeDtypeStruct(y.shape, y.dtype),
@@ -302,13 +402,16 @@ def tensor_product_bwd(
                 x,
                 y,
                 ct_z,
+                coef_ranges,
                 mode=int32(mode.value),
                 layout=int32(layout.value),
                 debug=int32(config().debug_level),
             )
 
         def partition(mesh, arg_shapes, result_shape):
-            assert len(arg_shapes) == 4, "Expected four arguments: coef_bwd, x, y, ct_z"
+            assert (
+                len(arg_shapes) == 5
+            ), "Expected five arguments: coef_bwd, x, y, ct_z, coef_ranges"
             if len(arg_shapes[1].shape) not in (2, 3):
                 raise ShardingError(
                     f"Expected x rank 2 or 3, got {arg_shapes[1].shape}"
@@ -317,7 +420,7 @@ def tensor_product_bwd(
                 raise ShardingError(
                     f"Expected y rank 2 or 3, got {arg_shapes[2].shape}"
                 )
-            coef_shape, x_shape, y_shape, ct_z_shape = arg_shapes
+            coef_shape, x_shape, y_shape, ct_z_shape, coef_ranges_shape = arg_shapes
             ct_x_shape, ct_y_shape = result_shape
 
             return (
@@ -329,6 +432,7 @@ def tensor_product_bwd(
                     x_shape.sharding,
                     y_shape.sharding,
                     ct_z_shape.sharding,
+                    coef_ranges_shape.sharding,
                 ),
             )
 
@@ -338,21 +442,23 @@ def tensor_product_bwd(
 
         # coef_bwd is (2, K, numel): replicate all axes.
         sharding_rule = (
-            f"o p q, ... {x_rule}, ... {y_rule}, ... {z_rule} "
+            f"o p q, ... {x_rule}, ... {y_rule}, ... {z_rule}, r "
             f"-> ... {x_rule}, ... {y_rule}"
         )
 
         __tensor_product_bwd_impl.def_partition(
             partition=partition,
             sharding_rule=sharding_rule,
-            need_replication_factors=("o", "p", "q"),
+            need_replication_factors=("o", "p", "q", "r"),
         )
 
-        return __tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+        return __tensor_product_bwd_impl(coef_bwd, x, y, ct_z, coef_ranges)
 
     @_tensor_product_bwd_impl.def_vmap
-    def _tensor_product_bwd_vmap_rule(axis_size, in_batched, coef_bwd, x, y, ct_z):
-        coef_b, x_b, y_b, ct_z_b = in_batched
+    def _tensor_product_bwd_vmap_rule(
+        axis_size, in_batched, coef_bwd, x, y, ct_z, coef_ranges
+    ):
+        coef_b, x_b, y_b, ct_z_b, _coef_ranges_b = in_batched
         if coef_b:
             raise NotImplementedError(
                 "Batching over the coef_bwd argument is not supported."
@@ -367,12 +473,12 @@ def tensor_product_bwd(
         x = x.reshape((axis_size * num_rows,) + x.shape[2:])
         y = y.reshape((axis_size * num_rows,) + y.shape[2:])
         ct_z = ct_z.reshape((axis_size * num_rows,) + ct_z.shape[2:])
-        ct_x, ct_y = _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+        ct_x, ct_y = _tensor_product_bwd_impl(coef_bwd, x, y, ct_z, coef_ranges)
         ct_x = ct_x.reshape((axis_size, num_rows) + ct_x.shape[1:])
         ct_y = ct_y.reshape((axis_size, num_rows) + ct_y.shape[1:])
         return (ct_x, ct_y), (True, True)
 
-    ct_x, ct_y = _tensor_product_bwd_impl(coef_bwd, x, y, ct_z)
+    ct_x, ct_y = _tensor_product_bwd_impl(coef_bwd, x, y, ct_z, coef_ranges)
     ct_x = _zero_gap_rows(ct_x, written_x, layout)
     ct_y = _zero_gap_rows(ct_y, written_y, layout)
     return ct_x, ct_y

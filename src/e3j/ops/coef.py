@@ -150,10 +150,10 @@ class Coef:
         return self.__class__(self.val.__array__(), self.idx.__array__())
 
     def pack_numpy(self) -> numpy.ndarray:
-        return numpy.array(
-            [(val, *idx) for val, idx in self],
-            dtype=self.dtype,
-        )
+        # Zeroed allocation keeps the padding bytes deterministic.
+        coef_np = numpy.zeros(self.val.shape[0], dtype=self.dtype)
+        coef_np[:] = [(val, *idx) for val, idx in self]
+        return coef_np
 
     def pack_jax(self) -> jnp.ndarray:
         coef_np = self.pack_numpy()

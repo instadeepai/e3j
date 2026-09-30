@@ -23,8 +23,15 @@ from jax import Array, custom_vjp
 from jax.ffi import ffi_call
 from numpy import int32
 
-from e3j.data.graph import INDEX_DTYPE, GraphCSR, is_dummy_edge, is_dummy_index
+from e3j.data.graph import INDEX_DTYPE, GraphCSR, is_dummy_index
 from e3j.ops.coef import Coef4D
+from e3j.ops.coef_ranges import (
+    balance_coef_ranges,
+    choose_block_y,
+    estimate_smem_bytes,
+    kernel_registers,
+    launch_threads_x,
+)
 from e3j.utils import config, is_pow2
 from e3j.utils.options import GraphOrdering
 
@@ -167,11 +174,44 @@ def convolution(
                 c.val * signs, c.idx, val_dtype=c.val_dtype, idx_dtype=c.idx_dtype
             ).pack_jax()
 
+    # Balance coefficients across blockDim.y, in a single pass.
+    with jax.ensure_compile_time_eval():
+        c = Coef4D.unpack(coef, val_dtype=x.dtype)
+        num_coef = int(c.idx.shape[0])
+        out_idx = [numpy.asarray(c.idx[:, 0])]
+        # Shared memory at blockDim.y = 1: [lhs | rhs | out | mix].
+        val_bytes = numpy.dtype(c.val_dtype).itemsize
+        threads_x, N = launch_threads_x(channels_x)
+        unroll_x = min(threads_x * N, channels_x)
+        smem = estimate_smem_bytes(
+            [
+                unroll_x * x.shape[1],
+                y.shape[1],
+                unroll_x * num_out,
+                unroll_x * s.shape[1],
+            ],
+            num_coef,
+            c.dtype.itemsize,
+            val_bytes=val_bytes,
+        )
+        registers = kernel_registers("convolution", c.idx_dtype, c.val_dtype, N)
+        block_y = choose_block_y(
+            out_idx,
+            num_coef,
+            channels_x,
+            max_block_size=512,
+            smem_bytes=smem,
+            registers_per_thread=registers,
+        )
+        (perm,), ranges = balance_coef_ranges(out_idx, num_coef, block_y)
+        coef_fwd = coef_fwd[perm]
+        coef_ranges = jnp.asarray(ranges)
+
     # ---- custom_partitioning ----
     #
     # All array arguments explicit, only close over static problem sizes.
     @jax.experimental.custom_partitioning.custom_partitioning
-    def _sharded_op(coef, x, y, s, sender, receiver):
+    def _sharded_op(coef, x, y, s, sender, receiver, coef_ranges):
         n = x.shape[0]
         sender_local = _wrap_global_index(sender, n)
         receiver_local = _wrap_global_index(receiver, n)
@@ -196,6 +236,7 @@ def convolution(
             s,
             sender_local,
             receiver_local_ptr,
+            coef_ranges,
             num_nodes=int32(n),
             debug=int32(config().debug_level),
         )
@@ -212,13 +253,13 @@ def convolution(
     s_rule = "ns cx"
     out_rule = "nz cx"
     sharding_rule = (
-        f"u v, nodes {x_rule}, edges ny, edges {s_rule}, edges, edges"
+        f"u v, nodes {x_rule}, edges ny, edges {s_rule}, edges, edges, r"
         f" -> nodes {out_rule}"
     )
     _sharded_op.def_partition(
         partition=_partition,
         sharding_rule=sharding_rule,
-        need_replication_factors=("u", "v"),
+        need_replication_factors=("u", "v", "r"),
     )
 
     # ---- custom_vmap ----
@@ -229,7 +270,7 @@ def convolution(
 
     @jax.custom_batching.custom_vmap
     def _batched_op(x, y, s, sender, receiver):
-        return _sharded_op(coef_fwd, x, y, s, sender, receiver)
+        return _sharded_op(coef_fwd, x, y, s, sender, receiver, coef_ranges)
 
     @_batched_op.def_vmap
     def _vmap_rule(axis_size, in_batched, x, y, s, sender, receiver):
@@ -324,15 +365,51 @@ def convolution_bwd(
         #   - dy = bigotimes(coef_dy, dm, x, s)
         #   - ds = bigotimes(coef_ds, dm, y, x)
         c = Coef4D.unpack(coef, val_dtype=x.dtype)
-        coef_dx = c.transpose((1, 0, 2, 3)).pack_jax()
-        coef_dy = c.transpose((2, 0, 1, 3)).pack_jax()
-        coef_ds = c.transpose((3, 0, 2, 1)).pack_jax()
-        coef_bwd = jnp.stack([coef_dx, coef_dy, coef_ds])
+        c_dx = c.transpose((1, 0, 2, 3))
+        c_dy = c.transpose((2, 0, 1, 3))
+        c_ds = c.transpose((3, 0, 2, 1))
+
+        # Balance the dx, dy, ds passes jointly, as no barrier separates them.
+        num_coef = int(c_dx.idx.shape[0])
+        channels_x = int(x.shape[-1]) if has_cx else 1
+        passes = [numpy.asarray(c_bwd.idx[:, 0]) for c_bwd in (c_dx, c_dy, c_ds)]
+        # Shared memory at blockDim.y = 1: [dm | x | y | mix | dy scratch].
+        val_bytes = numpy.dtype(c_dx.val_dtype).itemsize
+        threads_x, N = launch_threads_x(channels_x)
+        unroll_x = min(threads_x * N, channels_x)
+        warps_x = max(1, threads_x // 32)
+        smem = estimate_smem_bytes(
+            [
+                unroll_x * dm.shape[1],
+                unroll_x * x.shape[1],
+                y.shape[1],
+                unroll_x * s.shape[1],
+            ],
+            3 * num_coef,
+            c_dx.dtype.itemsize,
+            val_bytes=val_bytes,
+            extra_bytes=warps_x * y.shape[1] * val_bytes,
+        )
+        registers = kernel_registers(
+            "convolution_bwd", c_dx.idx_dtype, c_dx.val_dtype, N
+        )
+        block_y = choose_block_y(
+            passes,
+            num_coef,
+            channels_x,
+            smem_bytes=smem,
+            registers_per_thread=registers,
+        )
+        perms, ranges = balance_coef_ranges(passes, num_coef, block_y)
+        coef_bwd = jnp.stack(
+            [c_bwd.pack_jax()[perm] for c_bwd, perm in zip((c_dx, c_dy, c_ds), perms)]
+        )
+        coef_ranges = jnp.asarray(ranges)
 
     # ---- custom_partitioning ----
 
     @jax.experimental.custom_partitioning.custom_partitioning
-    def _sharded_op(coef_bwd, x, y, s, dm, sender, receiver):
+    def _sharded_op(coef_bwd, x, y, s, dm, sender, receiver, coef_ranges):
         num_nodes = x.shape[0]
         sender_local = _wrap_global_index(sender, num_nodes)
         receiver_local = _wrap_global_index(receiver, num_nodes)
@@ -372,16 +449,12 @@ def convolution_bwd(
             sender_local_t,
             receiver_local_t_ptr,
             perm,
+            coef_ranges,
             num_nodes=int32(num_nodes),
             debug=int32(config().debug_level),
         )
 
-        # Dummy edges are skipped by the kernel guard, so their per-edge
-        # cotangents are never written; zero them explicitly. Edges keep their
-        # original order (no regroup), so the mask applies directly.
-        dummy = is_dummy_edge(sender, receiver)
-        dy = jnp.where(dummy[:, None], 0, dy)
-        ds = jnp.where(dummy[:, None, None], 0, ds)
+        # The kernel zeroes the cotangents of padding edges.
         return dx, dy, ds
 
     def _partition(mesh, arg_shapes, result_shape):
@@ -398,19 +471,19 @@ def convolution_bwd(
     dm_rule = "nz cx"
     sharding_rule = (
         f"o p q, nodes {x_rule}, edges ny, edges {s_rule}, nodes {dm_rule},"
-        f" edges, edges -> nodes {x_rule}, edges ny, edges {s_rule}"
+        f" edges, edges, r -> nodes {x_rule}, edges ny, edges {s_rule}"
     )
     _sharded_op.def_partition(
         partition=_partition,
         sharding_rule=sharding_rule,
-        need_replication_factors=("o", "p", "q"),
+        need_replication_factors=("o", "p", "q", "r"),
     )
 
     # ---- custom_vmap ----
 
     @jax.custom_batching.custom_vmap
     def _batched_op(x, y, s, dm, sender, receiver):
-        return _sharded_op(coef_bwd, x, y, s, dm, sender, receiver)
+        return _sharded_op(coef_bwd, x, y, s, dm, sender, receiver, coef_ranges)
 
     @_batched_op.def_vmap
     def _vmap_rule(axis_size, in_batched, x, y, s, dm, sender, receiver):
