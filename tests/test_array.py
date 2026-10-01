@@ -129,10 +129,12 @@ class _TestO3Array:
         expect = scalars * x.array
         assert jnp.all(expect == result)
 
-    @pytest.mark.xfail
     def test_illegal_rmul(self, o3_inputs):
         x, y = o3_inputs
-        z = x * y
+        with pytest.raises(
+            NotImplementedError, match="Cannot multiply equivariant data"
+        ):
+            x * y
 
     @pytest.mark.xfail
     def test_shorter_feature_axis(self, inputs):

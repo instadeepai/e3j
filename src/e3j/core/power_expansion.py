@@ -79,12 +79,12 @@ class PowerExpansion:
         set the `l_max` attribute. This parameter allows for a trade-off
         between expressivity vs. speed and memory.
         """
-        layers = self.otimes_layers()
+        layers = self.otimes_layers
         return (self.source, *(otimes.target for otimes in layers))
 
     @property
     def target(self) -> tuple[O3Space, ...]:
-        return tuple(layer.target for layer in self.filter_layers())
+        return tuple(layer.target for layer in self.filter_layers)
 
     def _final_target(self) -> O3Space:
         """Filter applied to the final, full-exponent output."""
@@ -151,7 +151,7 @@ class PowerExpansion:
             return None
         return irrep_range(self.l_max, True)
 
-    @functools.cache
+    @functools.cached_property
     def filter_layers(self) -> list[Filter]:
         """Return list of :class:`e3j.core.Filter` instances.
 
@@ -169,7 +169,7 @@ class PowerExpansion:
         target = self.get_target_filter(self.exponent)
         return [Filter(src, target, axis_lm) for src in sources]
 
-    @functools.cache
+    @functools.cached_property
     def otimes_layers(self) -> list[TensorProduct]:
         """Return list of :class:`e3j.core.TensorProduct` instances."""
         layers = []
@@ -193,9 +193,9 @@ class PowerExpansion:
     def __call__(self, x: np.ndarray) -> list[np.ndarray]:
         """Compute list of (filter-projected) equivariant powers [x, x2, ...]."""
         out = [x]
-        for otimes in self.otimes_layers():
+        for otimes in self.otimes_layers:
             x_nu = out[-1]
             x_nu = otimes(x_nu, x)
             out.append(x_nu)
-        filters = self.filter_layers()
+        filters = self.filter_layers
         return [filter_out(x_nu) for x_nu, filter_out in zip(out, filters)]

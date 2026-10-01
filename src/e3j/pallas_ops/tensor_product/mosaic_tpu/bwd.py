@@ -37,6 +37,7 @@ from e3j.utils import options
 class BwdKernel(ABC):
     """Backward tensor-product kernel."""
 
+    @abstractmethod
     def __call__(
         self,
         x: jax.Array,
@@ -154,7 +155,6 @@ class _BwdTrailingChannelKernel(BwdKernel):
         )
         n_batch_packed_in_channel = n_batch_packed_in_channel if packing else 1
         if packing:
-            packed_batch_size = batch_size // n_batch_packed_in_channel
             x = self._pack_rows(
                 x, n_batch_packed_in_channel
             )  # (packed_batch_size, x_dim, k*channel == 128)

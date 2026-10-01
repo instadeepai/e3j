@@ -24,5 +24,5 @@ def set_ram_limits():
         print(f"INFO: Setting RAM limits to ({soft_limit}, {hard_limit})")
 
         resource.setrlimit(resource.RLIMIT_AS, (soft_limit, hard_limit))
-    except:
+    except Exception:
         print("INFO: Could not set container RAM limits")

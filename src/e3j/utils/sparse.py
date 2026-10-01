@@ -130,7 +130,7 @@ class SparseMixin:
             raise RuntimeError(
                 f"Unknown aggregation method {value}, available options are:\n"
                 f"{list(options.Aggregation)}"
-            )
+            ) from err
 
     @cached_property
     def target_matrix(self) -> sparse.BCOO | np.ndarray:

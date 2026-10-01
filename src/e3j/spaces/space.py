@@ -66,7 +66,7 @@ IrrepT = TypeVar("IrrepT", bound=Irrep)
 class Space(abc.ABC):
     """Base class for G-representations, a.k.a. G-spaces."""
 
-    _array_type: ClassVar[type["Array"]]
+    _array_type: ClassVar[type["Array"]]  # noqa: F821
 
     @property
     @abc.abstractmethod

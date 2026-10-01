@@ -15,7 +15,7 @@
 import importlib.util
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -125,7 +125,7 @@ class config(Config):
 
     def __init__(self, **kwargs):
         # Global state is created and seeded in __new__; nothing to do here.
-        return None
+        pass
 
     @classmethod
     def _default_backend_config(cls) -> Config:

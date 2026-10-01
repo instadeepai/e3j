@@ -1,0 +1,19 @@
+[flake8]
+max-line-length = 127
+exclude = docs/*.py
+
+# Deliberate: conflicts with black, or accepts `l` and math-style names.
+# The rest is pre-existing style debt; drop a code once the tree is clean.
+extend-ignore =
+    E203, E501, E741, W503, CCR001, C401, C408, N801, N803, N806,
+    A001, A005, C400, E301, E704, E713, E721, E722, E731, F401, F541,
+    N802, N804, PT004, PT006, PT011, PT018, PT028
+
+# Only false positives remain; every real finding is fixed.
+per-file-ignores =
+    # @pl.when/@pl.loop trace inside the iteration that binds the loop variable.
+    src/e3j/pallas_ops/convolution/mosaic_tpu/common.py:B023
+    # `@cache` here is e3j.utils.cache, not functools.cache.
+    src/e3j/core/bigotimes.py:B019
+    src/e3j/core/convolution.py:B019
+    src/e3j/utils/sparse.py:B019
