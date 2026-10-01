@@ -103,3 +103,15 @@ class TestPowerExpansionSP2SPLmax(_TestPowerExpansion):
     exponent = 2
     keep_ir_out = None
     l_max = 2
+
+
+class TestPowerExpansionSP3SPLmax(_TestPowerExpansion):
+    """l_max strictly below source.l_max * exponent: catches l_max being
+    ignored on the final power when target_filter is None (regression test
+    for PowerExpansion l-max ignored bug).
+    """
+
+    source = "0e + 1o"
+    exponent = 3
+    keep_ir_out = None
+    l_max = 1

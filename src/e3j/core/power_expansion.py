@@ -90,7 +90,10 @@ class PowerExpansion:
         """Filter applied to the final, full-exponent output."""
         if self.target_filter is not None:
             return self.target_filter
-        return irrep_range(self.source.l_max * self.exponent, True)
+        l_max = self.source.l_max * self.exponent
+        if self.l_max is not None:
+            l_max = min(l_max, self.l_max)
+        return irrep_range(l_max, True)
 
     def _reachable_filter(self, power: int) -> O3Space:
         """Irreps at `power` that can still contribute to the final output.
