@@ -25,12 +25,16 @@ class TensorProduct(Enum):
         DENSE: Evaluate via `einsum` on dense CG coefficient array.
         FUSED_CUDA: Dispatch to custom CUDA kernel via XLA-FFI (requires `e3j_ops`).
         FUSED_MOSAIC_TPU: Dispatch to the Pallas Mosaic TPU kernel.
+        FUSED_MOSAIC_GPU: Dispatch to the Pallas Mosaic GPU kernel,
+            ``TRAILING_CHANNELS`` layout, `OUTER` and `MAP` modes. Targets
+            Hopper (sm_90) and newer.
     """
 
     UNFUSED = "UNFUSED"
     DENSE = "DENSE"
     FUSED_CUDA = "FUSED_CUDA"
     FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
+    FUSED_MOSAIC_GPU = "FUSED_MOSAIC_GPU"
 
 
 class Aggregation(Enum):

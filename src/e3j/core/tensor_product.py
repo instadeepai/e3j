@@ -29,7 +29,9 @@ import e3j.utils as utils
 from e3j.ops import CUDATensorProductParams, tensor_product
 from e3j.ops.coef import Coef, resolve_val_dtype
 from e3j.pallas_ops.tensor_product import (
+    PallasMosaicGPUTensorProductParams,
     PallasMosaicTPUTensorProductParams,
+    tensor_product_pallas_mosaic_gpu,
     tensor_product_pallas_mosaic_tpu,
 )
 from e3j.spaces import O3Space
@@ -63,6 +65,7 @@ class TensorProduct(SparseMixin):
     .. code:: python
 
         e3j.config(tensor_product="FUSED_CUDA")         # CUDA
+        e3j.config(tensor_product="FUSED_MOSAIC_GPU")   # Pallas MGPU (sm_90+)
         e3j.config(tensor_product="FUSED_MOSAIC_TPU")   # Pallas MTPU
         e3j.config(tensor_product="UNFUSED")            # plain JAX, all platforms
     """
@@ -382,6 +385,38 @@ class TensorProduct(SparseMixin):
         params = self._mtpu_params(coef)
         return tensor_product_pallas_mosaic_tpu(x, y, params)
 
+    def _mgpu_params(self, coef: sparse.BCOO | None = None):
+        """Build Pallas Mosaic GPU kernel parameters from this tensor product.
+
+        As on Mosaic TPU, the kernels unroll the Clebsch-Gordan structure
+        statically from the COO `(idx, coef)` arrays, so those are materialized
+        as concrete numpy arrays at trace time.
+        """
+        if coef is None:
+            coef = self.coef
+        if self.mode not in (options.MixingMode.OUTER, options.MixingMode.MAP):
+            raise NotImplementedError(
+                f"Mosaic GPU tensor product does not support mode {self.mode}; "
+                "use 'OUTER' or 'MAP'."
+            )
+        with jax.ensure_compile_time_eval():
+            idx = numpy.asarray(coef.indices)
+            val = numpy.asarray(coef.data)
+        return PallasMosaicGPUTensorProductParams(
+            indices=idx,
+            values=val,
+            layout=self.layout,
+            mode=self.mode,
+            x_space=self.source[0],
+            y_space=self.source[1],
+            z_space=self.target,
+        )
+
+    def _mgpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
+        """Evaluate bilinear map via the Pallas Mosaic GPU kernel."""
+        params = self._mgpu_params(coef)
+        return tensor_product_pallas_mosaic_gpu(x, y, params)
+
     def __call__(self, x: Array, y: Array, coef: Array | None = None) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         # Only load coefficients from `self` if not passed explicitly
@@ -396,6 +431,8 @@ class TensorProduct(SparseMixin):
                 return self._fused_eval(x, y, coef)
             case options.TensorProduct.FUSED_MOSAIC_TPU:
                 return self._mtpu_eval(x, y, coef)
+            case options.TensorProduct.FUSED_MOSAIC_GPU:
+                return self._mgpu_eval(x, y, coef)
             case options.TensorProduct.UNFUSED:
                 return self._sparse_eval(x, y, coef)
         raise ValueError(f"Unrecognized tensor product option: {impl}")

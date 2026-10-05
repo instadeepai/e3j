@@ -360,11 +360,10 @@ def _receiver_grouped_body(
     node = jax.lax.axis_index(NODE_AXIS)
     first_edge = plgpu.load(offsets_gmem.at[node])
     last_edge = plgpu.load(offsets_gmem.at[node + 1])
-    with jax.named_scope("copy_ct"):
-        plgpu.copy_gmem_to_smem(
-            ct_gmem.at[pl.ds(node, 1), :, plan.channel_slice], ct_smem, node_barrier
-        )
-        plgpu.barrier_wait(node_barrier)
+    plgpu.copy_gmem_to_smem(
+        ct_gmem.at[pl.ds(node, 1), :, plan.channel_slice], ct_smem, node_barrier
+    )
+    plgpu.barrier_wait(node_barrier)
     zero_row = plan.zero_row()
 
     def edge_body(indices, x_smem, y_smem, s_smem):

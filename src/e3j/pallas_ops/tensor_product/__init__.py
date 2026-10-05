@@ -27,3 +27,34 @@ __all__ = [
     "PallasMosaicTPUTensorProductParamsBwdConfig",
     "tensor_product_pallas_mosaic_tpu",
 ]
+
+# Mosaic GPU is unavailable on jaxlib builds without CUDA support, and this
+# module is imported unconditionally by `e3j.core`. Keep `import e3j` working
+# there by exposing stubs that fail only when actually used, as
+# `pallas_ops.convolution` does.
+try:
+    from e3j.pallas_ops.tensor_product.mosaic_gpu import (  # noqa: F401
+        PallasMosaicGPUTensorProductParams,
+        PallasMosaicGPUTensorProductParamsBwdConfig,
+        PallasMosaicGPUTensorProductParamsFwdConfig,
+        tensor_product_pallas_mosaic_gpu,
+    )
+except ImportError as exc:  # pragma: no cover - depends on the jaxlib build
+    _MOSAIC_GPU_IMPORT_ERROR = exc
+
+    def _mosaic_gpu_unavailable(*_args, **_kwargs):
+        raise NotImplementedError(
+            "Pallas Mosaic GPU is unavailable in this jaxlib build"
+        ) from _MOSAIC_GPU_IMPORT_ERROR
+
+    PallasMosaicGPUTensorProductParams = _mosaic_gpu_unavailable  # type: ignore[assignment]
+    PallasMosaicGPUTensorProductParamsFwdConfig = _mosaic_gpu_unavailable  # type: ignore[assignment]
+    PallasMosaicGPUTensorProductParamsBwdConfig = _mosaic_gpu_unavailable  # type: ignore[assignment]
+    tensor_product_pallas_mosaic_gpu = _mosaic_gpu_unavailable  # type: ignore[assignment]
+
+__all__ += [
+    "PallasMosaicGPUTensorProductParams",
+    "PallasMosaicGPUTensorProductParamsFwdConfig",
+    "PallasMosaicGPUTensorProductParamsBwdConfig",
+    "tensor_product_pallas_mosaic_gpu",
+]
