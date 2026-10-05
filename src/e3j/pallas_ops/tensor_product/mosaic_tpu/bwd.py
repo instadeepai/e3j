@@ -91,7 +91,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
     ----------
     A single `pallas_call` runs over a megacore grid of `tpu_info.num_cores`
     with PARALLEL semantics, with all operands and outputs living in HBM.
-    Inside each program, `emit_pipeline` walks a grid of `num_blocks` batch
+    Inside each program, `emit_pipeline` walks a grid of `n_batch_blocks` batch
     tiles of `batch_block_size` rows each. `core_axis=0` distributes tiles
     across cores, `batch_block_size` is chosen to fit the double-buffered VMEM
     working set, see `_vmem_bytes_per_batch_element`. `emit_pipeline`
@@ -198,7 +198,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
             vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
             override=bwd_config.batch_block_size,
         )
-        num_blocks = kernel_batch // batch_block_size
+        n_batch_blocks = kernel_batch // batch_block_size
 
         def bwd_kernel(dz_ref, x_ref, y_ref, dx_ref, dy_ref):
             def body(dz_vmem, x_vmem_src, y_vmem, dx_vmem, dy_vmem):
@@ -242,7 +242,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
 
             pltpu.emit_pipeline(
                 body,
-                grid=(num_blocks,),
+                grid=(n_batch_blocks,),
                 in_specs=[
                     pl.BlockSpec(
                         block_shape=(

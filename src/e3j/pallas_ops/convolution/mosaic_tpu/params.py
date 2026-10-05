@@ -26,12 +26,13 @@ from e3j.utils import options
 
 
 class PallasMosaicTPUMessagePassingConvolutionFwdConfig(BaseModel, frozen=True):
-    batch_block_size: int | None = None  # None => auto-fit to the VMEM budget
+    edge_block_size: int | None = None  # None => auto-fit to the VMEM budget
     assume_receiver_sorted: bool = False
 
 
 class PallasMosaicTPUMessagePassingConvolutionBwdConfig(BaseModel, frozen=True):
-    batch_block_size: int | None = None  # None => auto-fit to the VMEM budget
+    edge_block_size: int | None = None  # None => auto-fit to the VMEM budget
+    channel_block: int | None = None
     assume_sender_sorted: bool = False
 
 

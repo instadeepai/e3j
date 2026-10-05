@@ -23,8 +23,8 @@ from e3j.pallas_ops.convolution.mosaic_tpu.padding import block_order
 BLOCK = 4
 
 
-def _order(edge_is_real, n_blocks=4, block=BLOCK):
-    order, walked = block_order(jnp.asarray(edge_is_real, bool), n_blocks, block)
+def _order(edge_is_real, n_batch_blocks=4, block=BLOCK):
+    order, walked = block_order(jnp.asarray(edge_is_real, bool), n_batch_blocks, block)
     return numpy.asarray(order), int(walked)
 
 

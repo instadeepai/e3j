@@ -26,14 +26,14 @@ from jax import Array, lax
 from e3j.data.graph import is_dummy_edge
 
 
-def block_order(edge_is_real: Array, n_blocks: int, batch_block_size: int) -> tuple:
+def block_order(edge_is_real: Array, n_edge_blocks: int, edge_block_size: int) -> tuple:
     """Return the edge blocks with those holding a real edge first, and how many."""
     is_real_per_slot = jnp.pad(
-        edge_is_real, (0, n_blocks * batch_block_size - edge_is_real.size)
+        edge_is_real, (0, n_edge_blocks * edge_block_size - edge_is_real.size)
     )
-    block_holds_real_edge = is_real_per_slot.reshape(n_blocks, batch_block_size).any(
-        axis=1
-    )
+    block_holds_real_edge = is_real_per_slot.reshape(
+        n_edge_blocks, edge_block_size
+    ).any(axis=1)
     return (
         jnp.argsort(~block_holds_real_edge, stable=True).astype(jnp.int32),
         jnp.count_nonzero(block_holds_real_edge),
@@ -41,7 +41,7 @@ def block_order(edge_is_real: Array, n_blocks: int, batch_block_size: int) -> tu
 
 
 def core_edge_bounds(
-    block_order: Array, n_walked_blocks: Array, num_cores: int, batch_block_size: int
+    block_order: Array, n_walked_blocks: Array, num_cores: int, edge_block_size: int
 ) -> tuple[Array, Array]:
     """Return the first and last edge slot each core walks, as `(num_cores,)` pairs.
 
@@ -56,8 +56,8 @@ def core_edge_bounds(
     first_block = block_order[offset]
     last_block = block_order[jnp.maximum(offset + walked - 1, 0)]
     return (
-        first_block * batch_block_size,
-        last_block * batch_block_size + (batch_block_size - 1),
+        first_block * edge_block_size,
+        last_block * edge_block_size + (edge_block_size - 1),
     )
 
 

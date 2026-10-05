@@ -78,7 +78,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
     ----------
     A single `pallas_call` runs over a megacore grid of `tpu_info.num_cores` with
     PARALLEL semantics, with both operands and the output living in HBM. Inside
-    each program, `emit_pipeline` walks a grid of `num_blocks` batch tiles of
+    each program, `emit_pipeline` walks a grid of `n_batch_blocks` batch tiles of
     `batch_block_size` rows each (`core_axis=0` distributes tiles across cores;
     `batch_block_size` is chosen to fit the double-buffered VMEM working set, see
     `_vmem_bytes_per_batch_element`). emit_pipeline double-buffers the x / y / z
@@ -174,7 +174,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
             num_kernel=num_kernel,
             override=config.batch_block_size,
         )
-        num_blocks = batch_size // batch_block_size
+        n_batch_blocks = batch_size // batch_block_size
 
         def tp_kernel(x, y, z):
             def body(x_vmem_src, y_vmem_src, z_vmem_src):
@@ -209,7 +209,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
 
             pltpu.emit_pipeline(
                 body,
-                grid=(num_blocks,),
+                grid=(n_batch_blocks,),
                 in_specs=[
                     pl.BlockSpec(
                         block_shape=(batch_block_size, x_dim_padded, channels_padded),

@@ -29,6 +29,12 @@ from jax.sharding import Mesh
 
 from e3j.core.convolution import Convolution
 from e3j.data.graph import GraphCSR
+from e3j.pallas_ops.convolution.mosaic_tpu import (
+    PallasMosaicTPUMessagePassingConvolutionBwdConfig,
+    PallasMosaicTPUMessagePassingConvolutionFwdConfig,
+    PallasMosaicTPUMessagePassingConvolutionParams,
+    convolution_mosaic_tpu,
+)
 from e3j.spaces import O3Space
 from e3j.utils import config, options
 from e3j.utils.options import Layout
@@ -48,6 +54,7 @@ CASES = [
     # l_max=3 (dense + packed)
     ("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128),
     ("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 32),
+    ("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 256),
 ]
 CASE_IDS = [f"{x}__channels{m}" for x, _, _, m in CASES]
 
@@ -752,3 +759,52 @@ def test_end_to_end_position_gradient_matches(x_ir, y_ir, o_ir, channels):
         lambda p: jnp.sum(fused(node, Y(p), radial(p), senders, receivers) ** 2)
     )(positions)
     assert _rel(d_pos_fused, autodiff) < 1e-3
+
+
+@pytest.mark.parametrize("channel_block", [256, 128])
+def test_backward_channel_strides_match_unfused(channel_block):
+    """The bwd may walk the edges once per channel slice; every split must agree."""
+    irreps, channels = "0e + 1o + 2e", 256
+    conv = Convolution(
+        source=(O3Space(irreps), O3Space(irreps)),
+        target=O3Space(irreps),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    node, sph, es, senders, receivers = _contract_valid_inputs(
+        conv, n_nodes=8, channels=channels
+    )
+    coef = conv._otimes.coef
+    params = PallasMosaicTPUMessagePassingConvolutionParams(
+        indices=np.array(coef.indices),
+        values=np.array(coef.data),
+        layout=options.Layout.TRAILING_CHANNELS,
+        x_space=O3Space(str(conv._otimes.source[0])),
+        y_space=O3Space(str(conv._otimes.source[1])),
+        z_space=O3Space(str(conv._otimes.target)),
+        fwd_config=PallasMosaicTPUMessagePassingConvolutionFwdConfig(
+            assume_receiver_sorted=True
+        ),
+        bwd_config=PallasMosaicTPUMessagePassingConvolutionBwdConfig(
+            assume_sender_sorted=True, channel_block=channel_block
+        ),
+    )
+
+    def strided(n, s, e):
+        return convolution_mosaic_tpu(n, s, e, senders, receivers, params)
+
+    gradients = jax.grad(lambda n, s, e: jnp.sum(strided(n, s, e) ** 2), (0, 1, 2))(
+        node, sph, es
+    )
+    expected = jax.grad(
+        lambda n, s, e: jnp.sum(conv._unfused_eval(n, s, e, senders, receivers) ** 2),
+        (0, 1, 2),
+    )(node, sph, es)
+    for name, got, want in zip(
+        ("d_node_feats", "d_sph", "d_edge_scalars"), gradients, expected
+    ):
+        assert (
+            _rel(got, want) < RTOL
+        ), f"{name} mismatch at channel_block={channel_block}"

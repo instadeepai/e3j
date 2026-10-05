@@ -20,7 +20,7 @@ closes the open group's segment, accumulates and flushes it.
 """
 
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +45,7 @@ class FlushBuffers(NamedTuple):
     semaphore: pltpu.SemaphoreType  # DMA semaphore for the async flush
     boundary_hbm: pl.MemoryRef  # (num_cores, 2, planes, width): straddling groups
     flush_count: pl.MemoryRef  # (1,) i32: flushes done by this core
+    channel_slice: Any = slice(None)  # channel range this pass owns, full by default
 
 
 def make_group_flush(bufs: FlushBuffers, core_id):
@@ -60,10 +61,17 @@ def make_group_flush(bufs: FlushBuffers, core_id):
     core boundary. A core's first-closed and final groups are the only ones that
     can be shared with a neighbour, and those two go to `boundary_hbm[core_id,
     {0,1}]` for the caller to add back.
+
+    Every destination is narrowed to `channel_slice`, so a caller that walks the
+    edge list once per channel stride writes each pass into its own slice of the
+    same full-width buffers.
     """
 
     def _dst(row):
-        return bufs.dst_hbm.at[pl.ds(row, 1), :, :]
+        return bufs.dst_hbm.at[pl.ds(row, 1), :, bufs.channel_slice]
+
+    def _boundary(slot):
+        return bufs.boundary_hbm.at[core_id].at[pl.ds(slot, 1), :, bufs.channel_slice]
 
     def _wait_inflight():
         # any destination of the same shape settles the same byte count
@@ -83,7 +91,7 @@ def make_group_flush(bufs: FlushBuffers, core_id):
         if final:
             # the still-open group at the core's last edge: may continue into the
             # next core, so it is a partial and never written in place.
-            _start(bufs.boundary_hbm.at[core_id].at[pl.ds(1, 1), :, :])
+            _start(_boundary(1))
         else:
             is_first = bufs.flush_count[0] == jnp.int32(0)
             bufs.flush_count[0] = bufs.flush_count[0] + jnp.int32(1)
@@ -92,7 +100,7 @@ def make_group_flush(bufs: FlushBuffers, core_id):
             def _first_group_is_partial():
                 # opened before this core's first edge: may continue the previous
                 # core's final group.
-                _start(bufs.boundary_hbm.at[core_id].at[pl.ds(0, 1), :, :])
+                _start(_boundary(0))
 
             @pl.when(jnp.logical_not(is_first))
             def _interior_group_owns_its_row():
