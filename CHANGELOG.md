@@ -6,12 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-10-05
+
 ### Added
+
 - Mosaic GPU convolution kernels, differentiable to any order.
 - Mosaic GPU tensor product kernels, differentiable to any order.
+- Mosaic TPU fused convolution kernels support `mul > 128`, in both the
+  forward and backward passes.
+
+### Fixed
+
+- `PowerExpansion` ignored `l_max` on the final power when no `target_filter`
+  was given.
+- Mosaic TPU convolution backward returned zero gradients when jitted on TPU v4
+  with libtpu >= 0.0.42 (jax-ml/jax#39744).
 
 ### Changed
+
 - Python 3.12 is now the minimum supported version.
+- `PowerExpansion.filter_layers` and `PowerExpansion.otimes_layers` are now
+  cached properties instead of methods: drop the call parentheses.
+- Mosaic TPU tensor product: faster `l_max=2` MAP/OUTER paths through a
+  dim-leading layout.
 
 ## [0.1.1] — 2026-09-24
 
