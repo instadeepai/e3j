@@ -395,8 +395,14 @@ def _num_partitions(compiled) -> int:
     return int(match.group(1))
 
 
-def _assert_input_sharded(compiled, batch, channels) -> None:
-    x_operand = r"f32\[%d,\d+,%d\]" % (batch, channels)  # (batch, x_dim, channels)
+def _x_operand(batch, channels, dim_leading) -> str:
+    if dim_leading:
+        return r"f32\[\d+,%d,%d\]" % (batch, channels)  # (x_dim, batch, channels)
+    return r"f32\[%d,\d+,%d\]" % (batch, channels)  # (batch, x_dim, channels)
+
+
+def _assert_input_sharded(compiled, batch, channels, dim_leading=False) -> None:
+    x_operand = _x_operand(batch, channels, dim_leading)
     pattern = (
         r'custom_call_target="tpu_custom_call", operand_layout_constraints=\{'
         + x_operand
@@ -407,8 +413,8 @@ def _assert_input_sharded(compiled, batch, channels) -> None:
     ), f"expected a sharded tpu_custom_call matching {pattern!r}\n\n{hlo}"
 
 
-def _assert_grad_sharded(compiled, batch, channels) -> None:
-    dx = r"f32\[%d,\d+,%d\]" % (batch, channels)  # (batch, x_dim, channels)
+def _assert_grad_sharded(compiled, batch, channels, dim_leading=False) -> None:
+    dx = _x_operand(batch, channels, dim_leading)
     pattern = r"= \(" + dx + r'.+?custom_call_target="tpu_custom_call"'
     hlo = compiled.as_text()
     assert re.search(
@@ -467,8 +473,10 @@ def test_vmap_precompiles_device_free(in1, in2, out, channels, batch: int = 128)
     assert _num_partitions(fwd) == v
     assert _num_partitions(grad) == v
     shard_batch, shard_channels = _packed_shard_dims(batch, channels)
-    _assert_input_sharded(fwd, shard_batch, shard_channels)
-    _assert_grad_sharded(grad, shard_batch, shard_channels)
+    # mirrors the OUTER kernels' dim-leading gate
+    dim_leading = x_dim % 8 != 0 and channels % 128 == 0
+    _assert_input_sharded(fwd, shard_batch, shard_channels, dim_leading)
+    _assert_grad_sharded(grad, shard_batch, shard_channels, dim_leading)
 
 
 def test_vmap_multidevice_indivisible_batch_raises(channels: int = 128):

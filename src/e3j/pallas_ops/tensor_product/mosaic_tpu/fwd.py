@@ -102,6 +102,8 @@ class _FwdTrailingChannelKernel(FwdKernel):
     We take advantage of this layout of z in the backward pass see _BwdTrailingChannelKernel.
     """
 
+    _DIM_LEADING = False
+
     def __call__(
         self,
         x: jax.Array,
@@ -110,6 +112,9 @@ class _FwdTrailingChannelKernel(FwdKernel):
     ) -> jax.Array:
         config = params.fwd_config or PallasMosaicTPUTensorProductParamsFwdConfig()
         x_origin_shape = x.shape
+        dim_leading = (
+            self._DIM_LEADING and x.shape[-2] % 8 != 0 and x.shape[-1] % 128 == 0
+        )
         assert (
             len(x_origin_shape) == 3
         ), f"x must be (batch, x_dim, channel), got {x.shape}"
@@ -124,7 +129,8 @@ class _FwdTrailingChannelKernel(FwdKernel):
             128 // num_channels if num_channels < 128 and 128 % num_channels == 0 else 1
         )
         packing = (
-            n_batch_packed_in_channel >= 4
+            not dim_leading
+            and n_batch_packed_in_channel >= 4
             and original_batch % n_batch_packed_in_channel == 0
             and (original_batch // n_batch_packed_in_channel) % num_kernel == 0
         )
@@ -141,15 +147,19 @@ class _FwdTrailingChannelKernel(FwdKernel):
                 original_batch // n_batch_packed_in_channel,
             )
 
-        x = pad_for_tpu(x)
-        y = pad_for_tpu(y)
-        x_dim_padded = x.shape[1]
-        channels_padded = x.shape[-1]
+        if dim_leading:
+            x = pad_for_tpu(jnp.transpose(x, (1, 0, 2)))
+            y = self._orient_y_dim_leading(y)
+            x_dim_padded = x.shape[0]
+            channels_padded = x.shape[-1]
+            batch_size = x.shape[1]
+        else:
+            x = pad_for_tpu(x)
+            y = pad_for_tpu(y)
+            x_dim_padded = x.shape[1]
+            channels_padded = x.shape[-1]
+            batch_size = x.shape[0]
         z_dim = params.z_space.dim
-
-        # After packing, x is (packed_batch_size, x_dim, 128)
-        # the kernel's batch is packed_batch_size.
-        batch_size = x.shape[0]
 
         cg_by_zi = group_coef_by_zi(params.indices, params.values)
         cg_groups = tuple(
@@ -159,9 +169,19 @@ class _FwdTrailingChannelKernel(FwdKernel):
         yis = frozenset(yi for _, contribs in cg_groups for _, yi, _ in contribs)
         total_contribs = sum(len(contribs) for _, contribs in cg_groups)
 
-        batch_block_size = select_batch_block_size(
-            batch_size=batch_size,
-            vmem_bytes_per_batch_element=self._vmem_bytes_per_batch_element(
+        if dim_leading:
+            vmem_bytes = (
+                2
+                * x.dtype.itemsize
+                * ((x_dim_padded + z_dim) * channels_padded + y.size // batch_size)
+                + 4 * channels_padded * (len(yis) + 1)
+                + _SPILL_BYTES_PER_CONTRIB
+                * channels_padded
+                * x.dtype.itemsize
+                * total_contribs
+            )
+        else:
+            vmem_bytes = self._vmem_bytes_per_batch_element(
                 x_dim_padded,
                 channels_padded,
                 y,
@@ -169,7 +189,10 @@ class _FwdTrailingChannelKernel(FwdKernel):
                 len(yis),
                 total_contribs,
                 x.dtype.itemsize,
-            ),
+            )
+        batch_block_size = select_batch_block_size(
+            batch_size=batch_size,
+            vmem_bytes_per_batch_element=vmem_bytes,
             vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
             num_kernel=num_kernel,
             override=config.batch_block_size,
@@ -178,17 +201,22 @@ class _FwdTrailingChannelKernel(FwdKernel):
 
         def tp_kernel(x, y, z):
             def body(x_vmem_src, y_vmem_src, z_vmem_src):
-                with named_scope("x_vmem transpose"):
-                    # Transpose x to (x_dim, batch_block_size, channel) for better memory access in the kernel.
-                    x_vmem = jax.lax.transpose(x_vmem_src[...], (1, 0, 2))
-                with named_scope("preload_y"):
-                    pre_y_vmem = self.preload_y(
-                        y_vmem_src,
-                        yis,
-                        batch_block_size,
-                        channels_padded,
-                        self._n_batch_packed_in_channel,
+                if dim_leading:
+                    x_vmem = x_vmem_src[...]
+                    pre_y_vmem = self._load_y_dim_leading(
+                        y_vmem_src, yis, batch_block_size, channels_padded
                     )
+                else:
+                    with named_scope("x_vmem transpose"):
+                        x_vmem = jax.lax.transpose(x_vmem_src[...], (1, 0, 2))
+                    with named_scope("preload_y"):
+                        pre_y_vmem = self.preload_y(
+                            y_vmem_src,
+                            yis,
+                            batch_block_size,
+                            channels_padded,
+                            self._n_batch_packed_in_channel,
+                        )
                 for zi, contributions in cg_groups:
                     with named_scope(f"zi:{zi}"):
                         with named_scope(f"create acc"):
@@ -210,18 +238,38 @@ class _FwdTrailingChannelKernel(FwdKernel):
             pltpu.emit_pipeline(
                 body,
                 grid=(n_batch_blocks,),
-                in_specs=[
-                    pl.BlockSpec(
-                        block_shape=(batch_block_size, x_dim_padded, channels_padded),
-                        index_map=lambda i: (i, 0, 0),
-                    ),
-                    pl.BlockSpec(
-                        block_shape=self.y_block_shape(
-                            y.shape, batch_block_size, channels_padded
+                in_specs=(
+                    [
+                        pl.BlockSpec(
+                            block_shape=(
+                                x_dim_padded,
+                                batch_block_size,
+                                channels_padded,
+                            ),
+                            index_map=lambda i: (0, i, 0),
                         ),
-                        index_map=self.y_index_map,
-                    ),
-                ],
+                        self._y_blockspec_dim_leading(
+                            y, batch_block_size, channels_padded
+                        ),
+                    ]
+                    if dim_leading
+                    else [
+                        pl.BlockSpec(
+                            block_shape=(
+                                batch_block_size,
+                                x_dim_padded,
+                                channels_padded,
+                            ),
+                            index_map=lambda i: (i, 0, 0),
+                        ),
+                        pl.BlockSpec(
+                            block_shape=self.y_block_shape(
+                                y.shape, batch_block_size, channels_padded
+                            ),
+                            index_map=self.y_index_map,
+                        ),
+                    ]
+                ),
                 out_specs=pl.BlockSpec(
                     block_shape=(z_dim, batch_block_size, channels_padded),
                     index_map=lambda i: (0, i, 0),
@@ -258,7 +306,10 @@ class _FwdTrailingChannelKernel(FwdKernel):
 
         # transpose(1,0,2) is a free bitcast: {2,1,0} on (z_dim,batch,channel)
         # becomes {2,0,1} on (batch,z_dim,channel) — no data movement.
-        return tmp.transpose(1, 0, 2)[:, :, :num_channels]
+        result = tmp.transpose(1, 0, 2)[:, :, :num_channels]
+        if dim_leading:
+            result = result[:original_batch]
+        return result
 
     @staticmethod
     def _pack_x(
@@ -337,6 +388,30 @@ class _FwdTrailingChannelKernel(FwdKernel):
 class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
     """OUTER (y_channel=1): y is (batch, y_dim); broadcasts over x's channel axis."""
 
+    _DIM_LEADING = True
+
+    def _orient_y_dim_leading(self, y: jax.Array) -> jax.Array:
+        return pad_for_tpu(y)
+
+    def _y_blockspec_dim_leading(
+        self, y: jax.Array, batch_block_size: int, channels: int
+    ) -> pl.BlockSpec:
+        return pl.BlockSpec(
+            block_shape=(batch_block_size, y.shape[1]), index_map=lambda i: (i, 0)
+        )
+
+    def _load_y_dim_leading(
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        batch_block_size: int,
+        channels: int,
+    ) -> dict[int, jax.Array]:
+        return {
+            yi: jnp.broadcast_to(y_vmem[:, yi][:, None], (batch_block_size, channels))
+            for yi in yis
+        }
+
     def _validate_y(self, x: jax.Array, y: jax.Array) -> None:
         assert (
             len(y.shape) == 2
@@ -401,6 +476,28 @@ class _FwdTrailingChannelOuterKernel(_FwdTrailingChannelKernel):
 
 class _FwdTrailingChannelMapKernel(_FwdTrailingChannelKernel):
     """MAP: y is (batch, y_dim, channel); elementwise over the channel axis."""
+
+    _DIM_LEADING = True
+
+    def _orient_y_dim_leading(self, y: jax.Array) -> jax.Array:
+        return pad_for_tpu(jnp.transpose(y, (1, 0, 2)))
+
+    def _y_blockspec_dim_leading(
+        self, y: jax.Array, batch_block_size: int, channels: int
+    ) -> pl.BlockSpec:
+        return pl.BlockSpec(
+            block_shape=(y.shape[0], batch_block_size, channels),
+            index_map=lambda i: (0, i, 0),
+        )
+
+    def _load_y_dim_leading(
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        batch_block_size: int,
+        channels: int,
+    ) -> dict[int, jax.Array]:
+        return {yi: y_vmem[yi, :, :] for yi in yis}
 
     def _validate_y(self, x: jax.Array, y: jax.Array) -> None:
         assert (

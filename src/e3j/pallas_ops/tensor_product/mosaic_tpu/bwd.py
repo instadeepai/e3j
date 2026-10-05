@@ -117,6 +117,8 @@ class _BwdTrailingChannelKernel(BwdKernel):
          a per-channel scalar, MAP writes the full `(batch_block_size, num_channels)` vector.
     """
 
+    _DIM_LEADING = False
+
     # Only used for channel=32 as it was slowing down for channel=64
     _PACK_MIN_K = 4
 
@@ -128,6 +130,9 @@ class _BwdTrailingChannelKernel(BwdKernel):
         params: PallasMosaicTPUTensorProductParams,
     ) -> tuple[jax.Array, jax.Array]:
         bwd_config = params.bwd_config or PallasMosaicTPUTensorProductParamsBwdConfig()
+        dim_leading = (
+            self._DIM_LEADING and x.shape[-2] % 8 != 0 and x.shape[-1] % 128 == 0
+        )
 
         assert len(x.shape) == 3, f"x must be (batch, x_dim, channel), got {x.shape}"
         assert (
@@ -149,7 +154,8 @@ class _BwdTrailingChannelKernel(BwdKernel):
             128 // channels if channels < 128 and 128 % channels == 0 else 1
         )
         packing = (
-            n_batch_packed_in_channel >= self._PACK_MIN_K
+            not dim_leading
+            and n_batch_packed_in_channel >= self._PACK_MIN_K
             and batch_size % n_batch_packed_in_channel == 0
             and (batch_size // n_batch_packed_in_channel) % num_kernel == 0
         )
@@ -163,18 +169,25 @@ class _BwdTrailingChannelKernel(BwdKernel):
             )  # (packed_batch_size, out_dim, 128)
             y = self.pack_y(y, n_batch_packed_in_channel)
 
-        x = pad_for_tpu(x)  # (kbatch, x_dim_padded, channel_padded)
-        dz = pad_for_tpu(dz.transpose(1, 0, 2))  # (out_dim, kbatch, channel_padded)
-        y = pad_for_tpu(
-            y
-        )  # OUTER: (kbatch, y_dim_p); MAP: (kbatch, y_dim_p, channel_p)
+        if dim_leading:
+            x = pad_for_tpu(jnp.transpose(x, (1, 0, 2)))
+            y = self._orient_y_dim_leading(y)
+            dz = pad_for_tpu(jnp.transpose(dz, (1, 0, 2)))
+        else:
+            x = pad_for_tpu(x)
+            dz = pad_for_tpu(dz.transpose(1, 0, 2))
+            y = pad_for_tpu(y)
 
-        # After packing the kernel runs on the shrunk batch `packed_batch_size`.
-        kernel_batch = x.shape[0]
-        x_dim_padded = x.shape[1]
         z_dim = dz.shape[0]
-        num_channels_padded = x.shape[2]
-        dy_kernel_shape = self.dy_kernel_shape(y, kernel_batch)
+        num_channels_padded = x.shape[-1]
+        if dim_leading:
+            kernel_batch = x.shape[1]
+            x_dim_padded = x.shape[0]
+            dy_kernel_shape = self._dy_kernel_shape_dim_leading(y, kernel_batch)
+        else:
+            kernel_batch = x.shape[0]
+            x_dim_padded = x.shape[1]
+            dy_kernel_shape = self.dy_kernel_shape(y, kernel_batch)
 
         cg_by_xi = tuple(
             (xi, tuple((oi, yi, v) for oi, yi, v in contribs))
@@ -183,9 +196,13 @@ class _BwdTrailingChannelKernel(BwdKernel):
         yis = frozenset(yi for _, contribs in cg_by_xi for _, yi, _ in contribs)
         yi_used = range(y_dim)
 
-        batch_block_size = select_batch_block_size(
-            batch_size=kernel_batch,
-            vmem_bytes_per_batch_element=self._vmem_bytes_per_batch_element(
+        if dim_leading:
+            vmem_bytes = 2 * x.dtype.itemsize * (
+                (z_dim + 2 * x_dim_padded) * num_channels_padded
+                + 2 * (y.size // kernel_batch)
+            ) + 4 * num_channels_padded * (2 * x_dim_padded + 2 * y_dim + 1)
+        else:
+            vmem_bytes = self._vmem_bytes_per_batch_element(
                 x_dim_padded,
                 num_channels_padded,
                 y,
@@ -193,7 +210,10 @@ class _BwdTrailingChannelKernel(BwdKernel):
                 len(yis),
                 y_dim,
                 x.dtype.itemsize,
-            ),
+            )
+        batch_block_size = select_batch_block_size(
+            batch_size=kernel_batch,
+            vmem_bytes_per_batch_element=vmem_bytes,
             num_kernel=num_kernel,
             vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
             override=bwd_config.batch_block_size,
@@ -202,22 +222,22 @@ class _BwdTrailingChannelKernel(BwdKernel):
 
         def bwd_kernel(dz_ref, x_ref, y_ref, dx_ref, dy_ref):
             def body(dz_vmem, x_vmem_src, y_vmem, dx_vmem, dy_vmem):
-                # dz already (out_dim, batch_block_size, channel); only x needs the in-kernel
-                # transpose so the inner loop can index its leading dim for free.
-                x_vmem = jax.lax.transpose(x_vmem_src[...], (1, 0, 2))
-                pre_broadcast_y = self.preload_y(
-                    y_vmem,
-                    yis,
-                    batch_block_size,
-                    num_channels_padded,
-                    n_batch_packed_in_channel,
-                )
+                if dim_leading:
+                    x_vmem = x_vmem_src[...]
+                    pre_broadcast_y = self._load_y_dim_leading(
+                        y_vmem, yis, batch_block_size, num_channels_padded
+                    )
+                else:
+                    x_vmem = jax.lax.transpose(x_vmem_src[...], (1, 0, 2))
+                    pre_broadcast_y = self.preload_y(
+                        y_vmem,
+                        yis,
+                        batch_block_size,
+                        num_channels_padded,
+                        n_batch_packed_in_channel,
+                    )
                 zero = jnp.zeros((batch_block_size, num_channels_padded), jnp.float32)
-                # Per-yi (batch_block_size, channel) accumulators. In OUTER they're reduced over
-                # the channel axis before store; in MAP they're written out directly.
                 dy_acc = {yi: zero for yi in yi_used}
-                # Per-xi dx rows assembled in (x_dim, batch_block_size, channel) order, then
-                # transposed once to the output's (batch_block_size, x_dim, channel) layout.
                 dx_rows = [zero] * x_dim_padded
 
                 for xi, contributions in cg_by_xi:
@@ -230,53 +250,73 @@ class _BwdTrailingChannelKernel(BwdKernel):
                         dy_acc[yi] = dy_acc[yi] + x_slice * vdz
                     dx_rows[xi] = acc_dx
 
-                dx_block = jnp.stack(
-                    dx_rows, axis=0
-                )  # (x_dim, batch_block_size, channel)
-                dx_vmem[...] = jax.lax.transpose(dx_block, (1, 0, 2)).astype(
-                    dx_vmem.dtype
-                )
-
-                for yi in yi_used:
-                    self.write_dy(dy_vmem, yi, dy_acc[yi], n_batch_packed_in_channel)
+                dx_block = jnp.stack(dx_rows, axis=0)
+                if dim_leading:
+                    dx_vmem[...] = dx_block.astype(dx_vmem.dtype)
+                    for yi in yi_used:
+                        self._store_dy_dim_leading(dy_vmem, yi, dy_acc[yi])
+                else:
+                    dx_vmem[...] = jax.lax.transpose(dx_block, (1, 0, 2)).astype(
+                        dx_vmem.dtype
+                    )
+                    for yi in yi_used:
+                        self.write_dy(
+                            dy_vmem, yi, dy_acc[yi], n_batch_packed_in_channel
+                        )
 
             pltpu.emit_pipeline(
                 body,
                 grid=(n_batch_blocks,),
                 in_specs=[
                     pl.BlockSpec(
-                        block_shape=(
-                            z_dim,
-                            batch_block_size,
-                            num_channels_padded,
-                        ),
+                        block_shape=(z_dim, batch_block_size, num_channels_padded),
                         index_map=lambda i: (0, i, 0),
                     ),
                     pl.BlockSpec(
                         block_shape=(
-                            batch_block_size,
-                            x_dim_padded,
-                            num_channels_padded,
+                            (x_dim_padded, batch_block_size, num_channels_padded)
+                            if dim_leading
+                            else (batch_block_size, x_dim_padded, num_channels_padded)
                         ),
-                        index_map=lambda i: (i, 0, 0),
+                        index_map=(
+                            (lambda i: (0, i, 0))
+                            if dim_leading
+                            else (lambda i: (i, 0, 0))
+                        ),
                     ),
-                    pl.BlockSpec(
-                        block_shape=self.y_block_shape(y, batch_block_size),
-                        index_map=self.y_index_map,
+                    (
+                        self._y_blockspec_dim_leading(
+                            y, batch_block_size, num_channels_padded
+                        )
+                        if dim_leading
+                        else pl.BlockSpec(
+                            block_shape=self.y_block_shape(y, batch_block_size),
+                            index_map=self.y_index_map,
+                        )
                     ),
                 ],
                 out_specs=[
                     pl.BlockSpec(
                         block_shape=(
-                            batch_block_size,
-                            x_dim_padded,
-                            num_channels_padded,
+                            (x_dim_padded, batch_block_size, num_channels_padded)
+                            if dim_leading
+                            else (batch_block_size, x_dim_padded, num_channels_padded)
                         ),
-                        index_map=lambda i: (i, 0, 0),
+                        index_map=(
+                            (lambda i: (0, i, 0))
+                            if dim_leading
+                            else (lambda i: (i, 0, 0))
+                        ),
                     ),
-                    pl.BlockSpec(
-                        block_shape=self.y_block_shape(y, batch_block_size),
-                        index_map=self.y_index_map,
+                    (
+                        self._y_blockspec_dim_leading(
+                            y, batch_block_size, num_channels_padded
+                        )
+                        if dim_leading
+                        else pl.BlockSpec(
+                            block_shape=self.y_block_shape(y, batch_block_size),
+                            index_map=self.y_index_map,
+                        )
                     ),
                 ],
                 core_axis=0,
@@ -287,7 +327,12 @@ class _BwdTrailingChannelKernel(BwdKernel):
             bwd_kernel,
             out_shape=[
                 jax.ShapeDtypeStruct(
-                    (kernel_batch, x_dim_padded, num_channels_padded), x.dtype
+                    (
+                        (x_dim_padded, kernel_batch, num_channels_padded)
+                        if dim_leading
+                        else (kernel_batch, x_dim_padded, num_channels_padded)
+                    ),
+                    x.dtype,
                 ),
                 jax.ShapeDtypeStruct(dy_kernel_shape, x.dtype),
             ],
@@ -296,7 +341,11 @@ class _BwdTrailingChannelKernel(BwdKernel):
             ],
             out_specs=[
                 pl.BlockSpec(
-                    (kernel_batch, x_dim_padded, num_channels_padded),
+                    (
+                        (x_dim_padded, kernel_batch, num_channels_padded)
+                        if dim_leading
+                        else (kernel_batch, x_dim_padded, num_channels_padded)
+                    ),
                     memory_space=pltpu.HBM,
                 ),
                 pl.BlockSpec(dy_kernel_shape, memory_space=pltpu.HBM),
@@ -308,6 +357,11 @@ class _BwdTrailingChannelKernel(BwdKernel):
             name="tensor_product_mtpu_trailing_channel_bwd",
         )(dz, x, y)
 
+        if dim_leading:
+            return (
+                dx.transpose(1, 0, 2)[:batch_size, :, :channels],
+                self._finalize_dy_dim_leading(dy, y_dim, channels, batch_size),
+            )
         dx = self._unpack_dx(dx, batch_size, x_dim, channels, n_batch_packed_in_channel)
         return dx, self.finalize_dy(
             dy, y_dim, channels, batch_size, n_batch_packed_in_channel
@@ -450,6 +504,45 @@ class _BwdTrailingChannelKernel(BwdKernel):
 class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
     """OUTER (y_channel=1): y is (batch, y_dim); dy reduced over the channel axis."""
 
+    _DIM_LEADING = True
+
+    def _orient_y_dim_leading(self, y: jax.Array) -> jax.Array:
+        return pad_for_tpu(y)
+
+    def _dy_kernel_shape_dim_leading(
+        self, y: jax.Array, kernel_batch: int
+    ) -> tuple[int, ...]:
+        return (kernel_batch, y.shape[1])
+
+    def _y_blockspec_dim_leading(
+        self, y: jax.Array, batch_block_size: int, channels: int
+    ) -> pl.BlockSpec:
+        return pl.BlockSpec(
+            block_shape=(batch_block_size, y.shape[1]), index_map=lambda i: (i, 0)
+        )
+
+    def _load_y_dim_leading(
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        batch_block_size: int,
+        channels: int,
+    ) -> dict[int, jax.Array]:
+        return {
+            yi: jnp.broadcast_to(y_vmem[:, yi][:, None], (batch_block_size, channels))
+            for yi in yis
+        }
+
+    def _store_dy_dim_leading(
+        self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array
+    ) -> None:
+        dy_vmem[:, yi] = jnp.sum(dy_acc, axis=-1).astype(dy_vmem.dtype)
+
+    def _finalize_dy_dim_leading(
+        self, dy: jax.Array, y_dim: int, num_channels: int, batch: int
+    ) -> jax.Array:
+        return dy[:batch, :y_dim]
+
     def _validate_y(self, x: jax.Array, y: jax.Array) -> None:
         assert (
             len(y.shape) == 2
@@ -564,6 +657,43 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
 
 class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
     """MAP: y is (batch, y_dim, channel); dy is elementwise over the channel axis."""
+
+    _DIM_LEADING = True
+
+    def _orient_y_dim_leading(self, y: jax.Array) -> jax.Array:
+        return pad_for_tpu(jnp.transpose(y, (1, 0, 2)))
+
+    def _dy_kernel_shape_dim_leading(
+        self, y: jax.Array, kernel_batch: int
+    ) -> tuple[int, ...]:
+        return (y.shape[0], kernel_batch, y.shape[2])
+
+    def _y_blockspec_dim_leading(
+        self, y: jax.Array, batch_block_size: int, channels: int
+    ) -> pl.BlockSpec:
+        return pl.BlockSpec(
+            block_shape=(y.shape[0], batch_block_size, channels),
+            index_map=lambda i: (0, i, 0),
+        )
+
+    def _load_y_dim_leading(
+        self,
+        y_vmem: jax.Array,
+        yis: frozenset[int],
+        batch_block_size: int,
+        channels: int,
+    ) -> dict[int, jax.Array]:
+        return {yi: y_vmem[yi, :, :] for yi in yis}
+
+    def _store_dy_dim_leading(
+        self, dy_vmem: jax.Array, yi: int, dy_acc: jax.Array
+    ) -> None:
+        dy_vmem[yi, :, :] = dy_acc.astype(dy_vmem.dtype)
+
+    def _finalize_dy_dim_leading(
+        self, dy: jax.Array, y_dim: int, num_channels: int, batch: int
+    ) -> jax.Array:
+        return dy.transpose(1, 0, 2)[:batch, :, :num_channels]
 
     def _validate_y(self, x: jax.Array, y: jax.Array) -> None:
         assert (
