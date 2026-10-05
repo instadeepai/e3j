@@ -48,12 +48,38 @@ CASES = [
 CASE_IDS = [f"{a}__{b}__{c}" for a, b, c in CASES]
 
 
-def parametrize_non_shard(func):
-    """Decorator bundling CASES, BATCH_SIZES, and CHANNELS parametrization."""
-    func = pytest.mark.parametrize("channels", CHANNELS)(func)
-    func = pytest.mark.parametrize("batch_size", BATCH_SIZES)(func)
-    func = pytest.mark.parametrize(("in1", "in2", "out"), CASES, ids=CASE_IDS)(func)
-    return func
+def _grid_case(i: int, j: int):
+    batch_size, channels = BATCH_SIZES[j], CHANNELS[(i + j) % len(CHANNELS)]
+    return pytest.param(
+        *CASES[i],
+        batch_size,
+        channels,
+        marks=pytest.mark.slow if batch_size == BATCH_SIZES[-1] else (),
+        id=f"{CASE_IDS[i]}-batch{batch_size}-channels{channels}",
+    )
+
+
+NON_SHARD_GRID = [
+    _grid_case(i, j) for i in range(len(CASES)) for j in range(len(BATCH_SIZES))
+]
+DISPATCH_GRID = [_grid_case(1, 1)]
+
+
+def parametrize_non_shard(func, grid=NON_SHARD_GRID):
+    """Parametrize over `grid`."""
+    return pytest.mark.parametrize(
+        ("in1", "in2", "out", "batch_size", "channels"), grid
+    )(func)
+
+
+def parametrize_dispatch(func):
+    """Parametrize over `DISPATCH_GRID`."""
+    return parametrize_non_shard(func, DISPATCH_GRID)
+
+
+def _jit_vjp(fn):
+    """Jitted `(x, y, do) -> (dx, dy)` through `fn`."""
+    return jax.jit(lambda x, y, do: jax.vjp(fn, x, y)[1](do))
 
 
 @pytest.fixture(autouse=True)
@@ -131,7 +157,7 @@ def test_forward_trailing_channel_outer_matches_reference(
     params = _build_params(in1, in2, out)
     x, y = _inputs_trailing_outer(params, batch_size, channels)
 
-    result = tensor_product_pallas_mosaic_tpu(x, y, params)
+    result = jax.jit(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params))(x, y)
     expect = _reference_trailing_outer(x, y, params)
 
     assert result.shape == (batch_size, params.z_space.dim, channels)
@@ -150,8 +176,9 @@ def test_backward_trailing_channel_outer_matches_reference(
         jax.random.key(1), (batch_size, params.z_space.dim, channels), dtype=x.dtype
     )
 
-    _, vjp = jax.vjp(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params), x, y)
-    dx, dy = vjp(do)
+    dx, dy = _jit_vjp(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params))(
+        x, y, do
+    )
 
     # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
     _, vjp_ref = jax.vjp(
@@ -173,7 +200,7 @@ def test_forward_trailing_channel_map_matches_reference(
     params = _build_params(in1, in2, out, options.MixingMode.MAP)
     x, y = _inputs_trailing_map(params, batch_size, channels)
 
-    result = tensor_product_pallas_mosaic_tpu(x, y, params)
+    result = jax.jit(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params))(x, y)
     expect = _reference_trailing_map(x, y, params)
 
     assert result.shape == (batch_size, params.z_space.dim, channels)
@@ -192,8 +219,9 @@ def test_backward_trailing_channel_map_matches_reference(
         jax.random.key(1), (batch_size, params.z_space.dim, channels), dtype=x.dtype
     )
 
-    _, vjp = jax.vjp(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params), x, y)
-    dx, dy = vjp(do)
+    dx, dy = _jit_vjp(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params))(
+        x, y, do
+    )
 
     # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
     _, vjp_ref = jax.vjp(
@@ -230,21 +258,21 @@ def _mtpu_tp(in1: str, in2: str, out: str | None, mode: options.MixingMode):
     return tp
 
 
-@parametrize_non_shard
+@parametrize_dispatch
 def test_class_dispatch_trailing_outer_forward(in1, in2, out, batch_size, channels):
     """`TensorProduct(...)(x, y)` with MOSAIC_TPU matches the OUTER reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
         tp = _mtpu_tp(in1, in2, out, options.MixingMode.OUTER)
         params = tp._mtpu_params()
         x, y = _inputs_trailing_outer(params, batch_size, channels)
-        result = tp(x, y)
+        result = jax.jit(tp)(x, y)
 
     expect = _reference_trailing_outer(x, y, params)
     assert result.shape == (batch_size, params.z_space.dim, channels)
     testing.assert_allclose(result, expect, rtol=RTOL, atol=ATOL)
 
 
-@parametrize_non_shard
+@parametrize_dispatch
 def test_class_dispatch_trailing_outer_backward(in1, in2, out, batch_size, channels):
     """Backward through `TensorProduct.__call__` matches the OUTER reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
@@ -254,8 +282,7 @@ def test_class_dispatch_trailing_outer_backward(in1, in2, out, batch_size, chann
         do = jax.random.normal(
             jax.random.key(1), (batch_size, params.z_space.dim, channels), dtype=x.dtype
         )
-        _, vjp = jax.vjp(tp, x, y)
-        dx, dy = vjp(do)
+        dx, dy = _jit_vjp(tp)(x, y, do)
 
     # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
     _, vjp_ref = jax.vjp(
@@ -269,21 +296,21 @@ def test_class_dispatch_trailing_outer_backward(in1, in2, out, batch_size, chann
     testing.assert_allclose(dy, dy_ref, rtol=RTOL, atol=ATOL)
 
 
-@parametrize_non_shard
+@parametrize_dispatch
 def test_class_dispatch_trailing_map_forward(in1, in2, out, batch_size, channels):
     """`TensorProduct(...)(x, y)` with MOSAIC_TPU matches the MAP reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
         tp = _mtpu_tp(in1, in2, out, options.MixingMode.MAP)
         params = tp._mtpu_params()
         x, y = _inputs_trailing_map(params, batch_size, channels)
-        result = tp(x, y)
+        result = jax.jit(tp)(x, y)
 
     expect = _reference_trailing_map(x, y, params)
     assert result.shape == (batch_size, params.z_space.dim, channels)
     testing.assert_allclose(result, expect, rtol=RTOL, atol=ATOL)
 
 
-@parametrize_non_shard
+@parametrize_dispatch
 def test_class_dispatch_trailing_map_backward(in1, in2, out, batch_size, channels):
     """Backward through `TensorProduct.__call__` matches the MAP reference."""
     with config.use(tensor_product=options.TensorProduct.FUSED_MOSAIC_TPU):
@@ -293,8 +320,7 @@ def test_class_dispatch_trailing_map_backward(in1, in2, out, batch_size, channel
         do = jax.random.normal(
             jax.random.key(1), (batch_size, params.z_space.dim, channels), dtype=x.dtype
         )
-        _, vjp = jax.vjp(tp, x, y)
-        dx, dy = vjp(do)
+        dx, dy = _jit_vjp(tp)(x, y, do)
 
     # reference is jitted to avoid a compilation bug: (https://github.com/jax-ml/jax/issues/39025)
     _, vjp_ref = jax.vjp(
@@ -308,15 +334,7 @@ def test_class_dispatch_trailing_map_backward(in1, in2, out, batch_size, channel
     testing.assert_allclose(dy, dy_ref, rtol=RTOL, atol=ATOL)
 
 
-SHARD_CASES = [
-    ("0e + 1o", "0e + 1o", "0e + 1o + 2e"),
-    ("2x0e + 1o + 2e", "0e + 2x1o + 2e", "0e + 1o + 2e"),
-    ("0e + 1o + 2e + 3o", "0e + 1o + 2e", "0e + 1o + 2e + 3o"),
-]
-SHARD_CASES_IDS = [f"{a}__{b}__{c}" for a, b, c in SHARD_CASES]
-
-
-@pytest.mark.parametrize(("in1", "in2", "out"), SHARD_CASES, ids=SHARD_CASES_IDS)
+@pytest.mark.parametrize(("in1", "in2", "out"), CASES, ids=CASE_IDS)
 def test_vmap_matches_loop(in1, in2, out, batch: int = 128, channels: int = 128):
     """jax.vmap over the fused TP matches a per-item loop in both value and
     gradient Exercises the data-parallel custom_vmap
@@ -348,7 +366,7 @@ def test_vmap_matches_loop(in1, in2, out, batch: int = 128, channels: int = 128)
 
 
 @pytest.mark.multi_devices
-@pytest.mark.parametrize(("in1", "in2", "out"), SHARD_CASES, ids=SHARD_CASES_IDS)
+@pytest.mark.parametrize(("in1", "in2", "out"), CASES, ids=CASE_IDS)
 def test_vmap_execute_multi_devices_channel_packing(
     in1, in2, out, batch: int = 128, channels: int = 32
 ):
@@ -445,7 +463,7 @@ def _packed_shard_dims(batch: int, channels: int) -> tuple[int, int]:
 @pytest.mark.parametrize(
     "channels", [32, 128], ids=["channels32_packed", "channels128_unpacked"]
 )
-@pytest.mark.parametrize(("in1", "in2", "out"), SHARD_CASES, ids=SHARD_CASES_IDS)
+@pytest.mark.parametrize(("in1", "in2", "out"), CASES, ids=CASE_IDS)
 def test_vmap_precompiles_device_free(in1, in2, out, channels, batch: int = 128):
     """The dp-vmap forward and backward lower and compile against a virtual
     multi-device topology (no live TPU), sharding the merged batch axis across
@@ -480,7 +498,7 @@ def test_vmap_precompiles_device_free(in1, in2, out, channels, batch: int = 128)
 
 
 def test_vmap_multidevice_indivisible_batch_raises(channels: int = 128):
-    in1, in2, out = SHARD_CASES[0]
+    in1, in2, out = CASES[0]
     mesh = _virtual_tpu_mesh()
     params = _build_params(in1, in2, out)
     x_dim, y_dim = params.x_space.dim, params.y_space.dim

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 
 import jax.numpy as np
@@ -21,6 +22,15 @@ import pytest
 from jax.experimental import sparse
 
 E3J_OPS_TESTS = Path("tests/test_ops")
+
+# Under `pytest -n N`, worker `gwK` gets TPU chip K to itself (TPU chips can't be shared).
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
+if _XDIST_WORKER is not None and "TPU_VISIBLE_DEVICES" not in os.environ:
+    os.environ.update(
+        TPU_VISIBLE_DEVICES=_XDIST_WORKER.removeprefix("gw"),
+        TPU_CHIPS_PER_PROCESS_BOUNDS="1,1,1",
+        TPU_PROCESS_BOUNDS="1,1,1",
+    )
 
 
 def pytest_collection_modifyitems(config, items):

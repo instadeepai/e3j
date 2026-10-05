@@ -21,6 +21,10 @@ with `edge_features` (sph) odd and `edge_scalars` even under edge reversal. The
 backward runs the natural edges directly. The inputs below satisfy that contract.
 """
 
+import functools
+from collections.abc import Callable
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -44,26 +48,33 @@ pytestmark = pytest.mark.mosaic_tpu
 RTOL = 1e-3
 ATOL = 1e-3
 
+SLOW = pytest.mark.slow
+
+
+def _case(x_ir, y_ir, o_ir, channels, *marks):
+    return pytest.param(
+        x_ir, y_ir, o_ir, channels, marks=marks, id=f"{x_ir}__channels{channels}"
+    )
+
+
 CASES = [
     # dense and packed
-    ("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 128),
-    ("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 64),
+    _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 128),
+    _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 64),
     # output irreps with multiplicity > 1 (dense + packed)
-    ("0e + 2x1o", "0e + 1o", "0e + 1o + 2e", 128),
-    ("0e + 2x1o", "0e + 1o", "0e + 1o + 2e", 32),
+    _case("0e + 2x1o", "0e + 1o", "0e + 1o + 2e", 128, SLOW),
+    _case("0e + 2x1o", "0e + 1o", "0e + 1o + 2e", 32, SLOW),
     # l_max=3 (dense + packed)
-    ("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128),
-    ("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 32),
-    ("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 256),
+    _case("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128, SLOW),
+    _case("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 32, SLOW),
+    _case("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 256, SLOW),
 ]
-CASE_IDS = [f"{x}__channels{m}" for x, _, _, m in CASES]
 
 # The per-edge gradient relationships are checked on fewer cases for speed.
 BWD_CASES = [
-    ("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 128),
-    ("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 32),
+    _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 128),
+    _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 32),
 ]
-BWD_CASE_IDS = [f"{x}__channels{m}" for x, _, _, m in BWD_CASES]
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +140,71 @@ def _contract_valid_inputs(
     )
 
 
+def _sum_sq_grads(conv_fn):
+    """Gradients of `sum(conv_fn(...) ** 2)` w.r.t. node feats, sph and edge scalars."""
+    return jax.grad(lambda n, s, e, *g: jnp.sum(conv_fn(n, s, e, *g) ** 2), (0, 1, 2))
+
+
+def _second_grads(conv_fn):
+    """Force-training style second-order gradients through `conv_fn`."""
+
+    def loss(n, s, e, *g):
+        d_node = jax.grad(lambda nn: jnp.sum(conv_fn(nn, s, e, *g) ** 2))(n)
+        return jnp.sum(d_node**2)
+
+    return jax.grad(loss, (0, 1, 2))
+
+
+def _vjp(conv_fn):
+    """Cotangents of `conv_fn` for an explicit output cotangent `ct`."""
+
+    def vjp(n, s, e, senders, receivers, ct):
+        return jax.vjp(lambda *a: conv_fn(*a, senders, receivers), n, s, e)[1](ct)
+
+    return vjp
+
+
+class _Kernels(NamedTuple):
+    """A `Convolution` with its fused and unfused entry points, jitted."""
+
+    conv: Convolution
+    fused: Callable
+    unfused: Callable
+    fused_grads: Callable
+    unfused_grads: Callable
+    fused_second_grads: Callable
+    unfused_second_grads: Callable
+    fused_vjp: Callable
+    unfused_vjp: Callable
+
+
+@functools.cache
+def _kernels(x_ir: str, y_ir: str, o_ir: str) -> _Kernels:
+    """One `Convolution` and its jitted entry points per irreps triple, shared by
+    every test so each shape compiles once per session. The graph and the optional
+    node mask are traced arguments, so every graph of the same size reuses them."""
+    conv = Convolution(
+        source=(O3Space(x_ir), O3Space(y_ir)),
+        target=O3Space(o_ir),
+        layout=Layout.TRAILING_CHANNELS,
+        avg_num_neighbors=None,
+        normalization="SQRT_DIM_OUT",
+        graph_ordering="SENDER",
+    )
+    fused, unfused = conv._fused_mosaic_tpu_eval, conv._unfused_eval
+    return _Kernels(
+        conv=conv,
+        fused=jax.jit(fused),
+        unfused=jax.jit(unfused),
+        fused_grads=jax.jit(_sum_sq_grads(fused)),
+        unfused_grads=jax.jit(_sum_sq_grads(unfused)),
+        fused_second_grads=jax.jit(_second_grads(fused)),
+        unfused_second_grads=jax.jit(_second_grads(unfused)),
+        fused_vjp=jax.jit(_vjp(fused)),
+        unfused_vjp=jax.jit(_vjp(unfused)),
+    )
+
+
 def _rel(a, b) -> float:
     a, b = np.asarray(a), np.asarray(b)
     return float(np.abs(a - b).max() / (np.abs(b).max() + 1e-12))
@@ -143,116 +219,41 @@ def _symmetric_edges(n_nodes: int):
     )
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES)
 def test_fused_matches_unfused(x_ir, y_ir, o_ir, channels):
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    node, sph, es, senders, receivers = _contract_valid_inputs(
-        conv, n_nodes=16, channels=channels
-    )
+    k = _kernels(x_ir, y_ir, o_ir)
+    inputs = _contract_valid_inputs(k.conv, n_nodes=16, channels=channels)
 
-    expected = conv._unfused_eval(node, sph, es, senders, receivers)
-    got = jax.jit(conv._fused_mosaic_tpu_eval)(node, sph, es, senders, receivers)
+    expected = k.unfused(*inputs)
+    got = k.fused(*inputs)
 
     np.testing.assert_allclose(
         np.asarray(got), np.asarray(expected), rtol=RTOL, atol=ATOL
     )
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
-def test_backward_matches_unfused(x_ir, y_ir, o_ir, channels):
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    node, sph, es, senders, receivers = _contract_valid_inputs(
-        conv, n_nodes=8, channels=channels
-    )
-    fused, unfused = conv._fused_mosaic_tpu_eval, conv._unfused_eval
-
-    # forward matches
-    np.testing.assert_allclose(
-        np.asarray(fused(node, sph, es, senders, receivers)),
-        np.asarray(unfused(node, sph, es, senders, receivers)),
-        rtol=RTOL,
-        atol=ATOL,
-    )
-    # all three gradients match the unfused reference directly (natural frame)
-    gf = jax.grad(
-        lambda n, s, e: jnp.sum(fused(n, s, e, senders, receivers) ** 2), (0, 1, 2)
-    )(node, sph, es)
-    gu = jax.grad(
-        lambda n, s, e: jnp.sum(unfused(n, s, e, senders, receivers) ** 2), (0, 1, 2)
-    )(node, sph, es)
-    for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), gf, gu):
-        assert _rel(a, b) < RTOL, f"{name} mismatch"
-
-
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES)
 def test_backward_cotangents_match(x_ir, y_ir, o_ir, channels):
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    node, sph, es, senders, receivers = _contract_valid_inputs(
-        conv, n_nodes=8, channels=channels
-    )
-    fused, unfused = conv._fused_mosaic_tpu_eval, conv._unfused_eval
+    k = _kernels(x_ir, y_ir, o_ir)
+    inputs = _contract_valid_inputs(k.conv, n_nodes=8, channels=channels)
 
-    out, vjp_unfused = jax.vjp(
-        lambda n, s, e: unfused(n, s, e, senders, receivers), node, sph, es
-    )
-    _, vjp_fused = jax.vjp(
-        lambda n, s, e: fused(n, s, e, senders, receivers), node, sph, es
-    )
-    # arbitrary output cotangent, uncorrelated with the output
+    out = k.unfused(*inputs)
+    # all three gradients, for an arbitrary output cotangent uncorrelated with the output
     ct = jnp.asarray(np.random.default_rng(1).standard_normal(out.shape), jnp.float32)
-    df = vjp_fused(ct)
-    du = vjp_unfused(ct)
+    df = k.fused_vjp(*inputs, ct)
+    du = k.unfused_vjp(*inputs, ct)
     for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), df, du):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@SLOW
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_force_training_double_backward(x_ir, y_ir, o_ir, channels):
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    node, sph, es, senders, receivers = _contract_valid_inputs(
-        conv, n_nodes=8, channels=channels
-    )
+    k = _kernels(x_ir, y_ir, o_ir)
+    inputs = _contract_valid_inputs(k.conv, n_nodes=8, channels=channels)
 
-    def make_loss(conv_fn):
-        def loss(n, s, e):
-            # first-order gradient (forces-like), then a scalar of it
-            g = jax.grad(
-                lambda nn: jnp.sum(conv_fn(nn, s, e, senders, receivers) ** 2)
-            )(n)
-            return jnp.sum(g**2)
-
-        return loss
-
-    d2f = jax.grad(make_loss(conv._fused_mosaic_tpu_eval), (0, 1, 2))(node, sph, es)
-    d2u = jax.grad(make_loss(conv._unfused_eval), (0, 1, 2))(node, sph, es)
+    d2f = k.fused_second_grads(*inputs)
+    d2u = k.unfused_second_grads(*inputs)
     for name, a, b in zip(("dd_node", "dd_sph", "dd_edge_scalars"), d2f, d2u):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
 
@@ -290,22 +291,15 @@ def _marked(padded, node_mask):
     return (node, sph, es, *GraphCSR.mask_edges(senders, receivers, node_mask))
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES)
 def test_dummy_edges_forward_leaves_real_nodes_untouched(x_ir, y_ir, o_ir, channels):
     """`DUMMY_INDEX`-marked edges contribute nothing: the real messages match the
     unpadded graph and the padding nodes stay at exactly zero."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    real, padded, node_mask = _padded_inputs(conv, channels)
+    k = _kernels(x_ir, y_ir, o_ir)
+    real, padded, node_mask = _padded_inputs(k.conv, channels)
 
-    got = jax.jit(conv._fused_mosaic_tpu_eval)(*_marked(padded, node_mask), node_mask)
-    expected = jax.jit(conv._fused_mosaic_tpu_eval)(*real)
+    got = k.fused(*_marked(padded, node_mask), node_mask)
+    expected = k.fused(*real)
 
     assert got.shape[0] == N_REAL + N_PAD
     np.testing.assert_allclose(
@@ -314,31 +308,15 @@ def test_dummy_edges_forward_leaves_real_nodes_untouched(x_ir, y_ir, o_ir, chann
     np.testing.assert_array_equal(np.asarray(got[N_REAL:]), 0.0)
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES)
 def test_dummy_edges_cotangents_vanish(x_ir, y_ir, o_ir, channels):
     """Dummy edges get zero cotangents, and the real ones match the unpadded graph."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    real, padded, node_mask = _padded_inputs(conv, channels)
+    k = _kernels(x_ir, y_ir, o_ir)
+    real, padded, node_mask = _padded_inputs(k.conv, channels)
     n_real_edges = real[1].shape[0]
 
-    def grads(conv_fn, node, sph, es, senders, receivers):
-        return jax.grad(
-            lambda n, s, e: jnp.sum(conv_fn(n, s, e, senders, receivers) ** 2),
-            (0, 1, 2),
-        )(node, sph, es)
-
-    got = grads(
-        lambda *a: conv._fused_mosaic_tpu_eval(*a, node_mask),
-        *_marked(padded, node_mask),
-    )
-    expected = grads(conv._fused_mosaic_tpu_eval, *real)
+    got = k.fused_grads(*_marked(padded, node_mask), node_mask)
+    expected = k.unfused_grads(*real)
 
     for name, a, b, n_kept in zip(
         ("d_node_feats", "d_sph", "d_edge_scalars"),
@@ -350,35 +328,17 @@ def test_dummy_edges_cotangents_vanish(x_ir, y_ir, o_ir, channels):
         np.testing.assert_array_equal(np.asarray(a[n_kept:]), 0.0, err_msg=name)
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@SLOW
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_dummy_edges_double_backward(x_ir, y_ir, o_ir, channels):
     """Force training over a padded graph matches the unpadded one; the second-order
     cotangents of dummy edges vanish too."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    real, padded, node_mask = _padded_inputs(conv, channels)
+    k = _kernels(x_ir, y_ir, o_ir)
+    real, padded, node_mask = _padded_inputs(k.conv, channels)
     n_real_edges = real[1].shape[0]
 
-    def second_grads(conv_fn, node, sph, es, senders, receivers):
-        def loss(n, s, e):
-            g = jax.grad(
-                lambda nn: jnp.sum(conv_fn(nn, s, e, senders, receivers) ** 2)
-            )(n)
-            return jnp.sum(g**2)
-
-        return jax.grad(loss, (0, 1, 2))(node, sph, es)
-
-    got = second_grads(
-        lambda *a: conv._fused_mosaic_tpu_eval(*a, node_mask),
-        *_marked(padded, node_mask),
-    )
-    expected = second_grads(conv._fused_mosaic_tpu_eval, *real)
+    got = k.fused_second_grads(*_marked(padded, node_mask), node_mask)
+    expected = k.unfused_second_grads(*real)
 
     for name, a, b, n_kept in zip(
         ("dd_node", "dd_sph", "dd_edge_scalars"),
@@ -422,55 +382,43 @@ def _graph_with_one_padding_edge(conv, channels, position, seed: int = 0):
 
 
 @pytest.mark.parametrize("position", PLACEMENTS, ids=PLACEMENT_IDS)
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_dummy_edge_splitting_a_sender_group(x_ir, y_ir, o_ir, channels, position):
     """A dummy edge anywhere inside a real sender's group must not fragment it: the
     group flush overwrites its node row, so a reopened group loses its first
     partial and one node comes out silently wrong."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    real, padded, node_mask = _graph_with_one_padding_edge(conv, channels, position)
+    k = _kernels(x_ir, y_ir, o_ir)
+    real, padded, node_mask = _graph_with_one_padding_edge(k.conv, channels, position)
 
-    got = jax.jit(conv._fused_mosaic_tpu_eval)(*_marked(padded, node_mask), node_mask)
-    expected = jax.jit(conv._fused_mosaic_tpu_eval)(*real)
+    got = k.fused(*_marked(padded, node_mask), node_mask)
+    expected = k.fused(*real)
 
     assert _rel(got[:N_REAL], expected) < RTOL
     np.testing.assert_array_equal(np.asarray(got[N_REAL:]), 0.0)
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_dummy_edges_under_vmap(x_ir, y_ir, o_ir, channels):
     """Batching merges each graph's dummy tail into the middle of the edge list, so
     the runtime edge bound is dropped there; results must still match per graph."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    per_graph = [_padded_inputs(conv, channels, seed=g) for g in range(2)]
+    k = _kernels(x_ir, y_ir, o_ir)
+    per_graph = [_padded_inputs(k.conv, channels, seed=g) for g in range(2)]
     marked = [_marked(padded, mask) for _, padded, mask in per_graph]
     batched = tuple(jnp.stack([m[i] for m in marked]) for i in range(5))
     node_mask = per_graph[0][2]  # same padding layout for every graph
 
     def fused(node, sph, es, senders, receivers):
-        return conv._fused_mosaic_tpu_eval(node, sph, es, senders, receivers, node_mask)
+        return k.conv._fused_mosaic_tpu_eval(
+            node, sph, es, senders, receivers, node_mask
+        )
 
     got = jax.jit(jax.vmap(fused))(*batched)
     for g, single in enumerate(marked):
-        expected = jax.jit(fused)(*single)
+        expected = k.fused(*single, node_mask)
         assert _rel(got[g], expected) < RTOL, f"graph {g} mismatch"
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_node_mask_dispatch_matches_unfused(x_ir, y_ir, o_ir, channels):
     """`Convolution.__call__(node_mask=...)` marks the dummy edges for the kernel."""
     kwargs = dict(
@@ -495,33 +443,18 @@ def test_node_mask_dispatch_matches_unfused(x_ir, y_ir, o_ir, channels):
     )
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_all_real_mask_leaves_no_tail(x_ir, y_ir, o_ir, channels):
     """An all-real mask stops the pipeline at the last block, leaving nothing to zero."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    real = _contract_valid_inputs(conv, N_REAL, channels)
+    k = _kernels(x_ir, y_ir, o_ir)
+    real = _contract_valid_inputs(k.conv, N_REAL, channels)
     node_mask = jnp.ones(N_REAL, bool)
 
-    def grads(mask):
-        senders, receivers = (
-            GraphCSR.mask_edges(*real[3:], mask) if mask is not None else real[3:]
-        )
-        return jax.grad(
-            lambda n, s, e: jnp.sum(
-                conv._fused_mosaic_tpu_eval(n, s, e, senders, receivers, mask) ** 2
-            ),
-            (0, 1, 2),
-        )(*real[:3])
-
+    masked = k.fused_grads(
+        *real[:3], *GraphCSR.mask_edges(*real[3:], node_mask), node_mask
+    )
     for name, got, expected in zip(
-        ("d_node_feats", "d_sph", "d_edge_scalars"), grads(node_mask), grads(None)
+        ("d_node_feats", "d_sph", "d_edge_scalars"), masked, k.unfused_grads(*real)
     ):
         assert _rel(got, expected) < RTOL, f"{name} mismatch"
 
@@ -534,47 +467,27 @@ def _batch_valid_inputs(conv, n_nodes, channels, n_graphs):
     return tuple(jnp.stack([g[i] for g in per]) for i in range(5)), per
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_vmap_forward_matches_per_graph(x_ir, y_ir, o_ir, channels):
     """vmap over a batch of graphs must shift senders/receivers into each graph's
     own node block; otherwise every graph gathers from graph 0's nodes."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    fused = conv._fused_mosaic_tpu_eval
-    batched, per = _batch_valid_inputs(conv, n_nodes=8, channels=channels, n_graphs=3)
+    k = _kernels(x_ir, y_ir, o_ir)
+    batched, per = _batch_valid_inputs(k.conv, n_nodes=8, channels=channels, n_graphs=3)
 
-    got = jax.vmap(fused)(*batched)
-    expected = jnp.stack([fused(*g) for g in per])
+    got = jax.jit(jax.vmap(k.conv._fused_mosaic_tpu_eval))(*batched)
+    expected = jnp.stack([k.fused(*g) for g in per])
     assert _rel(got, expected) < RTOL
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_vmap_backward_matches_per_graph(x_ir, y_ir, o_ir, channels):
     """Gradients under vmap must also see per-graph-shifted edge indices."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    fused = conv._fused_mosaic_tpu_eval
-    batched, per = _batch_valid_inputs(conv, n_nodes=8, channels=channels, n_graphs=3)
+    k = _kernels(x_ir, y_ir, o_ir)
+    batched, per = _batch_valid_inputs(k.conv, n_nodes=8, channels=channels, n_graphs=3)
 
-    def grads(node, sph, es, senders, receivers):
-        return jax.grad(
-            lambda n, s, e: jnp.sum(fused(n, s, e, senders, receivers) ** 2), (0, 1, 2)
-        )(node, sph, es)
-
-    got = jax.vmap(grads)(*batched)
-    expected = tuple(jnp.stack([grads(*g)[i] for g in per]) for i in range(3))
+    got = jax.jit(jax.vmap(_sum_sq_grads(k.conv._fused_mosaic_tpu_eval)))(*batched)
+    per_graph = [k.unfused_grads(*g) for g in per]
+    expected = tuple(jnp.stack([g[i] for g in per_graph]) for i in range(3))
     for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), got, expected):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
 
@@ -592,83 +505,61 @@ def _device_mesh(axis: str = "batch") -> Mesh:
     return Mesh(np.asarray(devices), (axis,))
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.multi_devices
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_vmap_multidevice_forward_matches_per_graph(x_ir, y_ir, o_ir, channels):
     """vmap under a device mesh (shard_map data-parallel path) must give the same
     forward as the per-graph loop. Each shard sees only its slice of the merged
     node block, so per-graph edge offsets must be shard-local, not global."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    fused = conv._fused_mosaic_tpu_eval
+    k = _kernels(x_ir, y_ir, o_ir)
     mesh = _device_mesh()
     # one graph per shard: the merged (V*N) node axis splits graph-aligned.
     batched, per = _batch_valid_inputs(
-        conv, n_nodes=8, channels=channels, n_graphs=mesh.size
+        k.conv, n_nodes=8, channels=channels, n_graphs=mesh.size
     )
 
-    expected = jnp.stack([fused(*g) for g in per])
+    expected = jnp.stack([k.fused(*g) for g in per])
     with jax.sharding.set_mesh(mesh):
-        got = jax.jit(jax.vmap(fused))(*batched)
+        got = jax.jit(jax.vmap(k.conv._fused_mosaic_tpu_eval))(*batched)
     assert _rel(got, expected) < RTOL
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.multi_devices
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_vmap_multidevice_backward_matches_per_graph(x_ir, y_ir, o_ir, channels):
     """Gradients through the sharded dp-vmap path must match the per-graph loop."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
-    fused = conv._fused_mosaic_tpu_eval
+    k = _kernels(x_ir, y_ir, o_ir)
     mesh = _device_mesh()
     batched, per = _batch_valid_inputs(
-        conv, n_nodes=8, channels=channels, n_graphs=mesh.size
+        k.conv, n_nodes=8, channels=channels, n_graphs=mesh.size
     )
 
-    def grads(node, sph, es, senders, receivers):
-        return jax.grad(
-            lambda n, s, e: jnp.sum(fused(n, s, e, senders, receivers) ** 2), (0, 1, 2)
-        )(node, sph, es)
-
-    expected = tuple(jnp.stack([grads(*g)[i] for g in per]) for i in range(3))
+    per_graph = [k.unfused_grads(*g) for g in per]
+    expected = tuple(jnp.stack([g[i] for g in per_graph]) for i in range(3))
     with jax.sharding.set_mesh(mesh):
-        got = jax.jit(jax.vmap(grads))(*batched)
+        got = jax.jit(jax.vmap(_sum_sq_grads(k.conv._fused_mosaic_tpu_eval)))(*batched)
     for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), got, expected):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES, ids=BWD_CASE_IDS)
+@pytest.mark.multi_devices
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_vmap_multidevice_masked_matches_per_graph(x_ir, y_ir, o_ir, channels):
     """A padded batch under a device mesh: every shard builds its own block order,
     so the walked blocks must still cover exactly its graphs' real edges."""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
+    k = _kernels(x_ir, y_ir, o_ir)
     mesh = _device_mesh()
-    per_graph = [_padded_inputs(conv, channels, seed=g)[1:] for g in range(mesh.size)]
+    per_graph = [_padded_inputs(k.conv, channels, seed=g)[1:] for g in range(mesh.size)]
     marked = [_marked(padded, node_mask) for padded, node_mask in per_graph]
     batched = tuple(jnp.stack([m[i] for m in marked]) for i in range(5))
     node_mask = per_graph[0][1]  # same padding layout for every graph
 
     def fused(node, sph, es, senders, receivers):
-        return conv._fused_mosaic_tpu_eval(node, sph, es, senders, receivers, node_mask)
+        return k.conv._fused_mosaic_tpu_eval(
+            node, sph, es, senders, receivers, node_mask
+        )
 
-    expected = jnp.stack([jax.jit(fused)(*single) for single in marked])
+    expected = jnp.stack([k.fused(*single, node_mask) for single in marked])
     with jax.sharding.set_mesh(mesh):
         got = jax.jit(jax.vmap(fused))(*batched)
     assert _rel(got, expected) < RTOL
@@ -685,6 +576,7 @@ def _assertion_conv() -> Convolution:
     )
 
 
+@pytest.mark.multi_devices
 def test_vmap_multidevice_indivisible_batch_raises():
     conv = _assertion_conv()
     fused = conv._fused_mosaic_tpu_eval
@@ -700,17 +592,12 @@ def test_vmap_multidevice_indivisible_batch_raises():
             jax.jit(jax.vmap(fused))(*batched)
 
 
-@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", CASES, ids=CASE_IDS)
+@SLOW
+@pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES[:1])
 def test_end_to_end_position_gradient_matches(x_ir, y_ir, o_ir, channels):
     """The gradient w.r.t. atom positions (i.e. forces) matches the unfused"""
-    conv = Convolution(
-        source=(O3Space(x_ir), O3Space(y_ir)),
-        target=O3Space(o_ir),
-        layout=Layout.TRAILING_CHANNELS,
-        avg_num_neighbors=None,
-        normalization="SQRT_DIM_OUT",
-        graph_ordering="SENDER",
-    )
+    k = _kernels(x_ir, y_ir, o_ir)
+    conv = k.conv
     n_nodes = 8
     senders, receivers = _symmetric_edges(n_nodes)
     par = _y_parity_signs(conv._otimes.source[1])
@@ -742,25 +629,27 @@ def test_end_to_end_position_gradient_matches(x_ir, y_ir, o_ir, channels):
         d = jnp.linalg.norm(p[receivers] - p[senders], axis=1, keepdims=True)
         return (jnp.tanh(d @ Wr1) @ Wr2).reshape(senders.shape[0], num_irreps, channels)
 
-    fused, unfused = conv._fused_mosaic_tpu_eval, conv._unfused_eval
     sph, vjp_Y = jax.vjp(Y, positions)
     es, vjp_radial = jax.vjp(radial, positions)
 
-    def d_pos_from_cotangents(conv_fn):
-        d_sph, d_es = jax.grad(
-            lambda s, e: jnp.sum(conv_fn(node, s, e, senders, receivers) ** 2), (0, 1)
-        )(sph, es)
+    def d_pos_from_cotangents(conv, conv_vjp):
+        ct = 2 * conv(node, sph, es, senders, receivers)  # d sum(out**2) / d out
+        _, d_sph, d_es = conv_vjp(node, sph, es, senders, receivers, ct)
         return vjp_Y(d_sph)[0] + vjp_radial(d_es)[0]
 
-    d_pos_fused = d_pos_from_cotangents(fused)
-    d_pos_unfused = d_pos_from_cotangents(unfused)
+    d_pos_fused = d_pos_from_cotangents(k.fused, k.fused_vjp)
+    d_pos_unfused = d_pos_from_cotangents(k.unfused, k.unfused_vjp)
     assert _rel(d_pos_fused, d_pos_unfused) < 1e-3
-    autodiff = jax.grad(
-        lambda p: jnp.sum(fused(node, Y(p), radial(p), senders, receivers) ** 2)
+    fused = conv._fused_mosaic_tpu_eval
+    autodiff = jax.jit(
+        jax.grad(
+            lambda p: jnp.sum(fused(node, Y(p), radial(p), senders, receivers) ** 2)
+        )
     )(positions)
     assert _rel(d_pos_fused, autodiff) < 1e-3
 
 
+@SLOW
 @pytest.mark.parametrize("channel_block", [256, 128])
 def test_backward_channel_strides_match_unfused(channel_block):
     """The bwd may walk the edges once per channel slice; every split must agree."""
@@ -795,13 +684,12 @@ def test_backward_channel_strides_match_unfused(channel_block):
     def strided(n, s, e):
         return convolution_mosaic_tpu(n, s, e, senders, receivers, params)
 
-    gradients = jax.grad(lambda n, s, e: jnp.sum(strided(n, s, e) ** 2), (0, 1, 2))(
-        node, sph, es
-    )
-    expected = jax.grad(
-        lambda n, s, e: jnp.sum(conv._unfused_eval(n, s, e, senders, receivers) ** 2),
-        (0, 1, 2),
+    gradients = jax.jit(
+        jax.grad(lambda n, s, e: jnp.sum(strided(n, s, e) ** 2), (0, 1, 2))
     )(node, sph, es)
+    expected = jax.jit(_sum_sq_grads(conv._unfused_eval))(
+        node, sph, es, senders, receivers
+    )
     for name, got, want in zip(
         ("d_node_feats", "d_sph", "d_edge_scalars"), gradients, expected
     ):
