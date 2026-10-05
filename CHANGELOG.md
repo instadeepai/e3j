@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 
 ## [Unreleased]
 
+### Added
+- Mosaic GPU convolution kernels, differentiable to any order.
+
+### Changed
+- Python 3.12 is now the minimum supported version.
+
 ## [0.1.1] — 2026-09-24
 
 ### Fixed

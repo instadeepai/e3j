@@ -23,6 +23,10 @@ from e3j.core.tensor_product import TensorProduct
 from e3j.data.graph import GraphCSR
 from e3j.ops.coef import Coef4D, resolve_val_dtype
 from e3j.ops.convolution import CUDAConvolutionParams, convolution
+from e3j.pallas_ops.convolution import (
+    PallasMosaicGPUMessagePassingConvolutionParams,
+    convolution_mosaic_gpu,
+)
 from e3j.pallas_ops.convolution.mosaic_tpu import (
     PallasMosaicTPUMessagePassingConvolutionParams,
     convolution_mosaic_tpu,
@@ -59,8 +63,8 @@ class Convolution:
     Optionally, the sum of messages is rescaled by `avg_num_neighbors`.
 
     Note:
-        When using CUDA or Mosaic TPU kernels with `SENDER` graph ordering,
-        the following additional assumptions should hold:
+        When using the CUDA, Mosaic TPU or Mosaic GPU kernels with `SENDER`
+        graph ordering, the following additional assumptions should hold:
 
         1. **Symmetric graph:** each edge `(a, b)` has its reverse `(b, a)`,
         2. **Graded-symmetric edge features:** $y_{ba} = p . y_{ab}$ per slice,
@@ -70,6 +74,13 @@ class Convolution:
 
     Note:
         `RECEIVER` ordering is not yet implemented for the Mosaic TPU kernel.
+
+    Note:
+        The Mosaic GPU kernel takes either ordering. Prefer `RECEIVER` where the
+        edge list can be sorted either way: it aggregates each receiver's
+        incoming edges directly, so none of the assumptions above apply, and it
+        keeps the backward's per-edge gather on the narrow node features rather
+        than on the wider output cotangent.
     """
 
     def __init__(
@@ -95,7 +106,8 @@ class Convolution:
             graph_ordering: Edge ordering for the graph, can be `RECEIVER`,
                 `SENDER` or `NONE`. When edges are sorted by senders, symmetry
                 assumptions on the graph and edge features should hold. Only
-                the unfused path supports `NONE` for now.
+                the unfused path supports `NONE` for now; the Mosaic TPU path
+                supports only `SENDER`, every other fused path takes either.
             layout: Specifies the channel axis, `TRAILING_CHANNELS` is faster.
             avg_num_neighbors: If given, messages are divided by this factor.
             normalization: Normalization of the tensor product's Clebsch-Gordan
@@ -294,6 +306,43 @@ class Convolution:
             node_mask is not None,
         )
 
+    def _fused_mosaic_gpu_eval(
+        self,
+        node_features: Array,
+        edge_features: Array,
+        edge_scalars: Array,
+        senders: Array,
+        receivers: Array,
+    ) -> Array:
+        """Mosaic GPU implementation."""
+        if self.layout != Layout.TRAILING_CHANNELS:
+            raise NotImplementedError(
+                "FUSED_MOSAIC_GPU only supports TRAILING_CHANNELS layout."
+            )
+        if self.graph_ordering == options.GraphOrdering.NONE:
+            raise NotImplementedError(
+                "FUSED_MOSAIC_GPU only supports SENDER and RECEIVER ordering."
+            )
+
+        coef = self._otimes.coef
+        params = PallasMosaicGPUMessagePassingConvolutionParams(
+            indices=numpy.asarray(coef.indices),
+            values=numpy.asarray(coef.data),
+            layout=self.layout,
+            x_space=self._otimes.source[0],
+            y_space=self._otimes.source[1],
+            z_space=self._otimes.target,
+            graph_ordering=self.graph_ordering,
+        )
+        return convolution_mosaic_gpu(
+            node_features,
+            edge_features,
+            edge_scalars,
+            senders,
+            receivers,
+            params,
+        )
+
     def __call__(
         self,
         node_features: Array,
@@ -327,9 +376,10 @@ class Convolution:
                 granular to one edge block.
 
         Note:
-            On the CUDA convolution kernel the edges must be sorted by the endpoint
-            selected via `graph_ordering`. The `SENDER` ordering additionally
-            requires the symmetry assumptions documented on the class.
+            On the fused convolution kernels the edges must be sorted by the
+            endpoint selected via `graph_ordering`. The `SENDER` ordering
+            additionally requires the symmetry assumptions documented on the
+            class.
         """
         # Edges touching a padding node are excluded from every path: dropped
         # from the CSR (no kernel work) so padding never inflates the aggregation.
@@ -361,6 +411,14 @@ class Convolution:
                     senders,
                     receivers,
                     node_mask,
+                )
+            case options.Convolution.FUSED_MOSAIC_GPU:
+                return self._fused_mosaic_gpu_eval(
+                    node_features,
+                    edge_features,
+                    edge_scalars,
+                    senders,
+                    receivers,
                 )
             case _:
                 raise RuntimeError("Unknow convolution implementation.")

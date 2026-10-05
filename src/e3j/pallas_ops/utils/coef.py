@@ -60,6 +60,10 @@ CoefByZiThenXi: TypeAlias = tuple[
     tuple[int, tuple[tuple[int, tuple[tuple[int, float], ...]], ...]], ...
 ]
 
+#: The same nesting with the two inputs exchanged: per `zi`, its `yi` groups,
+#: each with its `(xi, value)` paths.
+CoefByZiThenYi: TypeAlias = CoefByZiThenXi
+
 
 def group_coef_by_zi(indices: np.ndarray, values: np.ndarray) -> CoefByZi:
     """Group coefficients by z index for static unrolling.
@@ -120,3 +124,22 @@ def group_coef_by_zi_then_xi(indices: np.ndarray, values: np.ndarray) -> CoefByZ
         )
         for zi, contribs in group_coef_by_zi(indices, values).items()
     )
+
+
+def group_coef_by_zi_then_yi(indices: np.ndarray, values: np.ndarray) -> CoefByZiThenYi:
+    """Group coefficients by output index `zi`, then by y-input index `yi`.
+
+    :func:`group_coef_by_zi_then_xi` with the two inputs exchanged, obtained by
+    swapping the `xi` and `yi` columns of `indices`: the same nesting, so a
+    kernel can load each `y[yi]` once and reuse it across its `xi` paths. This is
+    the view a cotangent of the *second* operand needs, the `xi` one that of the
+    first.
+
+    Args:
+        indices: `(nnz, 3)` COO index array; each row is `(zi, xi, yi)`.
+        values: `(nnz,)` coefficient values aligned with `indices`.
+
+    Returns:
+        `((zi, ((yi, ((xi, value), ...)), ...)), ...)`, sorted by `zi` then `yi`.
+    """
+    return group_coef_by_zi_then_xi(indices[:, [0, 2, 1]], values)

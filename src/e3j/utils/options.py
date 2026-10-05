@@ -57,15 +57,19 @@ class Convolution(Enum):
         FUSED_CUDA: Dispatch to custom CUDA kernel via XLA-FFI (requires `e3j_ops`).
         FUSED_MOSAIC_TPU: Single fused Pallas Mosaic-TPU kernel (gather + TP +
             mixing + scatter), ``TRAILING_CHANNELS`` layout. Requires a TPU backend.
+        FUSED_MOSAIC_GPU: Single fused Pallas Mosaic-GPU kernel (gather + TP +
+            mixing + aggregation), ``TRAILING_CHANNELS`` layout and `RECEIVER`
+            ordering. Targets Hopper (sm_90) and newer.
     """
 
     UNFUSED = "UNFUSED"
     FUSED_CUDA = "FUSED_CUDA"
     FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
+    FUSED_MOSAIC_GPU = "FUSED_MOSAIC_GPU"
 
 
 class GraphOrdering(EnumOption):
-    """Edge ordering contract for the fused CUDA :class:`~e3j.core.Convolution`.
+    """Edge ordering contract for the fused :class:`~e3j.core.Convolution` kernels.
 
     Values:
         RECEIVER: Edges sorted by receiver index. The forward pass can then
