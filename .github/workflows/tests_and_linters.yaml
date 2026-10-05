@@ -26,7 +26,7 @@ jobs:
   linters:
     runs-on: ubuntu-latest
     container:
-       image: python:3.11-slim
+       image: python:3.12-slim
     steps:
       - name: setup
         run: |
@@ -53,7 +53,7 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     container:
-       image: python:3.11-slim
+       image: python:3.12-slim
     steps:
       - name: setup
         run: |

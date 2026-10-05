@@ -39,7 +39,7 @@ build from source by running run one of:
 ```sh
 # Existing CUDA 13 install with `e3j_ops` kernels:
 uv sync --group cuda13_local --extra ops
-# Install CUDA 13 via pip and the `exp` group for benchmarks:
+# Install CUDA 13 via pip:
 uv sync --group cuda13 --extra ops
 ```
 

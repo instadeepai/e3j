@@ -8,21 +8,18 @@ repos:
     hooks:
       - id: isort
         args: ["--profile", "black"]
-        exclude: analysis/anarci/BioBlocks/
 
   - repo: https://github.com/psf/black
     rev: 24.2.0
     hooks:
       - id: black
         name: "Code formatter"
-        exclude: notebooks/ analysis/anarci/BioBlocks
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.1.0
     hooks:
       - id: end-of-file-fixer
         name: "End of file fixer"
-        exclude: docker/template.env *.fasta
       - id: debug-statements
         name: "Debug imports and breakpoints checker"
       - id: requirements-txt-fixer

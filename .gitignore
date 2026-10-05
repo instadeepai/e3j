@@ -27,5 +27,3 @@ outputs/
 media/
 traces/
 *.ncu-rep
-
-internal/

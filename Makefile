@@ -82,7 +82,7 @@ PYTHON_SUFFIX=$(shell ${PYTHON_EXE} -c 'import sysconfig; print(sysconfig.get_co
 
 #### Project paths #######################################
 
-UV_GROUPS = --group cuda13_local --group exp
+UV_GROUPS = --group cuda13_local
 SRC_DIR = lib/e3j_ops
 OBJ_DIR = bin
 INC_DIR = $(SRC_DIR)
@@ -127,7 +127,7 @@ CONVOLUTION_BWD_OBJ = \
 
 #### RULES ###############################################
 
-.PHONY: cutest pytest test_mosaic_tpu test clean uv e3j_ops docs
+.PHONY: cutest pytest test_mosaic_tpu test_mosaic_tpu_single_device test_mosaic_tpu_multi_devices test_mosaic_tpu_fast test clean uv e3j_ops docs
 
 #=== Static libraries builds ===
 
@@ -187,8 +187,27 @@ pytest:
 		uv run pytest -v -m "e3j_ops" tests/test_ops;\
 	fi
 
+TPU_CHIPS ?= $(shell ls -d /dev/accel* 2>/dev/null | wc -l)
+
+# reruns skip recompiling unchanged kernels and references
+export JAX_COMPILATION_CACHE_DIR ?= $(HOME)/.cache/e3j/jax
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS ?= 0
+
+# one xdist worker per local TPU chip
+test_mosaic_tpu_single_device:
+	uv run pytest -v -n $(TPU_CHIPS) -m "mosaic_tpu and not multi_devices" tests/
+
+# every local TPU chip in one process
+test_mosaic_tpu_multi_devices:
+	uv run pytest -v -m "mosaic_tpu and multi_devices" tests/
+
+# l_max=2 single-device subset for iterating; `test_mosaic_tpu` before review
+test_mosaic_tpu_fast:
+	uv run pytest -v -n $(TPU_CHIPS) -m "mosaic_tpu and not multi_devices and not slow" tests/
+
 test_mosaic_tpu:
-	uv run pytest -v -m "mosaic_tpu" tests/
+	$(MAKE) test_mosaic_tpu_single_device
+	$(MAKE) test_mosaic_tpu_multi_devices
 
 test: $(CU_TEST) pytest
 

@@ -25,8 +25,7 @@ WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
 
-ENV UV_GROUPS="--group cuda13_local --group exp"
-#ENV UV_GROUPS="--group cuda13_local --group exp --group openeq --group cuet"
+ENV UV_GROUPS="--group cuda13_local"
 
 # Install system dependencies
 RUN apt-get update && apt-get upgrade -y \
@@ -73,6 +72,5 @@ RUN uv sync --extra ops $UV_GROUPS --inexact --frozen
 # Copy recipes scripts and tests
 RUN mkdir bin/
 COPY Makefile Makefile
-COPY scripts scripts
 COPY tests tests
 COPY pytest.ini pytest.ini
