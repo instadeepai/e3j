@@ -18,7 +18,7 @@ The equivariance backend of our MLIP library is [e3j] as of [mlip] 0.2.0.
 
 The [`e3j`][e3j-pypi] package is available on PyPI.
 It consists of a thin JAX-based Python API which can run on CPU, GPU and TPU,
-supporting  Python versions from 3.11 to 3.14 included.
+supporting  Python versions from 3.12 to 3.14 included.
 
 For efficiency on GPU, our CUDA binaries are bundled as the [`e3j_ops`][e3j-ops-pypi]
 package on PyPI. The compatible version of the binaries should

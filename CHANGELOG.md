@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 
 ## [Unreleased]
 
+### Changed
+
+- `e3j_ops` now requires Python 3.12 or later, like `e3j`; cp311 wheels are no
+  longer built.
+
 ## [0.1.2] — 2026-10-05
 
 ### Added
