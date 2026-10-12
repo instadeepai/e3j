@@ -64,10 +64,9 @@ dev = [
     "pytest-cov == 5.0.0",
     "pytest-env == 1.1.5",
     "pytest-xdist == 3.8.0",
-    "seaborn == 0.13.2",
     "pre-commit == 3.7.1",
     "pybind11 >= 2.13.6",
-    "wheel>=0.45.1,<0.47.0"
+    "wheel>=0.45.1,<0.47.0",
 ]
 
 docs = [
