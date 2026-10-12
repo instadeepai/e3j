@@ -10,6 +10,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 
 - `e3j_ops` now requires Python 3.12 or later, like `e3j`; cp311 wheels are no
   longer built.
+- CUDA tensor product and convolution kernels balance coefficients across warps
+  on the host, at trace time, instead of on the device.
+- The CUDA convolution now requires a concrete `coef`: a traced one (e.g. a jit
+  argument) raises a `TypeError`, like the tensor product and Mosaic kernels.
+
+### Fixed
+
+- CUDA convolution backward: a race on the shared `dx` buffer could corrupt `dx`
+  on graphs with more than 8192 nodes or wide channels.
+- CUDA tensor product: warps without coefficients skipped a block barrier in
+  INNER reductions (undefined behaviour).
 
 ## [0.1.2] — 2026-10-05
 

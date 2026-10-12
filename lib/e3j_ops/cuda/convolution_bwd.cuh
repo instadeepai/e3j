@@ -47,6 +47,8 @@ namespace convolution {
  *     @param p convolution parameters / problem sizes
  *     @param stream CUDA stream
  *     @param debug debug level
+ *     @param block_y host-chosen blockDim.y
+ *     @param coef_ranges per-warp coefficient ranges
 
  *************************************************/
 template <typename Idx, typename Val>
@@ -63,8 +65,15 @@ e3j::Error launch_bwd(
     Val *ds,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y = 0,
+    const int *coef_ranges = nullptr
 );
+
+// Export register count for N in {1, 2, 4}  via `cudaFuncGetAttributes`,
+// for occupancy-constraints-aware Python-side coefficient distribution.
+template <typename Idx, typename Val>
+int get_registers_bwd(int N);
 
 } // namespace convolution
 } // namespace e3j

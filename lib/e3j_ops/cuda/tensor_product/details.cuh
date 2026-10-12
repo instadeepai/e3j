@@ -60,64 +60,6 @@ namespace tensor_product {
         int end;
     };
 
-    // Cooperative find_coef_bounds: all threads race via atomicMin
-    // to claim the nearest cut at each output-index boundary.
-    // smem_cuts: int[blockDim.y + 1] scratch in shared memory.
-    // Assumes num_coef < 2^16.
-    template<typename Idx, typename Val, template<typename,typename> class CoefT=Coef>
-    __device__ CoefRange
-    find_coef_bounds(
-        int *smem_cuts,
-        const CoefT<Idx, Val> *coef,
-        int num_coef,
-        int num_out
-    ) {
-        int tid = threadIdx.x + threadIdx.y * blockDim.x;
-        int stride = blockDim.x * blockDim.y;
-        int num_warps = blockDim.y;
-        int coefs_per_warp = (num_coef + num_warps - 1) / num_warps;
-
-        if (num_warps == 1)
-            return {0, num_coef};
-
-        #pragma unroll 1
-        for (int w = tid; w <= num_warps; w += stride)
-            smem_cuts[w] = (w == 0) ? 0 : (w == num_warps) ? num_coef : INT_MAX;
-        __syncthreads();
-
-        #pragma unroll 1
-        for (int i = tid; i < num_coef - 1; i += stride) {
-            if (coef[i].i != coef[i + 1].i) {
-                int cut = i + 1;
-                int w = (cut + coefs_per_warp / 2) / coefs_per_warp;
-                if (w >= 1 && w < num_warps
-                    && coef[cut].i < num_out - (num_warps - w)) {
-                    int dist = abs(cut - w * coefs_per_warp);
-                    atomicMin(&smem_cuts[w], (dist << 16) | cut);
-                }
-            }
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            #pragma unroll 1
-            for (int w = 1; w < num_warps; w++) {
-                int packed = smem_cuts[w];
-                int pos = (packed == INT_MAX) ? smem_cuts[w - 1] : (packed & 0xFFFF);
-                smem_cuts[w] = max(pos, smem_cuts[w - 1]);
-            }
-        }
-        __syncthreads();
-
-        CoefRange result = {
-            smem_cuts[threadIdx.y],
-            smem_cuts[threadIdx.y + 1],
-        };
-        __syncthreads();
-        return result;
-
-    }
-
 namespace leading_channels {
 
     template<typename Idx, typename Val, Mode kMode>

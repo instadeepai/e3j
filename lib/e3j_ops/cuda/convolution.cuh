@@ -52,6 +52,7 @@ struct Params {
     int32_t num_out;
     int32_t num_scalars;  // radial_embedding.numel
     int32_t channels_x;   // channels_y = 1
+    int32_t num_edges;    // backward only: zeroes padding-edge cotangents
 };
 
 /****************************************************************************
@@ -90,6 +91,8 @@ struct AdjacencyCSR {
  *  @param p additional problem parameters.
  *  @param stream CUDA stream (default 0)
  *  @param debug flag for stricter error catching and verbose logging.
+ *  @param block_y host-chosen blockDim.y
+ *  @param coef_ranges per-warp coefficient ranges, of length block_y (see kernel)
  *
  *****************************************************************************/
 template <typename Idx, typename Val>
@@ -102,8 +105,17 @@ e3j::Error launch(
     Val *m,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *coef_ranges
 );
+
+// Registers/thread for `convolution::kernel<Idx, Val, N>` (N in {1, 2, 4}),
+// via `cudaFuncGetAttributes`. Lets Python's `choose_block_y` cap
+// `resident_blocks` by the register budget too, not just SMEM and thread
+// count (see `e3j.ops.coef_ranges`).
+template <typename Idx, typename Val>
+int get_registers(int N);
 
 } // namespace convolution
 } // namespace e3j

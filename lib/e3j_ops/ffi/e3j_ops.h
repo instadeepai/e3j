@@ -126,6 +126,7 @@ xla::Error TensorProductHandler(
     xla::AnyBuffer coef,
     xla::AnyBuffer x,
     xla::AnyBuffer y,
+    xla::BufferR1<xla::DataType::S32> coef_ranges,
     xla::Result<xla::AnyBuffer> out,
     int32_t num_out,
     int32_t _mode,
@@ -207,12 +208,19 @@ xla::Error TensorProductHandler(
             .mode = mode,                                       \
             .layout = layout                                    \
         };                                                      \
+                                                                \
+        /* Empty for LEADING_CHANNELS. */                       \
+        int32_t block_y = coef_ranges.element_count();          \
+        const int *coef_ranges_ptr =                            \
+            coef_ranges.element_count()                         \
+                ? coef_ranges.typed_data() : nullptr;           \
+                                                                \
         return e3j::tensor_product::launch<Idx, Val>(           \
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
             y.typed_data<Val>(),                                \
             out->typed_data<Val>(),                             \
-            params, stream, debug                               \
+            params, stream, debug, block_y, coef_ranges_ptr     \
         ).to_xla();
 
     // The packed buffer is typed as idx_t but holds Coef<idx_t, val_t> structs.
@@ -235,6 +243,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // coef (packed Coef<Idx,Val> as idx_t vector)
         .Arg<xla::AnyBuffer>()   // x
         .Arg<xla::AnyBuffer>()   // y
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // coef_ranges
         .Ret<xla::AnyBuffer>()
         .Attr<int32_t>("num_out")
         .Attr<int32_t>("mode")
@@ -252,6 +261,7 @@ xla::Error TensorProductBwdHandler(
     xla::AnyBuffer x,
     xla::AnyBuffer y,
     xla::AnyBuffer dz,
+    xla::BufferR1<xla::DataType::S32> coef_ranges,
     xla::Result<xla::AnyBuffer> dx,
     xla::Result<xla::AnyBuffer> dy,
     int32_t _mode_fwd,
@@ -322,6 +332,10 @@ xla::Error TensorProductBwdHandler(
             coef.typed_data<Idx>()                              \
         );                                                      \
                                                                 \
+        /* One range per warp and pass (dx, dy). */             \
+        int32_t block_y = coef_ranges.element_count() / 2;      \
+        const int *coef_ranges_ptr = coef_ranges.typed_data();  \
+                                                                \
         return launch_bwd<Idx, Val>(                            \
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
@@ -329,7 +343,8 @@ xla::Error TensorProductBwdHandler(
             dz.typed_data<Val>(),                               \
             dx->typed_data<Val>(),                              \
             dy->typed_data<Val>(),                              \
-            params_fwd, stream, debug                           \
+            params_fwd, stream, debug,                          \
+            block_y, coef_ranges_ptr                            \
         ).to_xla();
 
     __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
@@ -349,6 +364,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // x
         .Arg<xla::AnyBuffer>()   // y
         .Arg<xla::AnyBuffer>()   // z
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // coef_ranges
         .Ret<xla::AnyBuffer>()   // dx
         .Ret<xla::AnyBuffer>()   // dy
         .Attr<int32_t>("mode")
@@ -368,6 +384,7 @@ xla::Error ConvolutionHandler(
     xla::AnyBuffer s,
     xla::BufferR1<xla::DataType::S32> sender,
     xla::BufferR1<xla::DataType::S32> receiver_ptr,
+    xla::BufferR1<xla::DataType::S32> coef_ranges,
     xla::Result<xla::AnyBuffer> out,
     int32_t num_nodes,
     int debug = 0
@@ -417,6 +434,9 @@ xla::Error ConvolutionHandler(
             .receiver_ptr = receiver_ptr.typed_data(),          \
         };                                                      \
                                                                 \
+        int32_t block_y = coef_ranges.element_count();          \
+        const int *coef_ranges_ptr = coef_ranges.typed_data();  \
+                                                                \
         return e3j::convolution::launch<Idx, Val>(              \
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
@@ -424,7 +444,7 @@ xla::Error ConvolutionHandler(
             s.typed_data<Val>(),                                \
             adj,                                                \
             out->typed_data<Val>(),                             \
-            params, stream, debug                               \
+            params, stream, debug, block_y, coef_ranges_ptr     \
         ).to_xla();
 
     __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
@@ -445,6 +465,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::AnyBuffer>()   // s (radial scalars)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (CSR)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // coef_ranges
         .Ret<xla::AnyBuffer>()   // out (output node features)
         .Attr<int32_t>("num_nodes")
         .Attr<int32_t>("debug")
@@ -464,6 +485,7 @@ xla::Error ConvolutionBwdHandler(
     xla::BufferR1<xla::DataType::S32> sender,
     xla::BufferR1<xla::DataType::S32> receiver_ptr,
     xla::BufferR1<xla::DataType::S32> edge_perm,
+    xla::BufferR1<xla::DataType::S32> coef_ranges,
     xla::Result<xla::AnyBuffer> dx,
     xla::Result<xla::AnyBuffer> dy,
     xla::Result<xla::AnyBuffer> ds,
@@ -510,6 +532,7 @@ xla::Error ConvolutionBwdHandler(
             .num_out = num_out,                                 \
             .num_scalars = num_scalars,                         \
             .channels_x = channels_x,                           \
+            .num_edges = (int32_t)dims_y[0],                    \
         };                                                      \
                                                                 \
         e3j::convolution::AdjacencyCSR adj = {                  \
@@ -524,6 +547,10 @@ xla::Error ConvolutionBwdHandler(
             edge_perm.element_count()                           \
                 ? edge_perm.typed_data() : nullptr;             \
                                                                 \
+        /* One range per warp and pass (dx, dy, ds). */         \
+        int32_t block_y = coef_ranges.element_count() / 3;      \
+        const int *coef_ranges_ptr = coef_ranges.typed_data();  \
+                                                                \
         return e3j::convolution::launch_bwd<Idx, Val>(          \
             coef_ptr,                                           \
             x.typed_data<Val>(),                                \
@@ -535,7 +562,7 @@ xla::Error ConvolutionBwdHandler(
             dx->typed_data<Val>(),                              \
             dy->typed_data<Val>(),                              \
             ds->typed_data<Val>(),                              \
-            params, stream, debug                               \
+            params, stream, debug, block_y, coef_ranges_ptr     \
         ).to_xla();
 
     __DISPATCH_DTYPE_PAIR(coef.element_type(), x.element_type())
@@ -558,6 +585,7 @@ XLA_FFI_DEFINE_HANDLER(
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // sender (transposed CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // receiver_ptr (transposed CSR)
         .Arg<xla::BufferR1<xla::DataType::S32>>()  // edge_perm (transposed → original)
+        .Arg<xla::BufferR1<xla::DataType::S32>>()  // coef_ranges
         .Ret<xla::AnyBuffer>()   // dx (cotangent node features)
         .Ret<xla::AnyBuffer>()   // dy (cotangent edge features)
         .Ret<xla::AnyBuffer>()   // ds (cotangent edge scalars)

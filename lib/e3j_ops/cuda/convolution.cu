@@ -30,8 +30,15 @@ template e3j::Error launch<Idx, Val>(              \
     Val *m,                                        \
     Params p,                                      \
     cudaStream_t stream,                           \
-    int debug                                      \
+    int debug,                                     \
+    int block_y,                                   \
+    const int *coef_ranges                         \
 );
+__FOR_EACH_DTYPE_PAIR
+#undef FOR_EACH_DTYPE_PAIR
+
+#define FOR_EACH_DTYPE_PAIR(Idx, Val) \
+template int get_registers<Idx, Val>(int N);
 __FOR_EACH_DTYPE_PAIR
 #undef FOR_EACH_DTYPE_PAIR
 

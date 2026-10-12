@@ -90,7 +90,7 @@ struct LaunchConfig {
         }
     }
 
-    static LaunchConfig get_hints(Params p, int debug, int N=-1) {
+    static LaunchConfig get_hints(Params p, int debug, int block_y, int N=-1) {
 
         // SMEM : [ Coef | kx * num_x | ky * num_y ]
 
@@ -121,21 +121,8 @@ struct LaunchConfig {
         }
         threadsX = max(32, 32 * (threadsX / 32));
 
-        // Estimate load, shared and coef sizes with blockDim.y = 1.
-        Sizes size = get_sizes(p, {threadsX, 1, 1}, N);
-
-        // Parallelize work over non-overlapping output coefficients:
-        //  - bound blockDim.y by the number of output coordinates
-        //  - ensure maxBlocks * blockSize tends to 2048 threads/SM
-        unsigned int maxBlocks = device.smem_max / size.smem;
-        unsigned int threadsY = 1;
-        while (
-            maxBlocks * threadsX * threadsY < 2048
-            and threadsX * threadsY < MAX_BLOCK_SIZE
-            and threadsY <=  (unsigned int)p.num_out / 2
-        ) {
-            threadsY *= 2;
-        }
+        // Host-supplied blockDim.y, matching the coefficient ranges.
+        unsigned int threadsY = (unsigned int)block_y;
 
         Sizes sizes = get_sizes(p, {threadsX, threadsY, 1}, N);
 
@@ -229,9 +216,14 @@ e3j::Error launch(
     Val *gmem_out,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *gmem_coef_ranges
 ) {
-    LaunchConfig<Idx,Val,kMode> cfg = LaunchConfig<Idx,Val,kMode>::get_hints(p, debug);
+    if (gmem_coef_ranges == nullptr || block_y <= 0)
+        return e3j::Error::InvalidArgument("tensor_product: coef_ranges of length block_y is required");
+
+    LaunchConfig<Idx,Val,kMode> cfg = LaunchConfig<Idx,Val,kMode>::get_hints(p, debug, block_y);
     if (cfg.error.failure())
         return cfg.error;
 
@@ -258,7 +250,7 @@ e3j::Error launch(
     #define LAUNCH(N, STRIDED)                                          \
     trailing_channels::kernel<Idx,Val,kMode,N,STRIDED>                  \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>           \
-        (coef, x, y, out, p.num_rows, p.num_idx, unroll)
+        (coef, x, y, out, p.num_rows, p.num_idx, unroll, gmem_coef_ranges)
 
     switch(cfg.N) {
         case 4:

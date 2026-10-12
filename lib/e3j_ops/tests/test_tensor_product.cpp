@@ -209,6 +209,7 @@ int test_tensor_product (Params p, int num_strips=NUM_STRIPS) {
 
     CoefT *coef_d;
     float *x_d, *y_d, *out_d;
+    int *coef_ranges_d;
 
     int cz = p.channels_out();
 
@@ -221,17 +222,23 @@ int test_tensor_product (Params p, int num_strips=NUM_STRIPS) {
 	cudaMalloc((void**)&x_d, size_x);
 	cudaMalloc((void**)&y_d, size_y);
 	cudaMalloc((void**)&out_d, size_out);
+	cudaMalloc((void**)&coef_ranges_d, sizeof(int));
 
 	cudaMemcpy(coef_d, args.coef.data(), size_coef, cudaMemcpyHostToDevice);
 	cudaMemcpy(x_d, args.x.data(), size_x, cudaMemcpyHostToDevice);
 	cudaMemcpy(y_d, args.y.data(), size_y, cudaMemcpyHostToDevice);
 	cudaMemcpy(out_d, args.out.data(), size_out, cudaMemcpyHostToDevice);
+    // Single-warp coefficient range [0, num_idx): no host-side balancing,
+    // this test only exercises kernel correctness (see `e3j.ops.coef_ranges`
+    // for the balanced partition used by the JAX-facing op).
+    cudaMemcpy(coef_ranges_d, &p.num_idx, sizeof(int), cudaMemcpyHostToDevice);
 
     cudaDeviceSynchronize();
 
 	// Call tensor product kernel
 	e3j::tensor_product::launch<Idx, float>(
-		coef_d, x_d, y_d, out_d, p, cudaStream_t(0), DEBUG
+		coef_d, x_d, y_d, out_d, p, cudaStream_t(0), DEBUG,
+		/*block_y=*/1, coef_ranges_d
 	);
 
 	cudaDeviceSynchronize();
@@ -251,6 +258,7 @@ int test_tensor_product (Params p, int num_strips=NUM_STRIPS) {
     cudaFree(x_d);
     cudaFree(y_d);
     cudaFree(out_d);
+    cudaFree(coef_ranges_d);
 
 	return 0;
 }

@@ -283,12 +283,17 @@ namespace trailing_channels {
         using Coef = Coef<Idx, Val>;
         using IdxVal = IdxVal<Idx, Val, N>;
 
-        int col = range.begin;
-        Coef c = coef[col];
-        IdxVal zi,
-               acc = {c.i, broadcast<N,Val>(Val(0))};
-        // Warps that found no coefficient boundary of their own must skip
+        // Empty coef slice: skip, else coef[range.begin] reads past the coef array.
+        // Host-side balancing (see `e3j.ops.coef_ranges`) can hand a warp an empty
+        // range whenever blockDim.y exceeds a pass's row count.
         bool has_coef = range.begin < range.end;
+
+        int col = range.begin;
+        IdxVal zi;
+        IdxVal acc = {
+           has_coef ? coef[col].i : Idx(0),
+           broadcast<N,Val>(Val(0))
+        };
 
         int lane = threadIdx.x % 32;
         int warp = threadIdx.x / 32;
@@ -333,10 +338,7 @@ namespace trailing_channels {
                 // NOTE: partial warp sums have to be accumulated in SMEM
                 //       as we can't synchronize over blockDim.y without
                 //       reaching deadlock within the loop over coefficients.
-                if (!has_coef) {
-                    return;
-                }
-                while (col <= range.end) {
+                while (has_coef && col <= range.end) {
                     // Sum z[i] over 32 channels at a time
                     zi = accumulate_products<Idx,Val,kMode,N>(
                         acc, coef, col, range.end, lhs.data, rhs.data, lhs.shape[1], rhs.shape[1]
@@ -376,7 +378,8 @@ __global__ void kernel(
     CuArray2D<Val> z,
     int num_rows,
     int num_coef,
-    dim3 unroll
+    dim3 unroll,
+    const int *coef_ranges = nullptr
 ) {
     using Coef = Coef<Idx,Val>;
     using Buffers = Buffers<Val>;
@@ -416,10 +419,9 @@ __global__ void kernel(
     // Allocate addresses from start of char* pointer.
     smem.to_shared<1>(smem_);
 
-    // Distribute coefficients across blockDim.y, without z-index overlap
-    CoefRange coef_range = find_coef_bounds<Idx, Val>(
-        reinterpret_cast<int*>(smem_), coef, num_coef, z.shape[0]
-    );
+    // Per-warp coefficient range, precomputed on the host.
+    unsigned int wy = threadIdx.y;
+    CoefRange coef_range = { wy ? coef_ranges[wy - 1] : 0, coef_ranges[wy] };
 
     // First row is blockIdx.x, then stride.
     x.data += blockIdx.x * size_x;

@@ -31,13 +31,15 @@ e3j::Error launch(
     Val *out,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *coef_ranges
 ) {
     switch(p.layout) {
 
         case Layout::TRAILING_CHANNELS: {
             return trailing_channels::launch<Idx,Val,kMode>
-                (coef, x, y, out, p, stream, debug);
+                (coef, x, y, out, p, stream, debug, block_y, coef_ranges);
         }
 
         case Layout::LEADING_CHANNELS:
@@ -58,11 +60,14 @@ e3j::Error launch(
     Val *out,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *coef_ranges
 ) {
     #define DISPATCH_MODE(MODE)                      \
-    return launch<Idx, Val, MODE>(                   \
-        coef, x, y, out, p, stream, debug            \
+    return launch<Idx, Val, MODE>(                    \
+        coef, x, y, out, p, stream, debug,            \
+        block_y, coef_ranges                          \
     );
 
     #define DISPATCH_MODE_ERROR(MODE) \
@@ -82,7 +87,9 @@ template e3j::Error launch<Idx, Val>(              \
     Val *out,                                      \
     Params p,                                      \
     cudaStream_t stream,                           \
-    int debug                                      \
+    int debug,                                     \
+    int block_y,                                   \
+    const int *coef_ranges                         \
 );
 __FOR_EACH_DTYPE_PAIR
 #undef FOR_EACH_DTYPE_PAIR

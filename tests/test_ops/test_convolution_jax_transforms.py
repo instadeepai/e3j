@@ -26,12 +26,14 @@ from jax.experimental.topologies import get_topology_desc
 
 import e3j
 from e3j.core.convolution import Convolution
+from e3j.data.graph import DUMMY_INDEX
 from e3j.ops.coef import Coef4D
 from e3j.ops.convolution import (
     ConvolutionBatchingWarning,
     CUDAConvolutionParams,
     convolution,
 )
+from e3j.utils.options import GraphOrdering
 from e3j.utils.sparse import narrow_index_dtype
 
 e3j.config(debug_level=0)
@@ -264,6 +266,44 @@ def test_masked_backward_zeros_padding_dx(ordering):
     testing.assert_allclose(dx_fused, dx_unfused, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("ordering", ["RECEIVER", "SENDER"])
+def test_backward_zeros_sender_only_padding_edges(ordering):
+    """Backward: edges whose sender alone is `DUMMY_INDEX` get zero dy/ds.
+
+    They sort past the last row of the sender-grouped CSR, so the kernel never
+    visits them, but must still write their cotangents.
+    """
+    coef, x, y, s, sender, receiver, params, *_ = generate_conv_data()
+    pad = np.arange(NUM_EDGES) >= NUM_EDGES - 3
+    sender = np.where(pad, DUMMY_INDEX, sender)
+    if ordering == "SENDER":
+        order = np.argsort(sender, stable=True)
+        sender, receiver, y, s, pad = (a[order] for a in (sender, receiver, y, s, pad))
+
+    def loss(y, s):
+        z = convolution(
+            coef,
+            x,
+            y,
+            s,
+            sender,
+            receiver,
+            params,
+            GraphOrdering[ordering],
+            y_parity=onp.ones(NUM_Y),
+        )
+        return np.sum(z**2)
+
+    # Recycle NaN-filled device memory, so unwritten cotangents show up.
+    np.full((1 << 24,), np.nan).block_until_ready()
+    dy, ds = jax.grad(loss, argnums=(0, 1))(y, s)
+
+    testing.assert_array_equal(jax.device_get(dy[pad]), 0.0)
+    testing.assert_array_equal(jax.device_get(ds[pad]), 0.0)
+    assert np.isfinite(dy).all()
+    assert np.isfinite(ds).all()
+
+
 @pytest.mark.multi_devices
 def test_vmap_convolution_execute_multi_devices():
     "Check that running on multiple device give the same result as each run individualy."
@@ -407,7 +447,8 @@ def test_vmap_fwd_convolution_multi_devices():
         r"f32\[24,4\]\{1,0\}, "  # y (edge embeddings)
         r"f32\[24,2,32\]\{2,1,0\}, "  # s (edge scalars)
         r"s32\[24\]\{0\}, "  # sender (COO, sharded edge-wise)
-        r"s32\[9\]\{0\}\}",  # receiver_ptr (shard-local CSR)
+        r"s32\[9\]\{0\}, "  # receiver_ptr (shard-local CSR)
+        r"s32\[2\]\{0\}\}",  # coef_ranges (1 pass * blockDim.y=2)
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(hlo))) == 1, (
@@ -477,7 +518,8 @@ def test_vmap_grad_convolution_multi_devices():
         r"f32\[8,4,32\]\{2,1,0\}, "  # dm (output cotangent)
         r"s32\[24\]\{0\}, "  # sender_t (shard-local transposed CSR)
         r"s32\[9\]\{0\}, "  # receiver_ptr_t
-        r"s32\[24\]\{0\}\}",  # perm (edge permutation)
+        r"s32\[24\]\{0\}, "  # perm (edge permutation)
+        r"s32\[6\]\{0\}\}",  # coef_ranges (3 passes * blockDim.y=2)
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(hlo))) == 1, (
@@ -570,6 +612,28 @@ def test_vmap_grad_convolution_multi_devices_numerical():
 
     for ref, shard in zip(g_ref, g_sharded):
         testing.assert_array_equal(jax.device_get(shard), jax.device_get(ref))
+
+
+# --- gradient ---
+
+
+def test_grad_convolution_matches_reference():
+    """Gradients match the reference with reordered backward coefficients."""
+    coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
+
+    def f_op(x, y, s):
+        return np.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
+
+    def f_ref(x, y, s):
+        z = convolution_reference(
+            idx, val, x, y, s, s_index, sender, receiver, params.num_out
+        )
+        return np.sum(z**2)
+
+    g_op = jax.grad(f_op, argnums=(0, 1, 2))(x, y, s)
+    g_ref = jax.grad(f_ref, argnums=(0, 1, 2))(x, y, s)
+    for a, b in zip(g_op, g_ref):
+        testing.assert_allclose(a, b, atol=1e-4, rtol=1e-4)
 
 
 # --- Hessian (jacrev ∘ grad) ---

@@ -22,7 +22,7 @@
 #include "cuda/array.cuh"
 #include "ffi/error.h"
 
-#define MAX_BLOCK_SIZE 256
+#define MAX_BLOCK_SIZE 1024
 
 namespace e3j {
 namespace convolution {
@@ -45,7 +45,7 @@ struct LaunchConfigBwd {
     int N;
 
     // SMEM layout matching BuffersBwd::to_shared:
-    //   [ coef(3x) | dm | x | y | mix | dx | dy_scratch ]
+    //   [ coef(3x) | dm | x | y | mix | dy_scratch ]
     static SizesBwd get_sizes(Params p, dim3 blockDims, int N) {
 
         constexpr int A = 16 / sizeof(Val);
@@ -55,13 +55,12 @@ struct LaunchConfigBwd {
         size_t size_x   = ((size_t)unroll_x * p.num_x       + A-1) / A * A;
         size_t size_y   = ((size_t)p.num_y                   + A-1) / A * A;
         size_t size_mix = ((size_t)unroll_x * p.num_scalars  + A-1) / A * A;
-        size_t size_dx  = ((size_t)unroll_x * p.num_x        + A-1) / A * A;
         int num_warps = max(1u, blockDims.x / 32);
         size_t size_scratch = (size_t)num_warps * p.num_y;
 
         size_t sizeLoad = sizeof(Val) * (
             size_dm + size_x + size_y + size_mix
-            + size_dx + size_scratch
+            + size_scratch
         );
 
         size_t sizeCoef = (size_t)(3 * p.num_coef) * sizeof(Coef4D<Idx,Val>);
@@ -90,7 +89,7 @@ struct LaunchConfigBwd {
         }
     }
 
-    static LaunchConfigBwd get_hints(Params p, int debug, int N=-1) {
+    static LaunchConfigBwd get_hints(Params p, int debug, int block_y, int N=-1) {
 
         DeviceProperties device = DeviceProperties::query();
         int smem_top = device.smem_max / 2;
@@ -99,12 +98,14 @@ struct LaunchConfigBwd {
         if (find_N)
             N = get_vectorization(p);
 
-        // Bound blockDim.x to avoid SMEM overflow.
-        // Channel-scaled buffers: dm + x + mix + dx.
+        // Bound blockDim.x to avoid SMEM overflow and fit MAX_BLOCK_SIZE.
+        // Channel-scaled buffers: dm + x + mix.
         unsigned int size_per_ch =
-            sizeof(Val) * (p.num_out + 2 * p.num_x + p.num_scalars);
+            sizeof(Val) * (p.num_out + p.num_x + p.num_scalars);
         unsigned int threadsX = p.channels_x / N;
-        while (size_per_ch * threadsX * N > smem_top && threadsX > 32) {
+        while ((size_per_ch * threadsX * N > smem_top
+                || threadsX * (unsigned int)block_y > MAX_BLOCK_SIZE)
+               && threadsX > 32) {
             threadsX /= 2;
         }
         if (find_N) {
@@ -119,20 +120,8 @@ struct LaunchConfigBwd {
                 N /= 2;
         }
 
-        // Estimate SMEM footprint with blockDim.y = 1.
-        SizesBwd size = get_sizes(p, {threadsX, 1, 1}, N);
-
-        // Distribute coeffiecients over blockDim.y to increase occupancy.
-        unsigned int maxBlocks = device.smem_max / size.smem;
-        unsigned int threadsY = 1;
-        while (
-            maxBlocks * threadsX * threadsY < 2048
-            and threadsX * threadsY < MAX_BLOCK_SIZE
-            and threadsY <= (unsigned int)p.num_out / 2
-        ) {
-            threadsY *= 2;
-        }
-
+        // Host-supplied blockDim.y, matching the coefficient ranges.
+        unsigned int threadsY = (unsigned int)block_y;
         SizesBwd sizes = get_sizes(p, {threadsX, threadsY, 1}, N);
 
         unsigned int blocksX = min(p.num_nodes, (int32_t)8192);
@@ -150,6 +139,13 @@ struct LaunchConfigBwd {
     }
 
     void validate(SizesBwd sizes, DeviceProperties device, int debug) {
+        if (blockDim.x * blockDim.y > MAX_BLOCK_SIZE) {
+            error = e3j::Error::InvalidArgument(
+                "e3j_ops.convolution_bwd: block size "
+                + std::to_string(blockDim.x * blockDim.y)
+                + " exceeds " + std::to_string(MAX_BLOCK_SIZE) + " threads");
+            return;
+        }
         switch(N) {
             case 4:  return validate<4>(sizes, device, debug);
             case 2:  return validate<2>(sizes, device, debug);
@@ -216,11 +212,16 @@ e3j::Error launch_bwd(
     Val *gmem_ds,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *gmem_coef_ranges
 ) {
 
+    if (gmem_coef_ranges == nullptr or block_y <= 0)
+        return e3j::Error::InvalidArgument("convolution_bwd: coef_ranges of length 3 * block_y is required");
+
     LaunchConfigBwd<Idx, Val> cfg =
-        LaunchConfigBwd<Idx, Val>::get_hints(p, debug);
+        LaunchConfigBwd<Idx, Val>::get_hints(p, debug, block_y);
     if (cfg.error.failure())
         return cfg.error;
 
@@ -239,7 +240,8 @@ e3j::Error launch_bwd(
     convolution::kernel_bwd<Idx,Val,N>                                       \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>                \
         (coef, x, y, s, dm, adj, edge_perm,                                  \
-         gmem_dx, gmem_dy, gmem_ds, p.num_nodes, p.num_coef, unroll)
+         gmem_dx, gmem_dy, gmem_ds, p.num_nodes, p.num_edges, p.num_coef,    \
+         unroll, gmem_coef_ranges)
 
     switch(cfg.N) {
         case 4:  LAUNCH_BWD(4); break;
@@ -260,6 +262,20 @@ e3j::Error launch_bwd(
     }
 
     return e3j::Error::Success();
+}
+
+
+template<typename Idx, typename Val>
+int get_registers_bwd(int N) {
+    cudaFuncAttributes attr{};
+    #define REGS(N) cudaFuncGetAttributes(&attr, convolution::kernel_bwd<Idx,Val,N>)
+    switch(N) {
+        case 4:  REGS(4); break;
+        case 2:  REGS(2); break;
+        default: REGS(1); break;
+    }
+    #undef REGS
+    return attr.numRegs;
 }
 
 

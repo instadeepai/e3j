@@ -21,7 +21,7 @@ from jax import Array
 
 import e3j
 from e3j.ops.coef import Coef4D
-from e3j.ops.convolution import CUDAConvolutionParams, convolution
+from e3j.ops.convolution import CUDAConvolutionParams, convolution, convolution_bwd
 from e3j.utils.sparse import narrow_index_dtype
 
 e3j.config(debug_level=0)
@@ -237,6 +237,47 @@ class TestConvolution256(_TestConvolutionOp):
     num_out = 16
     num_scalars = 4
     channels_x = 256
+
+
+class TestConvolutionWide(_TestConvolutionOp):
+    """Scalar irreps at 4096 channels: blockDim.x alone is 1024 threads."""
+
+    num_idx = 1
+    num_x = 1
+    num_y = 1
+    num_out = 1
+    num_scalars = 1
+    channels_x = 4096
+
+
+class TestConvolutionWideVector(_TestConvolutionOp):
+    """Scalar nodes, vector edges at 8192 channels: blockDim.x is 1024 threads."""
+
+    num_idx = 4
+    num_x = 1
+    num_y = 4
+    num_out = 4
+    num_scalars = 1
+    channels_x = 8192
+
+
+def test_convolution_bwd_wide():
+    """`convolution_bwd` at 8192 scalar channels caps blockDim.x to 1024.
+
+    The forward exceeds the CUDA block limit there, so only the backward runs.
+    """
+    op = TestConvolutionWide()
+    op.channels_x = 8192
+    idx, val, s_index, params = op.closure()
+    sender, receiver = op.graph()
+    coef = pack_coef4d(val, np.stack([idx[0], idx[1], idx[2], s_index[idx[0]]]))
+    x, y, s = op.inputs()
+    out, vjp = jax.vjp(op.fwd_ref, x, y, s)
+    dm = random.normal(random.key(7), out.shape)
+
+    result = convolution_bwd(coef, x, y, s, sender, receiver, dm, params)
+    for expect, res in zip(vjp(dm), result):
+        assert_allclose(expect, res, atol=5e-5, rtol=5e-5)
 
 
 class TestConvolutionSmallNumOutRegression(_TestConvolutionOp):

@@ -84,7 +84,7 @@ struct LaunchConfigBwd {
         }
     }
 
-    static LaunchConfigBwd get_hints(Params p, int debug, int N=-1) {
+    static LaunchConfigBwd get_hints(Params p, int debug, int block_y, int N=-1) {
 
         // SMEM : [ kz * num_z | kx * num_x or ky * num_y ]
 
@@ -99,8 +99,8 @@ struct LaunchConfigBwd {
         ParamsBwd p_bwd = GetParamsBwd(p);
         using CfgLHS = LaunchConfig<Idx, Val, kxMode>;
         using CfgRHS = LaunchConfig<Idx, Val, kyMode>;
-        CfgLHS cfg_lhs = CfgLHS::get_hints(p_bwd.lhs, 0, -1);
-        CfgRHS cfg_rhs = CfgRHS::get_hints(p_bwd.rhs, 0, -1);
+        CfgLHS cfg_lhs = CfgLHS::get_hints(p_bwd.lhs, 0, block_y, -1);
+        CfgRHS cfg_rhs = CfgRHS::get_hints(p_bwd.rhs, 0, block_y, -1);
 
         dim3 grid = {
             min(p.num_rows, 8192),
@@ -195,12 +195,17 @@ e3j::Error launch_bwd(
     Val *gmem_dy,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *gmem_coef_ranges
 ) {
+
+    if (gmem_coef_ranges == nullptr || block_y <= 0)
+        return e3j::Error::InvalidArgument("tensor_product_bwd: coef_ranges of length 2 * block_y is required");
 
     // Determine backward modes on LHS and RHS (rotates channel arguments)
     using LaunchConfigBwd = LaunchConfigBwd<Idx,Val,kxMode, kyMode>;
-    LaunchConfigBwd cfg = LaunchConfigBwd::get_hints(p, debug);
+    LaunchConfigBwd cfg = LaunchConfigBwd::get_hints(p, debug, block_y);
     if (cfg.error.failure())
         return cfg.error;
 
@@ -223,7 +228,8 @@ e3j::Error launch_bwd(
     #define LAUNCH_BWD(N)                                               \
     kernel_bwd<Idx,Val,kxMode,kyMode,N>                                 \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>           \
-        (coef, x, y, dz, dx, dy, p.num_rows, p.num_idx, unroll)
+        (coef, x, y, dz, dx, dy, p.num_rows, p.num_idx, unroll,         \
+         gmem_coef_ranges)
 
     switch(cfg.N) {
         case 4:  LAUNCH_BWD(4); break;

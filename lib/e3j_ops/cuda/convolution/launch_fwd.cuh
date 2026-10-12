@@ -91,7 +91,7 @@ struct LaunchConfig {
         }
     }
 
-    static LaunchConfig get_hints(Params p, int debug, int N=-1) {
+    static LaunchConfig get_hints(Params p, int debug, int block_y, int N=-1) {
 
         DeviceProperties device = DeviceProperties::query();
         int smem_top = device.smem_max / 2;
@@ -120,22 +120,8 @@ struct LaunchConfig {
                 N /= 2;
         }
 
-        // Estimate SMEM footprint with blockDim.y = 1.
-        Sizes size = get_sizes(p, {threadsX, 1, 1}, N);
-
-        // Parallelize work over non-overlapping output coefficients:
-        //  - bound blockDim.y by the number of output coordinates
-        //  - ensure maxBlocks * blockSize tends to 2048 threads/SM
-        unsigned int maxBlocks = device.smem_max / size.smem;
-        unsigned int threadsY = 1;
-        while (
-            maxBlocks * threadsX * threadsY < 2048
-            and threadsX * threadsY < MAX_BLOCK_SIZE
-            and threadsY <= (unsigned int)p.num_out / 2
-        ) {
-            threadsY *= 2;
-        }
-
+        // Host-supplied blockDim.y, matching the coefficient ranges.
+        unsigned int threadsY = (unsigned int)block_y;
         Sizes sizes = get_sizes(p, {threadsX, threadsY, 1}, N);
 
         unsigned int blocksX = min(p.num_nodes, (int32_t)8192);
@@ -153,6 +139,15 @@ struct LaunchConfig {
     }
 
     void validate(Sizes sizes, DeviceProperties device, int debug) {
+        // blockDim.x alone may reach the CUDA limit of 1024 threads.
+        unsigned int max_threads = blockDim.y > 1 ? MAX_BLOCK_SIZE : 1024;
+        if (blockDim.x * blockDim.y > max_threads) {
+            error = e3j::Error::InvalidArgument(
+                "e3j_ops.convolution: block size "
+                + std::to_string(blockDim.x * blockDim.y)
+                + " exceeds " + std::to_string(max_threads) + " threads");
+            return;
+        }
         switch(N) {
             case 4:  return validate<4>(sizes, device, debug);
             case 2:  return validate<2>(sizes, device, debug);
@@ -215,10 +210,15 @@ e3j::Error launch(
     Val *gmem_out,
     Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y,
+    const int *gmem_coef_ranges
 ) {
 
-    LaunchConfig<Idx, Val> cfg = LaunchConfig<Idx, Val>::get_hints(p, debug);
+    if (gmem_coef_ranges == nullptr || block_y <= 0)
+        return e3j::Error::InvalidArgument("convolution: coef_ranges of length block_y is required");
+
+    LaunchConfig<Idx, Val> cfg = LaunchConfig<Idx, Val>::get_hints(p, debug, block_y);
     if (cfg.error.failure())
         return cfg.error;
 
@@ -242,7 +242,7 @@ e3j::Error launch(
     convolution::kernel<Idx,Val,N>                                         \
         <<<cfg.gridDim, cfg.blockDim, cfg.sizeSMEM, stream>>>              \
         (coef, x, y, s, adj, m,                                            \
-         p.num_nodes, p.num_coef, unroll)
+         p.num_nodes, p.num_coef, unroll, gmem_coef_ranges)
 
     switch(cfg.N) {
         case 4:  LAUNCH(4); break;
@@ -263,6 +263,20 @@ e3j::Error launch(
     }
 
     return e3j::Error::Success();
+}
+
+
+template<typename Idx, typename Val>
+int get_registers(int N) {
+    cudaFuncAttributes attr{};
+    #define REGS(N) cudaFuncGetAttributes(&attr, convolution::kernel<Idx,Val,N>)
+    switch(N) {
+        case 4:  REGS(4); break;
+        case 2:  REGS(2); break;
+        default: REGS(1); break;
+    }
+    #undef REGS
+    return attr.numRegs;
 }
 
 

@@ -18,6 +18,11 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --threads 4 -Xcompiler -w \
     -gencode=arch=compute_100,code=compute_100\
   -Xcompiler=-fPIC -Xcompiler=-fvisibility=hidden")
 
+option(E3J_LINEINFO "Emit CUDA source line info (-lineinfo)" OFF)
+if(E3J_LINEINFO)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+endif()
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto=auto -fno-fat-lto-objects")
 
 

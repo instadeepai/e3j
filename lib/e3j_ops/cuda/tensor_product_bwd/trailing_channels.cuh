@@ -81,7 +81,8 @@ __global__ void kernel_bwd(
     CuArray2D<Val> dy,
     int num_rows,
     int num_coef,
-    dim3 unroll
+    dim3 unroll,
+    const int *coef_ranges = nullptr
 ) {
 
     using Coef = Coef<Idx,Val>;
@@ -127,11 +128,13 @@ __global__ void kernel_bwd(
     const Coef *coef_dx = coef;
     const Coef *coef_dy = coef + num_coef;
 
-    // Distribute coefficients across blockDim.y, without z-index overlap.
-    // Reuses dz buffer (not yet populated) as int[blockDim.y + 1] scratch.
-    int *smem_cuts = reinterpret_cast<int*>(smem.dz.data);
-    CoefRange coef_range_dx = find_coef_bounds<Idx, Val>(smem_cuts, coef_dx, num_coef, dx.shape[0]);
-    CoefRange coef_range_dy = find_coef_bounds<Idx, Val>(smem_cuts, coef_dy, num_coef, dy.shape[0]);
+    // Per-warp coefficient ranges, precomputed on the host for each pass:
+    // `wait_pipe()` separates the two `otimes` calls below.
+    unsigned int warps_y = blockDim.y, wy = threadIdx.y;
+    CoefRange coef_range_dx = { wy ? coef_ranges[0*warps_y + wy - 1] : 0,
+                                     coef_ranges[0*warps_y + wy] };
+    CoefRange coef_range_dy = { wy ? coef_ranges[1*warps_y + wy - 1] : 0,
+                                     coef_ranges[1*warps_y + wy] };
 
     // Block-wise row offsets
     x.data += blockIdx.x * size_x;

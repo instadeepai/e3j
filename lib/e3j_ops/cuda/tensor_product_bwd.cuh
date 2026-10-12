@@ -37,7 +37,9 @@ e3j::Error launch_bwd(
     Val *dy,
     const Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y = 0,
+    const int *coef_ranges = nullptr
 );
 
 template<typename Idx, typename Val>
@@ -50,7 +52,9 @@ e3j::Error launch_bwd(
     Val *dy,
     const Params p,
     cudaStream_t stream,
-    int debug
+    int debug,
+    int block_y = 0,
+    const int *coef_ranges = nullptr
 );
 
 }// namespace trailing_channels

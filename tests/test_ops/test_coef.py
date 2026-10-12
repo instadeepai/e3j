@@ -177,6 +177,19 @@ class _TestIdxDtypeRoundTrip:
             numpy.asarray(recovered.idx), numpy.asarray(coef.idx)
         )
 
+    def test_unpack_empty(self, coef):
+        """unpack() of an empty table, packed by numpy or JAX, stays empty."""
+        empty = type(coef)(
+            coef.val[:0],
+            coef.idx[:0],
+            val_dtype=coef.val_dtype,
+            idx_dtype=coef.idx_dtype,
+        )
+        for packed in (empty.pack_numpy(), empty.pack_jax()):
+            recovered = type(coef).unpack(packed, val_dtype=coef.val_dtype)
+            assert recovered.val.shape == (0,)
+            assert recovered.idx.shape == (0, coef.idx.shape[1])
+
 
 class TestNarrowValueWideIndex:
     """A value smaller than one index slot round-trips (float16 + int32)."""

@@ -271,7 +271,8 @@ def test_vmap_fwd_tensor_product_multi_devices():
         r"operand_layout_constraints=\{"
         r"s32\[60,4\]\{1,0\}, "  # coef
         r"f32\[8192,20\]\{1,0\}, "  # x
-        r"f32\[8192,30\]\{1,0\}\}",  # y
+        r"f32\[8192,30\]\{1,0\}, "  # y
+        r"s32\[0\]\{0\}\}",  # coef_ranges (empty for LEADING_CHANNELS)
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(tp_compiled_string))) == 1, (
@@ -338,9 +339,10 @@ def test_vmap_grad_tensor_product_multi_devices():
     # backward HLO:
     #   128 = x channels (TRAILING_CHANNELS layout); y has no channel dim
     #   2   = the two transposed COO orderings stacked in coef_bwd (xzy, yzx)
+    #   14  = coef_ranges (2 passes * blockDim.y=7)
     #
     # Exactly one `tensor_product_bwd` custom call per shard, with inputs
-    # (coef_bwd, x, y, ct_z) and outputs (ct_x, ct_y).
+    # (coef_bwd, x, y, ct_z, coef_ranges) and outputs (ct_x, ct_y).
     regex = re.compile(
         # outputs: (ct_x, ct_y)
         r"\(f32\[8192,20,128\]\{2,1,0\}, f32\[8192,30\]\{1,0\}\) custom-call.+"
@@ -349,7 +351,8 @@ def test_vmap_grad_tensor_product_multi_devices():
         r"s32\[2,60,4\]\{2,1,0\}, "  # coef_bwd
         r"f32\[8192,20,128\]\{2,1,0\}, "  # x
         r"f32\[8192,30\]\{1,0\}, "  # y
-        r"f32\[8192,20,128\]\{2,1,0\}\}",  # ct_z
+        r"f32\[8192,20,128\]\{2,1,0\}, "  # ct_z
+        r"s32\[14\]\{0\}\}",  # coef_ranges
         flags=re.MULTILINE,
     )
     assert len(list(regex.finditer(compiled_fn_string))) == 1, (

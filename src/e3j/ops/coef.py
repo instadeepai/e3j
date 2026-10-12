@@ -150,10 +150,10 @@ class Coef:
         return self.__class__(self.val.__array__(), self.idx.__array__())
 
     def pack_numpy(self) -> numpy.ndarray:
-        return numpy.array(
-            [(val, *idx) for val, idx in self],
-            dtype=self.dtype,
-        )
+        # Zeroed allocation keeps the padding bytes deterministic.
+        coef_np = numpy.zeros(self.val.shape[0], dtype=self.dtype)
+        coef_np[:] = [(val, *idx) for val, idx in self]
+        return coef_np
 
     def pack_jax(self) -> jnp.ndarray:
         coef_np = self.pack_numpy()
@@ -210,7 +210,9 @@ class Coef:
             data = data.view(dtype=idx_t).reshape(-1, numel)
         # Slice N slots, then keep their first value and drop the padding.
         val_as_idx = data[:, :numval]
-        val = val_as_idx.view(dtype=val_t).reshape(val_as_idx.shape[0], -1)[:, 0]
+        # Keep the width explicit: a `-1` width is ambiguous for an empty table.
+        val_as_val = val_as_idx.view(dtype=val_t)
+        val = val_as_val.reshape(-1, val_as_val.shape[-1])[:, 0]
         # Retrieve `cls.rank` index columns, skipping any trailing padding.
         idx = data[:, numval : numval + cls.rank]
         return cls(val, idx, val_dtype=val_t, idx_dtype=idx_t)
