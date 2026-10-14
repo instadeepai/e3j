@@ -125,6 +125,11 @@ class Layout(EnumOption):
     TRAILING_CHANNELS = 1
     E3NN = 2
 
+    @property
+    def axis_lm(self) -> int:
+        """Axis index of the l,m (irrep) dimension."""
+        return -2 if self == Layout.TRAILING_CHANNELS else -1
+
 
 class MixingMode(EnumOption):
     """Mixing mode for bilinear tensor products.

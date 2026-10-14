@@ -22,6 +22,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 - CUDA tensor product: warps without coefficients skipped a block barrier in
   INNER reductions (undefined behaviour).
 
+### Added
+
+- `e3j.core.Linear` and `e3j.core.LinearIndexwise`, flax-free compute cores of the
+  `e3j.linen` modules, which now only own the weights.
+- `e3j.linen.LinearIndexwise` accepts any number of leading batch axes.
+
+### Removed
+
+- `slice_inputs`, `slice_transform` and `join_outputs` are gone from
+  `e3j.linen.Linear` and `e3j.linen.LinearIndexwise`; the equivalent functions
+  live on the new `e3j.core` compute cores.
+- `e3j.core.LinearIndexwise` now raises `ValueError` when `index.shape` does
+  not match the leading batch axes of the features, instead of silently
+  using the first axis. Indices of shape `(N, 1)`, which used to broadcast
+  against `(N,)` features, now raise too.
+
 ## [0.1.2] — 2026-10-05
 
 ### Added

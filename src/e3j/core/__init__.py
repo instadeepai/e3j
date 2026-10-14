@@ -16,6 +16,8 @@ from .bigotimes import Bigotimes
 from .convolution import Convolution
 from .filter import Filter
 from .harmonics import Harmonics
+from .linear import Linear
+from .linear_indexwise import LinearIndexwise
 from .permutation import Permutation
 from .polynomials import Monomial, Polynomial
 from .power_expansion import PowerExpansion
@@ -27,6 +29,8 @@ __all__ = [
     "Convolution",
     "Filter",
     "Harmonics",
+    "Linear",
+    "LinearIndexwise",
     "Monomial",
     "Permutation",
     "Polynomial",

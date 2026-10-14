@@ -19,7 +19,9 @@ from conftest import assert_allclose
 from jax import numpy as np
 from jax import random
 
+from e3j.core.linear_indexwise import LinearIndexwise as LinearIndexwiseCore
 from e3j.linen.linear_indexwise import LinearIndexwise
+from e3j.utils.options import Layout
 
 
 class _TestLinearIndexwise:
@@ -274,3 +276,97 @@ class TestLinearIndexwiseFanInFCTP(_TestLinearIndexwise):
         var_ratio = float(np.var(y_fctp)) / float(np.var(y_none))
         expected_ratio = 1.0 / self.num_indices
         assert_allclose(expected_ratio, var_ratio, rtol=0.15, atol=1e-4)
+
+
+class TestLinearIndexwiseBatchAxes:
+    """Features may carry any number of leading batch axes, matched by indices."""
+
+    in1 = "2x0e + 3x1o + 4x2e"
+    out = "4x0e + 4x1o + 4x2e"
+    num_indices = 3
+
+    @pytest.fixture(
+        params=[
+            ("LEADING_CHANNELS", 4),
+            ("TRAILING_CHANNELS", 4),
+            ("LEADING_CHANNELS", None),
+        ]
+    )
+    def setting(self, request) -> tuple[str, int | None]:
+        return request.param
+
+    @pytest.fixture(params=["core", "linen"])
+    def apply(self, request, setting):
+        """``(features, indices) -> output`` for the core or linen linear."""
+        layout, num_channels = setting
+        key = random.key(0)
+        if request.param == "core":
+            core = LinearIndexwiseCore(self.in1, self.out, layout, num_channels)
+            channels = () if num_channels is None else (num_channels,)
+            weights = [
+                random.normal(key, (self.num_indices, *channels, *block.shape))
+                for block in core.blocks
+            ]
+            return lambda x, i: core(x, i, weights)
+        module = LinearIndexwise(
+            self.in1, self.out, self.num_indices, num_channels, layout=layout
+        )
+        x = random.normal(key, (5, *self.feat_shape(setting)))
+        params = module.init(key, x, np.zeros(5, dtype=int))
+        return lambda x, i: module.apply(params, x, i)
+
+    def feat_shape(self, setting) -> tuple[int, ...]:
+        layout, num_channels = setting
+        dim = e3nn.Irreps(self.in1).dim
+        if num_channels is None:
+            return (dim,)
+        if Layout.parse(layout) == Layout.TRAILING_CHANNELS:
+            return (dim, num_channels)
+        return (num_channels, dim)
+
+    @pytest.mark.parametrize("batch", [(), (5,), (1, 1), (2, 5), (2, 1, 3)])
+    def test_batch_axes(self, apply, setting, batch):
+        """The output matches the flattened-batch one, batch axes restored."""
+        key = random.key(1)
+        feat_shape = self.feat_shape(setting)
+        feats = random.normal(key, (*batch, *feat_shape))
+        index = random.choice(key, self.num_indices, batch)
+        y = apply(feats, index)
+        y_flat = apply(feats.reshape(-1, *feat_shape), index.reshape(-1))
+        assert y.shape == (*batch, *y_flat.shape[1:])
+        assert_allclose(y, y_flat.reshape(y.shape))
+
+    def test_index_shape_mismatch(self, apply, setting):
+        feats = np.ones((2, 5, *self.feat_shape(setting)))
+        with pytest.raises(ValueError, match="do not match the batch axes"):
+            apply(feats, np.zeros(10, dtype=int))
+
+
+class TestLinearIndexwiseIrrepsInput:
+    """Irreps are read as `e3nn.Irreps`, consistently with `source`/`target`."""
+
+    @pytest.mark.parametrize(
+        ("source", "target"),
+        [
+            (" 8x0e + 8x1o", "8x0e"),
+            ("8x0e + 8x1o ", "8x0e + 2x1o"),
+            (["0e", "1o"], "2x0e + 1o"),
+            (e3nn.Irrep("1o"), "2x1o"),
+            (e3nn.Irreps("0e + 1o"), e3nn.Irreps("1o")),
+        ],
+    )
+    def test_irreps_input(self, source, target):
+        """The module matches one built from the normalised irreps strings."""
+        kwargs = dict(num_indices=3, num_channels=4, layout="LEADING_CHANNELS")
+        module = LinearIndexwise(source, target, **kwargs)
+        reference = LinearIndexwise(
+            str(e3nn.Irreps(source)), str(e3nn.Irreps(target)), **kwargs
+        )
+        key = random.key(0)
+        feats = random.normal(key, (5, 4, module.source.dim))
+        index = random.choice(key, 3, (5,))
+        params = module.init(key, feats, index)
+        y = module.apply(params, feats, index)
+        assert module.blocks == reference.blocks
+        assert y.shape == (5, 4, module.target.dim)
+        assert_allclose(y, reference.apply(params, feats, index))

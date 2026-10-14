@@ -22,11 +22,11 @@ from typing import (
     Self,
     TypeAlias,
     TypeVar,
+    get_args,
     overload,
 )
 
 import numpy as np
-from typing_extensions import get_args
 
 
 @dataclass

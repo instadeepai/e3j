@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import Self
 
 import jax
 import jax.numpy as np
@@ -50,7 +51,7 @@ class Permutation:
         return np.argsort(self.sigma)
 
     @classmethod
-    def sort(cls, source: str | O3Space, axis: int = -1) -> str:
+    def sort(cls, source: str | O3Space, axis: int = -1) -> Self:
         """Sort irreducible blocks by angular momentum and parity.
 
         Note

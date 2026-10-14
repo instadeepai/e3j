@@ -160,10 +160,7 @@ class PowerExpansion:
         responsible for filtering the hidden features.
         """
         layout = Layout.parse(self.layout)
-        if layout == Layout.TRAILING_CHANNELS:
-            axis_lm = -2
-        else:
-            axis_lm = -1
+        axis_lm = layout.axis_lm
         sources = self.hidden
         # last output, coincides with target_irreps if not None
         target = self.get_target_filter(self.exponent)

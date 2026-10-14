@@ -21,3 +21,5 @@ core
     Bigotimes
     Permutation
     Filter
+    Linear
+    LinearIndexwise
