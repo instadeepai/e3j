@@ -272,6 +272,35 @@ def test_backward_regressions(out, mode, batch_size, channels):
     testing.assert_allclose(dy, dy_ref, rtol=RTOL, atol=ATOL)
 
 
+@pytest.mark.parametrize("mode", [options.MixingMode.OUTER, options.MixingMode.MAP])
+def test_unaligned_batch_matches_reference(mode):
+    """A batch that is not a multiple of 8 once picked 4-row blocks, which
+    libtpu >= 0.0.42 computes wrongly above 128 channels."""
+    params = _build_params(L3, L3, L3, mode)
+    outer = mode == options.MixingMode.OUTER
+    inputs = _inputs_trailing_outer if outer else _inputs_trailing_map
+    reference = _reference_trailing_outer if outer else _reference_trailing_map
+    x, y = inputs(params, 1000, 192)
+    do = jax.random.normal(jax.random.key(1), (1000, params.z_space.dim, 192))
+
+    fn = lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params)  # noqa: E731
+    z = jax.jit(fn)(x, y)
+    dx, dy = _jit_vjp(fn)(x, y, do)
+
+    z_ref, vjp_ref = jax.vjp(jax.jit(lambda x, y: reference(x, y, params)), x, y)
+    dx_ref, dy_ref = vjp_ref(do)
+    testing.assert_allclose(z, z_ref, rtol=RTOL, atol=ATOL)
+    testing.assert_allclose(dx, dx_ref, rtol=RTOL, atol=ATOL)
+    testing.assert_allclose(dy, dy_ref, rtol=RTOL, atol=ATOL)
+
+
+def test_config_rejects_blocks_under_8_rows():
+    with pytest.raises(ValueError):
+        PallasMosaicTPUTensorProductParamsFwdConfig(batch_block_size=4)
+    with pytest.raises(ValueError):
+        PallasMosaicTPUTensorProductParamsBwdConfig(batch_block_size=2)
+
+
 def test_fwd_config_rejects_bwd_only_block_size():
     """A 64-row batch block is backward-only."""
     with pytest.raises(ValueError):

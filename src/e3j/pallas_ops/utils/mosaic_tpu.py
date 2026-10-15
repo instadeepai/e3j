@@ -255,6 +255,14 @@ def select_batch_block_size(
     return batch_block_size
 
 
+def pad_batch(arrays: tuple[jax.Array, ...], multiple: int) -> tuple[jax.Array, ...]:
+    """Zero-pad the leading batch axis of every array up to a multiple of `multiple`."""
+    pad = -arrays[0].shape[0] % multiple
+    if not pad:
+        return arrays
+    return tuple(jnp.pad(a, ((0, pad),) + ((0, 0),) * (a.ndim - 1)) for a in arrays)
+
+
 def pad_for_tpu(x: jax.Array) -> jax.Array:
     """Pad the last two axes to TPU tile boundaries.
 

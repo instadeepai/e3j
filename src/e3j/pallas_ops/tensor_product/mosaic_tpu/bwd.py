@@ -26,11 +26,13 @@ from jax.experimental.pallas import tpu as pltpu
 
 from e3j.pallas_ops.tensor_product.mosaic_tpu.params import (
     BWD_BATCH_BLOCK_SIZE_CANDIDATES,
+    MIN_BATCH_BLOCK_SIZE,
     PallasMosaicTPUTensorProductParams,
     PallasMosaicTPUTensorProductParamsBwdConfig,
 )
 from e3j.pallas_ops.utils.coef import group_coef_by_xi
 from e3j.pallas_ops.utils.mosaic_tpu import (
+    pad_batch,
     pad_for_tpu,
     round_up,
     select_batch_block_size,
@@ -809,9 +811,12 @@ def _tensor_product_kernel_mosaic_tpu_bwd(
     params: PallasMosaicTPUTensorProductParams,
 ) -> tuple[jax.Array, jax.Array]:
     """Backward pass dispatching on `params.layout`/`params.mode`."""
-    if params.layout == options.Layout.TRAILING_CHANNELS:
-        if params.mode == options.MixingMode.MAP:
-            return _BwdTrailingChannelMapKernel()(x, y, dz, params)
-        if params.mode == options.MixingMode.OUTER:
-            return _BwdTrailingChannelOuterKernel()(x, y, dz, params)
+    kernels = {
+        options.MixingMode.MAP: _BwdTrailingChannelMapKernel,
+        options.MixingMode.OUTER: _BwdTrailingChannelOuterKernel,
+    }
+    if params.layout == options.Layout.TRAILING_CHANNELS and params.mode in kernels:
+        multiple = MIN_BATCH_BLOCK_SIZE * pltpu.get_tpu_info().num_cores
+        dx, dy = kernels[params.mode]()(*pad_batch((x, y, dz), multiple), params)
+        return dx[: x.shape[0]], dy[: x.shape[0]]
     raise NotImplementedError(f"Mosaic TPU TP bwd unsupported for {params}")

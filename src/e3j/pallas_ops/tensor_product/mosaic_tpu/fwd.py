@@ -23,11 +23,17 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from e3j.pallas_ops.tensor_product.mosaic_tpu.params import (
+    FWD_BATCH_BLOCK_SIZE_CANDIDATES,
+    MIN_BATCH_BLOCK_SIZE,
     PallasMosaicTPUTensorProductParams,
     PallasMosaicTPUTensorProductParamsFwdConfig,
 )
 from e3j.pallas_ops.utils.coef import group_coef_by_zi
-from e3j.pallas_ops.utils.mosaic_tpu import pad_for_tpu, select_batch_block_size
+from e3j.pallas_ops.utils.mosaic_tpu import (
+    pad_batch,
+    pad_for_tpu,
+    select_batch_block_size,
+)
 from e3j.pallas_ops.utils.named_scope import named_scope
 from e3j.utils import options
 
@@ -193,6 +199,7 @@ class _FwdTrailingChannelKernel(FwdKernel):
         batch_block_size = select_batch_block_size(
             batch_size=batch_size,
             vmem_bytes_per_batch_element=vmem_bytes,
+            batch_block_size_candidates=FWD_BATCH_BLOCK_SIZE_CANDIDATES,
             vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
             num_kernel=num_kernel,
             override=config.batch_block_size,
@@ -535,9 +542,12 @@ def _tensor_product_kernel_mosaic_tpu_fwd(
     y: jax.Array,
     params: PallasMosaicTPUTensorProductParams,
 ) -> jax.Array:
-    if params.layout == options.Layout.TRAILING_CHANNELS:
-        if params.mode == options.MixingMode.MAP:
-            return _FwdTrailingChannelMapKernel()(x, y, params)
-        if params.mode == options.MixingMode.OUTER:
-            return _FwdTrailingChannelOuterKernel()(x, y, params)
+    kernels = {
+        options.MixingMode.MAP: _FwdTrailingChannelMapKernel,
+        options.MixingMode.OUTER: _FwdTrailingChannelOuterKernel,
+    }
+    if params.layout == options.Layout.TRAILING_CHANNELS and params.mode in kernels:
+        multiple = MIN_BATCH_BLOCK_SIZE * pltpu.get_tpu_info().num_cores
+        z = kernels[params.mode]()(*pad_batch((x, y), multiple), params)
+        return z[: x.shape[0]]
     raise NotImplementedError(f"Mosaic TPU TP fwd: unsupported params {params}")

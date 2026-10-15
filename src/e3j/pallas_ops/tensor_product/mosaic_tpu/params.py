@@ -19,10 +19,12 @@ import numpy as np
 from pydantic import AfterValidator, BaseModel
 
 from e3j.pallas_ops.tensor_product.common.params import PallasTensorProductParams
-from e3j.pallas_ops.utils.mosaic_tpu import DEFAULT_BATCH_BLOCK_SIZE_CANDIDATES
 from e3j.utils import options
 
-BWD_BATCH_BLOCK_SIZE_CANDIDATES = [*DEFAULT_BATCH_BLOCK_SIZE_CANDIDATES, 64]
+# Blocks under 8 rows compute garbage on libtpu >= 0.0.42 (v4 CMEM); pad the batch instead.
+MIN_BATCH_BLOCK_SIZE = 8
+FWD_BATCH_BLOCK_SIZE_CANDIDATES = [8, 16, 32]
+BWD_BATCH_BLOCK_SIZE_CANDIDATES = [*FWD_BATCH_BLOCK_SIZE_CANDIDATES, 64]
 
 
 def _validate_batch_block_size(v: int, candidates: list[int]) -> int:
@@ -34,7 +36,7 @@ def _validate_batch_block_size(v: int, candidates: list[int]) -> int:
 FwdBatchBlockSize = Annotated[
     int,
     AfterValidator(
-        lambda v: _validate_batch_block_size(v, DEFAULT_BATCH_BLOCK_SIZE_CANDIDATES)
+        lambda v: _validate_batch_block_size(v, FWD_BATCH_BLOCK_SIZE_CANDIDATES)
     ),
 ]
 BwdBatchBlockSize = Annotated[
