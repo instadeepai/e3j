@@ -48,6 +48,18 @@ class FlushBuffers(NamedTuple):
     channel_slice: Any = slice(None)  # channel range this pass owns, full by default
 
 
+def _sum_rows(accumulator: pl.MemoryRef) -> jax.Array:
+    """`accumulator.sum(axis=1)` as strided sublane loads instead of sublane rotates."""
+    planes, rows, width = accumulator.shape
+    if width != 128:  # Mosaic only lowers the strided load on 128-lane rows
+        return jnp.sum(accumulator[:, :, :], axis=1)
+    flat = accumulator.reshape(planes * rows, width)
+    total = flat[pl.ds(0, planes, stride=rows), :]
+    for row in range(1, rows):
+        total = total + flat[pl.ds(row, planes, stride=rows), :]
+    return total
+
+
 def make_group_flush(bufs: FlushBuffers, core_id):
     """Double-buffered per-group reduce + async DMA out, shared by fwd/bwd.
 
@@ -85,7 +97,7 @@ def make_group_flush(bufs: FlushBuffers, core_id):
         def _wait_previous_flush():
             _wait_inflight()
 
-        bufs.stage_vmem[0, :, :] = jnp.sum(bufs.accumulator_vmem[:, :, :], axis=1)
+        bufs.stage_vmem[0, :, :] = _sum_rows(bufs.accumulator_vmem)
         bufs.accumulator_vmem[:, :, :] = jnp.zeros_like(bufs.accumulator_vmem[:, :, :])
 
         if final:

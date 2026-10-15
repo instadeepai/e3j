@@ -17,6 +17,7 @@
 Gather + tensor product + scalar mixing + receiver scatter in one kernel
 """
 
+from collections import defaultdict
 from typing import Any, NamedTuple
 
 import jax
@@ -48,7 +49,7 @@ from e3j.pallas_ops.utils.named_scope import named_scope
 class FwdScratch(NamedTuple):
     x_stage_vmem: (
         pl.MemoryRef
-    )  # (x_dim, edge_block_size, channels): gathered x[senders], x_dim-major
+    )  # (2, x_dim, edge_block_size, channels): gathered x[senders], double-buffered
     accumulator_vmem: (
         pl.MemoryRef
     )  # (out_dim, chunk, channels): open-group sublane partials
@@ -58,7 +59,8 @@ class FwdScratch(NamedTuple):
     previous_position_smem: pl.MemoryRef  # (1,) i32: current segment start within chunk
     flush_pending_smem: pl.MemoryRef  # (1,) i32: async flush in flight?
     flush_count_smem: pl.MemoryRef  # (1,) i32: flushes done (first one is a partial)
-    gather_semaphore: pltpu.SemaphoreType  # DMA semaphore for the sender gathers
+    step_smem: pl.MemoryRef  # (1,) i32: pipeline steps run, selects the x_stage slot
+    gather_semaphore: pltpu.SemaphoreType  # (2,) DMA semaphores, one per x_stage slot
     flush_semaphore: pltpu.SemaphoreType  # DMA semaphore for the async flush
 
 
@@ -94,7 +96,7 @@ class _FwdConstants(NamedTuple):
     num_irrep_blocks: int  # edge scalars per edge, one per output irrep block
     chunk: int
     dtype: Any
-    cg_groups: tuple  # ((zi, ((xi, ((yi, v), ...)), ...)), ...)
+    tp_plan: tuple  # see _plan_scalings
     irrep_block_of_output: tuple  # zi -> edge-scalar block
     dynamic_edges: bool  # walk only the blocks holding a real edge
 
@@ -115,7 +117,7 @@ def _vmem_shapes(
 ) -> tuple[dict[str, tuple[int, ...]], ...]:
     """Shapes of the VMEM scratch, the pipelined operands and the live values."""
     scratch = {
-        "x_stage_vmem": (x_dim, edge_block_size, channel_block),
+        "x_stage_vmem": (2, x_dim, edge_block_size, channel_block),
         "accumulator_vmem": (out_dim_padded, chunk, channel_block),
         "stage_vmem": (1, out_dim_padded, channel_block),
     }
@@ -125,6 +127,51 @@ def _vmem_shapes(
     }
     values = {"message_plane": (out_dim, edge_block_size, channel_block)}
     return scratch, operands, values
+
+
+def _plan_scalings(cg_groups: tuple) -> tuple:
+    """Per zi, `((z_scale, ((xi, yi, y_scale, x_scale, sign), ...)), ...)`.
+
+    Each path's `|v|` goes on its y tile, its x tile or its zi partial sum, chosen by
+    greedy set cover so that one scaled tile or sum serves as many paths as it can.
+    Ties go to y: it is scaled before its broadcast, one vmul instead of a tile of them.
+    """
+    paths = [
+        (zi, xi, yi, abs(float(v)), 1 if v > 0 else -1)
+        for zi, by_xi in cg_groups
+        for xi, yi_paths in by_xi
+        for yi, v in yi_paths
+    ]
+    covers = defaultdict(set)
+    for i, (zi, xi, yi, q, _) in enumerate(paths):
+        if q != 1.0:
+            for key in (("y", yi, q), ("x", xi, q), ("z", zi, q)):
+                covers[key].add(i)
+    uncovered = set().union(*covers.values())
+    side = {}
+    while uncovered:
+        key = max(
+            sorted(covers), key=lambda k: (len(covers[k] & uncovered), k[0] == "y")
+        )
+        for i in covers[key] & uncovered:
+            side[i] = key[0]
+        uncovered -= covers[key]
+
+    plan = defaultdict(lambda: defaultdict(list))
+    for i, (zi, xi, yi, q, sign) in enumerate(paths):
+        on = side.get(i)
+        scale = {s: q if s == on else 1.0 for s in "yxz"}
+        plan[zi][scale["z"]].append((xi, yi, scale["y"], scale["x"], sign))
+    return tuple(
+        (
+            zi,
+            tuple(
+                (z_scale, tuple(sorted(terms, key=lambda t: -t[-1])))
+                for z_scale, terms in by_z_scale.items()
+            ),
+        )
+        for zi, by_z_scale in plan.items()
+    )
 
 
 def _scratch_shapes(c: _FwdConstants) -> FwdScratch:
@@ -145,7 +192,8 @@ def _scratch_shapes(c: _FwdConstants) -> FwdScratch:
         previous_position_smem=pltpu.SMEM((1,), jnp.int32),
         flush_pending_smem=pltpu.SMEM((1,), jnp.int32),
         flush_count_smem=pltpu.SMEM((1,), jnp.int32),
-        gather_semaphore=pltpu.SemaphoreType.DMA,
+        step_smem=pltpu.SMEM((1,), jnp.int32),
+        gather_semaphore=pltpu.SemaphoreType.DMA((2,)),
         flush_semaphore=pltpu.SemaphoreType.DMA,
     )
 
@@ -204,9 +252,10 @@ class _MessagePassingFwdKernel:
 
     Per pipeline step (body), working in VMEM:
       1. Gather the tile's sender features: one async DMA per edge copies
-         `x[senders[k]]` into the `(edge_block_size, x_dim, channels)` stage.
-      2. Tensor product + scalar mixing: for each output index `zi`, zero an
-         accumulator, add `v * y[yi] * x[xi]` over its CG contributions, then multiply
+         `x[senders[k]]` into one slot of the double-buffered `(x_dim,
+         edge_block_size, channels)` stage, issued a step ahead.
+      2. Tensor product + scalar mixing: for each output index `zi`, sum
+         `v * y[yi] * x[xi]` over its CG contributions, then multiply
          by the edge scalar of `block(zi)` to get the message `m[zi]`.
       3. Chunked scatter to receivers: stack the messages into an `(out_dim, ...)`
          plane and hand it to `sorted_reduce_and_flush`, which — exploiting the
@@ -313,7 +362,7 @@ class _MessagePassingFwdKernel:
         # Group by output index zi, then by input xi so the kernel loads each
         # x[xi] tile once, reused across its yi paths.
         indices, values = np.array(params.indices), np.array(params.values)
-        cg_groups = group_coef_by_zi_then_xi(indices, values)
+        tp_plan = _plan_scalings(group_coef_by_zi_then_xi(indices, values))
         irrep_block_of_output = tuple(int(b) for b in params.irrep_block_of_output)
 
         n_edge_blocks = n_edges_padded // edge_block_size
@@ -362,7 +411,7 @@ class _MessagePassingFwdKernel:
             num_irrep_blocks=num_irrep_blocks,
             chunk=chunk,
             dtype=dtype,
-            cg_groups=cg_groups,
+            tp_plan=tp_plan,
             irrep_block_of_output=irrep_block_of_output,
             dynamic_edges=dynamic_edges,
         )
@@ -372,11 +421,14 @@ class _MessagePassingFwdKernel:
         """Build the `pallas_call` kernel closing over the static `c`."""
 
         def _pipeline_in_specs(
-            c: _FwdConstants, block_order_smem, stride: int
+            c: _FwdConstants, block_order_smem, n_walked_blocks_smem, stride: int
         ) -> list[pl.BlockSpec]:
-            """emit_pipeline in_specs for (y, edge_scalars, senders, receivers)."""
+            """emit_pipeline in_specs for (y, edge_scalars, senders, receivers, next senders)."""
             walked_block = (
                 (lambda i: block_order_smem[i]) if c.dynamic_edges else (lambda i: i)
+            )
+            last_block = (
+                n_walked_blocks_smem[0] - 1 if c.dynamic_edges else c.n_edge_blocks - 1
             )
             return [
                 pl.BlockSpec(
@@ -399,6 +451,14 @@ class _MessagePassingFwdKernel:
                 pl.BlockSpec(
                     block_shape=(1, c.plan.edge_block_size),
                     index_map=lambda i: (walked_block(i), 0),
+                    memory_space=pltpu.SMEM,
+                ),
+                pl.BlockSpec(
+                    block_shape=(1, c.plan.edge_block_size),
+                    index_map=lambda i: (
+                        walked_block(jnp.minimum(i + 1, last_block)),
+                        0,
+                    ),
                     memory_space=pltpu.SMEM,
                 ),
             ]
@@ -425,6 +485,7 @@ class _MessagePassingFwdKernel:
             previous_position_smem,
             flush_pending_smem,
             flush_count_smem,
+            step_smem,
             gather_semaphore,
             flush_semaphore,
         ):
@@ -437,6 +498,7 @@ class _MessagePassingFwdKernel:
                 accumulator_vmem[:, :, :] = jnp.zeros_like(accumulator_vmem[:, :, :])
 
                 current_receiver_smem[0] = jnp.int32(-1)
+                step_smem[0] = jnp.int32(0)
                 flush_pending_smem[0] = jnp.int32(0)
                 flush_count_smem[0] = jnp.int32(0)
 
@@ -455,37 +517,84 @@ class _MessagePassingFwdKernel:
                     core_id,
                 )
 
-                def body(y_vmem, edge_scalars_vmem, senders_smem, receivers_smem):
+                def gathers(sender, slot):
+                    return [
+                        pltpu.make_async_copy(
+                            x_hbm.at[sender(k), :, channel_slice],
+                            x_stage_vmem.at[slot, :, k, :],
+                            gather_semaphore.at[slot],
+                        )
+                        for k in range(c.plan.edge_block_size)
+                    ]
+
+                def body(
+                    y_vmem,
+                    edge_scalars_vmem,
+                    senders_smem,
+                    receivers_smem,
+                    next_senders_smem,
+                ):
+                    step = step_smem[0]
+                    slot = step % 2
 
                     # ---- 0. Load the needed sender node features ----
+                    # this block's were prefetched by the previous step
                     with named_scope("fwd_copying_senders"):
-                        copies = [
-                            pltpu.make_async_copy(
-                                x_hbm.at[senders_smem[0, k], :, channel_slice],
-                                x_stage_vmem.at[:, k, :],
-                                gather_semaphore,
-                            )
-                            for k in range(c.plan.edge_block_size)
-                        ]
-                        for copy in copies:
-                            copy.start()
-                        for copy in copies:
+
+                        @pl.when(step == 0)
+                        def _gather_first_block():
+                            for copy in gathers(lambda k: senders_smem[0, k], 0):
+                                copy.start()
+
+                        for copy in gathers(lambda k: senders_smem[0, k], slot):
                             copy.wait()
+                        for copy in gathers(
+                            lambda k: next_senders_smem[0, k], 1 - slot
+                        ):
+                            copy.start()
+                        step_smem[0] = step + 1
 
                     # ---- 1. Tensor product + scalar mixing ----
-                    x_plane = x_stage_vmem[:, :, :]
+                    x_plane = x_stage_vmem[slot]
                     message_by_zi = {}
                     with named_scope("fwd_tp_compute"):
-                        for zi, by_xi in c.cg_groups:
+                        tile_shape = (c.plan.edge_block_size, c.plan.channel_block)
+                        y_tiles, x_tiles = {}, {}
+
+                        def y_tile(yi, scale):
+                            if (yi, scale) not in y_tiles:
+                                y_vec = y_vmem[yi, 0, :]
+                                y_vec = y_vec if scale == 1.0 else scale * y_vec
+                                y_tiles[yi, scale] = jnp.broadcast_to(
+                                    y_vec[:, None], tile_shape
+                                )
+                            return y_tiles[yi, scale]
+
+                        def x_tile(xi, scale):
+                            if (xi, scale) not in x_tiles:
+                                x_b = x_plane[xi, :, :]
+                                x_tiles[xi, scale] = (
+                                    x_b if scale == 1.0 else scale * x_b
+                                )
+                            return x_tiles[xi, scale]
+
+                        for zi, by_z_scale in c.tp_plan:
+                            tp_acc = None
+                            for z_scale, terms in by_z_scale:
+                                partial = None
+                                for xi, yi, y_scale, x_scale, sign in terms:
+                                    term = y_tile(yi, y_scale) * x_tile(xi, x_scale)
+                                    if partial is None:
+                                        partial = term if sign > 0 else -term
+                                    elif sign > 0:
+                                        partial = partial + term
+                                    else:
+                                        partial = partial - term
+                                if z_scale != 1.0:
+                                    partial = z_scale * partial
+                                tp_acc = partial if tp_acc is None else tp_acc + partial
                             block = c.irrep_block_of_output[zi]
-                            edge_scalars_tile = edge_scalars_vmem[block, :, :]
-                            tp_acc = jnp.zeros_like(edge_scalars_tile)
-                            for xi, paths in by_xi:
-                                x_tile = x_plane[xi, :, :]
-                                for yi, v in paths:
-                                    y_vec = y_vmem[yi, 0, :]
-                                    tp_acc = tp_acc + v * y_vec[:, None] * x_tile
-                            message_by_zi[zi] = tp_acc * edge_scalars_tile
+                            message_by_zi[zi] = tp_acc * edge_scalars_vmem[block, :, :]
 
                     # ---- 2. Chunked scatter to receivers ----
                     row_idx = jax.lax.broadcasted_iota(
@@ -519,11 +628,19 @@ class _MessagePassingFwdKernel:
                 pltpu.emit_pipeline(
                     body,
                     grid=(n_edge_blocks,),
-                    in_specs=_pipeline_in_specs(c, block_order_smem, stride),
+                    in_specs=_pipeline_in_specs(
+                        c, block_order_smem, n_walked_blocks_smem, stride
+                    ),
                     out_specs=[],
                     core_axis=0,
                     dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
-                )(y_hbm, edge_scalars_hbm, senders_hbm, receivers_hbm)
+                )(y_hbm, edge_scalars_hbm, senders_hbm, receivers_hbm, senders_hbm)
+
+                # the last step prefetched a block it never reads
+                @pl.when(step_smem[0] > 0)
+                def _drain_gathers():
+                    for copy in gathers(lambda k: 0, step_smem[0] % 2):
+                        copy.wait()
 
                 # accumulator_vmem holds the last open group, so we flush it
                 final_receiver = current_receiver_smem[0]
