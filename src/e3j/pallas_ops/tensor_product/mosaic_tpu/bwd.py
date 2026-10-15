@@ -17,7 +17,6 @@
 Supports the TRAILING_CHANNELS layout (MAP and OUTER modes).
 """
 
-import math
 from abc import ABC, abstractmethod
 
 import jax
@@ -26,11 +25,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from e3j.pallas_ops.tensor_product.mosaic_tpu.params import (
+    BWD_BATCH_BLOCK_SIZE_CANDIDATES,
     PallasMosaicTPUTensorProductParams,
     PallasMosaicTPUTensorProductParamsBwdConfig,
 )
 from e3j.pallas_ops.utils.coef import group_coef_by_xi
-from e3j.pallas_ops.utils.mosaic_tpu import pad_for_tpu, select_batch_block_size
+from e3j.pallas_ops.utils.mosaic_tpu import (
+    pad_for_tpu,
+    round_up,
+    select_batch_block_size,
+)
 from e3j.utils import options
 
 
@@ -98,23 +102,16 @@ class _BwdTrailingChannelKernel(BwdKernel):
     double-buffers the `dz` / `x` / `y` input tiles and the `dx` / `dy`
     output tiles so the next tile's DMA overlaps the current tile's compute.
 
-    Per pipeline step (body), working in VMEM:
-      1. Transpose the x tile from `(batch_block_size, x_dim, num_channels)` to `(x_dim, batch_block_size, num_channels)`
-         so an `x[xi]` slice is a contiguous `(batch_block_size, num_channels)` operand
-         making it the leading axis avoids a strided gather on every contribution.
-      2. Preload each used `yi` into a `(batch_block_size, num_channels)` operand once
-         (OUTER broadcasts the per-channel scalar across the channel axis, MAP slices it),
-         so a `yi` reused across several `xi` is only materialized one time.
-      3. Allocate fp32 `(batch_block_size, num_channels)` accumulators: one `dy_acc[yi]` per
-         used `yi` (`yi_used = range(y_dim)`) and a `dx_rows` list with one
-         entry per `xi`.
-      4. For each `xi` and each contribution `(zi, yi, v)`, compute the shared
-         term `vdz = v * dz[zi]` once, then accumulate `y[yi] * vdz` into the
-         `xi` row of `dx` and `x[xi] * vdz` into `dy_acc[yi]`.
-      5. Stack the `dx` rows to `(x_dim, batch_block_size, num_channels)` and transpose once
-         back to the output's `(batch_block_size, x_dim, num_channels)` layout before storing.
-      6. Store each `dy_acc[yi]` via `write_dy` — OUTER reduces over the channel axis to
-         a per-channel scalar, MAP writes the full `(batch_block_size, num_channels)` vector.
+    `x` / `dx` move as whole `(batch_block_size, x_dim, 128)` blocks, one per
+    lane tile, and each `x[xi]` / `dx[xi]` row is read and written with a
+    sublane-strided load / store, so no transpose is materialized. The body
+    loops over 8-row sub-tiles so the accumulators stay in registers. Per sub-tile:
+      1. Load each used `yi` as a `(8, num_channels)` operand (OUTER broadcasts
+         the per-channel scalar, MAP slices it).
+      2. For each `xi` and each `yi`, form `t = sum_zi v * dz[zi]` once, then
+         accumulate `y[yi] * t` into `dx[xi]` and `x[xi] * t` into `dy_acc[yi]`.
+      3. Store each `dy_acc[yi]` via `write_dy` — OUTER reduces over the channel axis to
+         a per-channel scalar, MAP writes the full `(8, num_channels)` vector.
     """
 
     _DIM_LEADING = False
@@ -143,6 +140,7 @@ class _BwdTrailingChannelKernel(BwdKernel):
         assert x.shape[0] == y.shape[0], "Batch sizes must match for x and y"
 
         batch_size = x.shape[0]
+        dtype = x.dtype
         x_dim = x.shape[1]
         channels = x.shape[2]
         y_dim = y.shape[1]
@@ -174,7 +172,8 @@ class _BwdTrailingChannelKernel(BwdKernel):
             y = self._orient_y_dim_leading(y)
             dz = pad_for_tpu(jnp.transpose(dz, (1, 0, 2)))
         else:
-            x = pad_for_tpu(x)
+            # Mosaic has no strided loads of packed dtypes.
+            x = pad_for_tpu(x.astype(jnp.float32))
             dz = pad_for_tpu(dz.transpose(1, 0, 2))
             y = pad_for_tpu(y)
 
@@ -189,46 +188,74 @@ class _BwdTrailingChannelKernel(BwdKernel):
             x_dim_padded = x.shape[1]
             dy_kernel_shape = self.dy_kernel_shape(y, kernel_batch)
 
-        cg_by_xi = tuple(
-            (xi, tuple((oi, yi, v) for oi, yi, v in contribs))
-            for xi, contribs in group_coef_by_xi(params.indices, params.values).items()
-        )
-        yis = frozenset(yi for _, contribs in cg_by_xi for _, yi, _ in contribs)
-        yi_used = range(y_dim)
+        pairs_by_xi = []
+        for xi, contribs in group_coef_by_xi(params.indices, params.values).items():
+            by_yi = {}
+            for zi, yi, v in contribs:
+                by_yi.setdefault(yi, []).append((zi, v))
+            pairs_by_xi.append((xi, tuple(by_yi.items())))
+        xis = frozenset(xi for xi, _ in pairs_by_xi)
+        yis = frozenset(yi for _, pairs in pairs_by_xi for yi, _ in pairs)
 
-        if dim_leading:
-            vmem_bytes = 2 * x.dtype.itemsize * (
-                (z_dim + 2 * x_dim_padded) * num_channels_padded
-                + 2 * (y.size // kernel_batch)
-            ) + 4 * num_channels_padded * (2 * x_dim_padded + 2 * y_dim + 1)
-        else:
-            vmem_bytes = self._vmem_bytes_per_batch_element(
-                x_dim_padded,
-                num_channels_padded,
-                y,
-                z_dim,
-                len(yis),
-                y_dim,
-                x.dtype.itemsize,
-            )
+        # Packed y/dy relayouts across lanes, so do them once per block, not per sub-tile.
+        staged = n_batch_packed_in_channel > 1
+        n_pairs = sum(len(pairs) for _, pairs in pairs_by_xi)
         batch_block_size = select_batch_block_size(
             batch_size=kernel_batch,
-            vmem_bytes_per_batch_element=vmem_bytes,
+            vmem_bytes_per_batch_element=self._vmem_bytes_per_batch_element(
+                x_dim_padded,
+                num_channels_padded,
+                round_up(y.size // kernel_batch, 128),
+                z_dim,
+                (
+                    2 * y_dim
+                    + self.staging_rows(
+                        len(yis), y_dim, y.shape[1], n_batch_packed_in_channel
+                    )
+                    if staged
+                    else 0
+                ),
+                x.dtype.itemsize,
+            ),
+            batch_block_size_candidates=BWD_BATCH_BLOCK_SIZE_CANDIDATES,
             num_kernel=num_kernel,
-            vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
+            # Mosaic may hoist every `vdz` of a sub-tile and spill them: one
+            # (sub_rows, num_channels) tile per (xi, yi) pair, whatever the block size.
+            vmem_capacity_bytes=tpu_info.vmem_capacity_bytes
+            - 4 * 8 * num_channels_padded * n_pairs,
             override=bwd_config.batch_block_size,
         )
         n_batch_blocks = kernel_batch // batch_block_size
+        # One native sublane tile of dz: 8 fp32 or 16 bf16 rows.
+        sub_rows = min(32 // dz.dtype.itemsize, batch_block_size)
+        n_lane_tiles = 1 if dim_leading else num_channels_padded // 128
 
-        def bwd_kernel(dz_ref, x_ref, y_ref, dx_ref, dy_ref):
-            def body(dz_vmem, x_vmem_src, y_vmem, dx_vmem, dy_vmem):
+        def bwd_kernel(dz_ref, x_ref, y_ref, dx_ref, dy_ref, *scratch):
+            def rows(xi, start, n):
+                """Index of `n` batch rows of component `xi` in an x/dx block."""
                 if dim_leading:
-                    x_vmem = x_vmem_src[...]
-                    pre_broadcast_y = self._load_y_dim_leading(
-                        y_vmem, yis, batch_block_size, num_channels_padded
-                    )
-                else:
-                    x_vmem = jax.lax.transpose(x_vmem_src[...], (1, 0, 2))
+                    return xi, pl.ds(start, n)
+                # (batch * x_dim, 128) blocks: the rows of `xi` are x_dim apart.
+                return pl.ds(start * x_dim_padded + xi, n, stride=x_dim_padded)
+
+            def load_x(x_tiles, xi, start, n):
+                parts = [t[rows(xi, start, n)] for t in x_tiles]
+                return parts[0] if len(parts) == 1 else jnp.concatenate(parts, -1)
+
+            def store_dx(dx_tiles, xi, start, n, val):
+                w = val.shape[-1] // len(dx_tiles)
+                for t, ref in enumerate(dx_tiles):
+                    ref[rows(xi, start, n)] = val[:, t * w : (t + 1) * w]
+
+            def body(dz_vmem, *refs):
+                x_tiles, dx_tiles = refs[:n_lane_tiles], refs[n_lane_tiles + 1 : -1]
+                if not dim_leading:
+                    rows_2d = (batch_block_size * x_dim_padded, 128)
+                    x_tiles = [t.reshape(*rows_2d) for t in x_tiles]
+                    dx_tiles = [t.reshape(*rows_2d) for t in dx_tiles]
+                y_vmem, dy_vmem = refs[n_lane_tiles], refs[-1]
+                if staged:
+                    y_scratch, dy_scratch = scratch
                     pre_broadcast_y = self.preload_y(
                         y_vmem,
                         yis,
@@ -236,121 +263,125 @@ class _BwdTrailingChannelKernel(BwdKernel):
                         num_channels_padded,
                         n_batch_packed_in_channel,
                     )
-                zero = jnp.zeros((batch_block_size, num_channels_padded), jnp.float32)
-                dy_acc = {yi: zero for yi in yi_used}
-                dx_rows = [zero] * x_dim_padded
-
-                for xi, contributions in cg_by_xi:
-                    acc_dx = zero
-                    x_slice = x_vmem[xi, :, :]
-                    for oi, yi, v in contributions:
-                        dz_slice = dz_vmem[oi, :, :]
-                        vdz = v * dz_slice
-                        acc_dx = acc_dx + pre_broadcast_y[yi] * vdz
-                        dy_acc[yi] = dy_acc[yi] + x_slice * vdz
-                    dx_rows[xi] = acc_dx
-
-                dx_block = jnp.stack(dx_rows, axis=0)
-                if dim_leading:
-                    dx_vmem[...] = dx_block.astype(dx_vmem.dtype)
-                    for yi in yi_used:
-                        self._store_dy_dim_leading(dy_vmem, yi, dy_acc[yi])
-                else:
-                    dx_vmem[...] = jax.lax.transpose(dx_block, (1, 0, 2)).astype(
-                        dx_vmem.dtype
-                    )
-                    for yi in yi_used:
-                        self.write_dy(
-                            dy_vmem, yi, dy_acc[yi], n_batch_packed_in_channel
+                    for yi in yis:
+                        y_scratch[yi] = pre_broadcast_y[yi].astype(jnp.float32)
+                for xi in range(x_dim_padded):
+                    if xi not in xis:
+                        store_dx(
+                            dx_tiles,
+                            xi,
+                            0,
+                            batch_block_size,
+                            jnp.zeros((batch_block_size, num_channels_padded), x.dtype),
                         )
 
+                def sub_tile(r, carry):
+                    r0 = pl.multiple_of(r * sub_rows, sub_rows)
+                    rs = pl.ds(r0, sub_rows)
+                    if staged:
+                        pre_broadcast_y = {yi: y_scratch[yi, rs, :] for yi in yis}
+                    elif dim_leading:
+                        y_sub = self._batch_rows_dim_leading(y_vmem, rs)
+                        dy_sub = self._batch_rows_dim_leading(dy_vmem, rs)
+                        pre_broadcast_y = self._load_y_dim_leading(
+                            y_sub, yis, sub_rows, num_channels_padded
+                        )
+                    else:
+                        pre_broadcast_y = self.preload_y(
+                            y_vmem.at[rs], yis, sub_rows, num_channels_padded, 1
+                        )
+                    zero = jnp.zeros((sub_rows, num_channels_padded), jnp.float32)
+                    dy_acc = [zero] * y_dim
+                    for xi, pairs in pairs_by_xi:
+                        x_slice = load_x(x_tiles, xi, r0, sub_rows)
+                        acc_dx = zero
+                        for yi, terms in pairs:
+                            vdz = terms[0][1] * dz_vmem[terms[0][0], rs, :]
+                            for zi, v in terms[1:]:
+                                vdz = vdz + v * dz_vmem[zi, rs, :]
+                            acc_dx = acc_dx + pre_broadcast_y[yi] * vdz
+                            dy_acc[yi] = dy_acc[yi] + x_slice * vdz
+                        store_dx(dx_tiles, xi, r0, sub_rows, acc_dx.astype(x.dtype))
+                    for yi in range(y_dim):
+                        if staged:
+                            dy_scratch[yi, rs, :] = dy_acc[yi]
+                        elif dim_leading:
+                            self._store_dy_dim_leading(dy_sub, yi, dy_acc[yi])
+                        else:
+                            self.write_dy(dy_vmem.at[rs], yi, dy_acc[yi], 1)
+                    return carry
+
+                jax.lax.fori_loop(0, batch_block_size // sub_rows, sub_tile, 0)
+                if staged:
+                    for yi in range(y_dim):
+                        self.write_dy(
+                            dy_vmem, yi, dy_scratch[yi], n_batch_packed_in_channel
+                        )
+
+            dz_spec = pl.BlockSpec(
+                block_shape=(z_dim, batch_block_size, num_channels_padded),
+                index_map=lambda i: (0, i, 0),
+            )
+            if dim_leading:
+                x_specs = [
+                    pl.BlockSpec(
+                        block_shape=(
+                            x_dim_padded,
+                            batch_block_size,
+                            num_channels_padded,
+                        ),
+                        index_map=lambda i: (0, i, 0),
+                    )
+                ]
+                y_spec = self._y_blockspec_dim_leading(
+                    y, batch_block_size, num_channels_padded
+                )
+            else:
+                # One block per 128-lane tile: strided loads need a 128-lane memref.
+                x_specs = [
+                    pl.BlockSpec(
+                        block_shape=(batch_block_size, x_dim_padded, 128),
+                        index_map=lambda i, t=t: (i, 0, t),
+                    )
+                    for t in range(n_lane_tiles)
+                ]
+                y_spec = pl.BlockSpec(
+                    block_shape=self.y_block_shape(y, batch_block_size),
+                    index_map=self.y_index_map,
+                )
             pltpu.emit_pipeline(
                 body,
                 grid=(n_batch_blocks,),
-                in_specs=[
-                    pl.BlockSpec(
-                        block_shape=(z_dim, batch_block_size, num_channels_padded),
-                        index_map=lambda i: (0, i, 0),
-                    ),
-                    pl.BlockSpec(
-                        block_shape=(
-                            (x_dim_padded, batch_block_size, num_channels_padded)
-                            if dim_leading
-                            else (batch_block_size, x_dim_padded, num_channels_padded)
-                        ),
-                        index_map=(
-                            (lambda i: (0, i, 0))
-                            if dim_leading
-                            else (lambda i: (i, 0, 0))
-                        ),
-                    ),
-                    (
-                        self._y_blockspec_dim_leading(
-                            y, batch_block_size, num_channels_padded
-                        )
-                        if dim_leading
-                        else pl.BlockSpec(
-                            block_shape=self.y_block_shape(y, batch_block_size),
-                            index_map=self.y_index_map,
-                        )
-                    ),
-                ],
-                out_specs=[
-                    pl.BlockSpec(
-                        block_shape=(
-                            (x_dim_padded, batch_block_size, num_channels_padded)
-                            if dim_leading
-                            else (batch_block_size, x_dim_padded, num_channels_padded)
-                        ),
-                        index_map=(
-                            (lambda i: (0, i, 0))
-                            if dim_leading
-                            else (lambda i: (i, 0, 0))
-                        ),
-                    ),
-                    (
-                        self._y_blockspec_dim_leading(
-                            y, batch_block_size, num_channels_padded
-                        )
-                        if dim_leading
-                        else pl.BlockSpec(
-                            block_shape=self.y_block_shape(y, batch_block_size),
-                            index_map=self.y_index_map,
-                        )
-                    ),
-                ],
+                in_specs=[dz_spec, *x_specs, y_spec],
+                out_specs=[*x_specs, y_spec],
                 core_axis=0,
                 dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
-            )(dz_ref, x_ref, y_ref, dx_ref, dy_ref)
+            )(
+                dz_ref,
+                *[x_ref] * n_lane_tiles,
+                y_ref,
+                *[dx_ref] * n_lane_tiles,
+                dy_ref,
+            )
 
         dx, dy = pl.pallas_call(
             bwd_kernel,
             out_shape=[
-                jax.ShapeDtypeStruct(
-                    (
-                        (x_dim_padded, kernel_batch, num_channels_padded)
-                        if dim_leading
-                        else (kernel_batch, x_dim_padded, num_channels_padded)
-                    ),
-                    x.dtype,
-                ),
-                jax.ShapeDtypeStruct(dy_kernel_shape, x.dtype),
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
+                jax.ShapeDtypeStruct(dy_kernel_shape, dtype),
             ],
             in_specs=[
                 pl.BlockSpec(a.shape, memory_space=pltpu.HBM) for a in (dz, x, y)
             ],
             out_specs=[
-                pl.BlockSpec(
-                    (
-                        (x_dim_padded, kernel_batch, num_channels_padded)
-                        if dim_leading
-                        else (kernel_batch, x_dim_padded, num_channels_padded)
-                    ),
-                    memory_space=pltpu.HBM,
-                ),
+                pl.BlockSpec(x.shape, memory_space=pltpu.HBM),
                 pl.BlockSpec(dy_kernel_shape, memory_space=pltpu.HBM),
             ],
             grid=(num_kernel,),
+            scratch_shapes=[
+                pltpu.VMEM((y_dim, batch_block_size, num_channels_padded), jnp.float32)
+                for _ in range(2 if staged else 0)
+            ],
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,)
             ),
@@ -362,7 +393,13 @@ class _BwdTrailingChannelKernel(BwdKernel):
                 dx.transpose(1, 0, 2)[:batch_size, :, :channels],
                 self._finalize_dy_dim_leading(dy, y_dim, channels, batch_size),
             )
-        dx = self._unpack_dx(dx, batch_size, x_dim, channels, n_batch_packed_in_channel)
+        dx = self._unpack_dx(
+            dx.astype(dtype),
+            batch_size,
+            x_dim,
+            channels,
+            n_batch_packed_in_channel,
+        )
         return dx, self.finalize_dy(
             dy, y_dim, channels, batch_size, n_batch_packed_in_channel
         )
@@ -398,43 +435,27 @@ class _BwdTrailingChannelKernel(BwdKernel):
         )
         return dx[:, :x_dim, :channels]
 
+    @staticmethod
     def _vmem_bytes_per_batch_element(
-        self,
         x_dim_padded: int,
         channels_padded: int,
-        y_padded: jax.Array,
+        y_elems: int,
         z_dim: int,
-        num_yis: int,
-        y_dim: int,
+        scratch_rows: int,
         dtype_bytes: int,
     ) -> int:
-        """VMEM bytes consumed per batch element (pipeline double-buffered + body intermediates).
-
-        Pipeline: dz, x (in+out), y (in+out) — all double-buffered by emit_pipeline.
-        Body intermediates: transposed x, preloaded y slices, dy accumulators,
-        dx_rows list, dx_block stack.
-        """
-        y_elems = math.prod(self.y_block_shape(y_padded, 1))
-        pipeline = (
+        """VMEM bytes per batch element: double-buffered dz, x, dx, y and dy blocks
+        plus `scratch_rows` fp32 channel rows held at block scope."""
+        return (
             2
             * dtype_bytes
             * (
-                z_dim * channels_padded  # dz in
-                + 2 * x_dim_padded * channels_padded  # x in + dx out
-                + 2 * y_elems  # y in + dy out
+                z_dim * channels_padded
+                + 2 * x_dim_padded * channels_padded
+                + 2 * y_elems
             )
+            + 4 * channels_padded * scratch_rows
         )
-        body = (
-            4
-            * channels_padded
-            * (
-                x_dim_padded  # x_vmem transposed
-                + num_yis  # preloaded y slices
-                + y_dim  # dy accumulators (one per yi_used = range(y_dim))
-                + 2 * x_dim_padded  # dx_rows list + dx_block stack
-            )
-        )
-        return pipeline + body
 
     @abstractmethod
     def _validate_y(self, x: jax.Array, y: jax.Array) -> None:
@@ -477,6 +498,13 @@ class _BwdTrailingChannelKernel(BwdKernel):
         """
 
     @abstractmethod
+    def staging_rows(
+        self, n_yis: int, y_dim: int, y_cols: int, n_batch_packed_in_channel: int
+    ) -> int:
+        """fp32 channel rows the packed path's `preload_y` / `write_dy` hold per
+        batch element, besides the `y` / `dy` scratch."""
+
+    @abstractmethod
     def write_dy(
         self,
         dy_vmem: jax.Array,
@@ -508,6 +536,9 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
 
     def _orient_y_dim_leading(self, y: jax.Array) -> jax.Array:
         return pad_for_tpu(y)
+
+    def _batch_rows_dim_leading(self, ref: jax.Array, rows: pl.Slice) -> jax.Array:
+        return ref.at[rows]
 
     def _dy_kernel_shape_dim_leading(
         self, y: jax.Array, kernel_batch: int
@@ -609,6 +640,14 @@ class _BwdTrailingChannelOuterKernel(_BwdTrailingChannelKernel):
             for yi in yis
         }
 
+    def staging_rows(
+        self, n_yis: int, y_dim: int, y_cols: int, n_batch_packed_in_channel: int
+    ) -> int:
+        # Per used yi: the k-wide slice, the (k, channel) broadcast padded to a full
+        # tile, its reshape and cast. Per yi: the loaded dy row and its k segments.
+        k = n_batch_packed_in_channel
+        return n_yis * (3 + round_up(k, 8)) + y_dim * (1 + k)
+
     def write_dy(
         self,
         dy_vmem: jax.Array,
@@ -662,6 +701,9 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
 
     def _orient_y_dim_leading(self, y: jax.Array) -> jax.Array:
         return pad_for_tpu(jnp.transpose(y, (1, 0, 2)))
+
+    def _batch_rows_dim_leading(self, ref: jax.Array, rows: pl.Slice) -> jax.Array:
+        return ref.at[:, rows]
 
     def _dy_kernel_shape_dim_leading(
         self, y: jax.Array, kernel_batch: int
@@ -727,6 +769,12 @@ class _BwdTrailingChannelMapKernel(_BwdTrailingChannelKernel):
     ) -> dict[int, jax.Array]:
         y_t = jax.lax.transpose(y_vmem[...], (1, 0, 2))
         return {yi: y_t[yi, :, :] for yi in yis}
+
+    def staging_rows(
+        self, n_yis: int, y_dim: int, y_cols: int, n_batch_packed_in_channel: int
+    ) -> int:
+        # The transposed y block and the loaded dy rows.
+        return y_cols + y_dim
 
     def write_dy(
         self,

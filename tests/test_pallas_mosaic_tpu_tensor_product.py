@@ -29,6 +29,8 @@ from e3j.core.tensor_product import TensorProduct
 from e3j.pallas_ops.tensor_product.mosaic_tpu import tensor_product_pallas_mosaic_tpu
 from e3j.pallas_ops.tensor_product.mosaic_tpu.params import (
     PallasMosaicTPUTensorProductParams,
+    PallasMosaicTPUTensorProductParamsBwdConfig,
+    PallasMosaicTPUTensorProductParamsFwdConfig,
 )
 from e3j.utils import config, options
 
@@ -233,6 +235,48 @@ def test_backward_trailing_channel_map_matches_reference(
     assert dy.shape == (batch_size, params.y_space.dim, channels)
     testing.assert_allclose(dx, dx_ref, rtol=RTOL, atol=ATOL)
     testing.assert_allclose(dy, dy_ref, rtol=RTOL, atol=ATOL)
+
+
+L3 = "0e + 1o + 2e + 3o"
+
+
+@pytest.mark.parametrize(
+    ("out", "mode", "batch_size", "channels"),
+    [
+        pytest.param(L3, options.MixingMode.OUTER, 4096, 16, id="packed-outer-c16"),
+        pytest.param(
+            "0e + 1o + 2e", options.MixingMode.MAP, 2304, 256, id="mace-sc-map-c256"
+        ),
+        pytest.param(L3, options.MixingMode.OUTER, 1024, 160, id="cmem-outer-c160"),
+    ],
+)
+def test_backward_regressions(out, mode, batch_size, channels):
+    """Shapes the backward once broke: the first two overflowed VMEM, the last
+    reads padded operands XLA stages in v4 CMEM."""
+    params = _build_params(L3, L3, out, mode)
+    outer = mode == options.MixingMode.OUTER
+    inputs = _inputs_trailing_outer if outer else _inputs_trailing_map
+    reference = _reference_trailing_outer if outer else _reference_trailing_map
+    x, y = inputs(params, batch_size, channels)
+    do = jax.random.normal(
+        jax.random.key(1), (batch_size, params.z_space.dim, channels), dtype=x.dtype
+    )
+
+    dx, dy = _jit_vjp(lambda x, y: tensor_product_pallas_mosaic_tpu(x, y, params))(
+        x, y, do
+    )
+
+    _, vjp_ref = jax.vjp(jax.jit(lambda x, y: reference(x, y, params)), x, y)
+    dx_ref, dy_ref = vjp_ref(do)
+    testing.assert_allclose(dx, dx_ref, rtol=RTOL, atol=ATOL)
+    testing.assert_allclose(dy, dy_ref, rtol=RTOL, atol=ATOL)
+
+
+def test_fwd_config_rejects_bwd_only_block_size():
+    """A 64-row batch block is backward-only."""
+    with pytest.raises(ValueError):
+        PallasMosaicTPUTensorProductParamsFwdConfig(batch_block_size=64)
+    assert PallasMosaicTPUTensorProductParamsBwdConfig(batch_block_size=64)
 
 
 # --- TensorProduct class dispatch (MOSAIC_TPU config) ---
