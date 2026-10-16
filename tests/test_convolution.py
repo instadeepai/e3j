@@ -23,7 +23,7 @@ from conftest import assert_allclose
 import e3j
 from e3j.core.convolution import Convolution
 from e3j.ops.coef import Coef4D
-from e3j.utils.options import Layout
+from e3j.utils.options import Layout, TensorProduct
 from e3j.utils.sparse import narrow_index_dtype
 
 
@@ -455,3 +455,13 @@ class TestConvolutionFusedSender:
         )
         for gf, gr in zip(g_send, g_ref):
             assert_allclose(gf, gr, rtol=2e-3, atol=2e-3)
+
+
+def test_tensor_product_uses_module_config():
+    """The inner tensor product follows the convolution's config, not the global."""
+    config = e3j.utils.Config(tensor_product=TensorProduct.DENSE)
+    with e3j.config.use(tensor_product="UNFUSED"):
+        module = Convolution(
+            ("0e + 1o", "0e + 1o"), graph_ordering="NONE", config=config
+        )
+    assert module._otimes.config.tensor_product == config.tensor_product

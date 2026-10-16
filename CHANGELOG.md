@@ -23,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   INNER reductions (undefined behaviour).
 - CUDA tensor product: INNER reductions, also run by the OUTER backward, gave
   wrong results below 32 channels.
+- `Convolution` built its tensor product with the global config instead of its
+  own `config`.
 
 ### Added
 

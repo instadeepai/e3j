@@ -122,12 +122,14 @@ class Convolution:
             convolution is trailing channels only, so it never hits the
             `atomicAdd` float16 restriction.
         """
+        self.config = utils.config.state() if config is None else config
         # Tensor product block
         otimes = TensorProduct(
             (source[0], source[1]),
             target,
             normalization=normalization,
             layout=layout,
+            config=self.config,
         )
         # Statically rescale coefficients by num_neighbors to skip
         # the node-wise message rescaling overhead.
@@ -149,7 +151,6 @@ class Convolution:
         # Optional rescaling factor
         self.avg_num_neighbors = avg_num_neighbors
 
-        self.config = utils.config.state() if config is None else config
         self.layout = Layout.parse(layout)
         self.normalization = otimes.normalization
         self._otimes = otimes
