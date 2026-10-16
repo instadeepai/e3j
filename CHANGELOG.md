@@ -36,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   `e3j.linen` modules, which now only own the weights.
 - `e3j.linen.LinearIndexwise` accepts any number of leading batch axes.
 - `e3j.config.snapshot(config)`: `config`, or a frozen copy of the global state.
+- `PowerExpansion` takes a `config` for its tensor products.
 
 ### Removed
 

@@ -13,13 +13,18 @@
 # limitations under the License.
 
 import e3nn_jax as e3nn
+import jax
 import jax.numpy as np
 import jax.random as random
 import pytest
+from conftest import assert_allclose
 
+import e3j
 from e3j.core.power_expansion import PowerExpansion
 from e3j.spaces import O3Space
+from e3j.utils.config import Config
 from e3j.utils.irreps import irrep_range
+from e3j.utils.options import TensorProduct
 
 
 class _TestPowerExpansion:
@@ -78,6 +83,20 @@ class _TestPowerExpansion:
         # Powers 1, ..., nu (inclusive)
         assert len(out) == self.exponent
 
+    def test_reuse_after_jit(self, inputs):
+        """Layers built lazily under `jit` must not leak tracers."""
+        module = PowerExpansion(
+            source=self.source,
+            exponent=self.exponent,
+            target_filter=self.keep_ir_out,
+            l_max=self.l_max,
+            layout=self.layout,
+        )
+        (x,) = inputs
+        jax.jit(module)(x[1:])
+        jax.jit(module)(x)
+        module(x)
+
 
 class TestPowerExpansionSPD2SPD(_TestPowerExpansion):
 
@@ -115,3 +134,36 @@ class TestPowerExpansionSP3SPLmax(_TestPowerExpansion):
     exponent = 3
     keep_ir_out = None
     l_max = 1
+
+
+@pytest.mark.parametrize("exponent", [0, -1])
+def test_exponent_below_one(exponent):
+    with pytest.raises(ValueError, match="exponent of at least 1"):
+        PowerExpansion("0e + 1o", exponent)
+
+
+class TestPowerExpansionVectorToScalar(_TestPowerExpansion):
+    """Odd powers of a vector hold no scalar, so they are empty."""
+
+    source = "1o"
+    exponent = 3
+    keep_ir_out = "0e"
+    l_max = None
+
+    def test_squared_norm(self, module):
+        x = random.normal(self.key, (self.batch_size, 4, O3Space(self.source).dim))
+        x1, x2, x3 = module(x)
+        assert x1.shape == x3.shape == (self.batch_size, 4, 0)
+        # 1o x 1o -> 0e has unit-norm Clebsch-Gordan coefficients delta_ij / sqrt(3)
+        assert_allclose(np.abs(x2[..., 0]), np.sum(x**2, axis=-1) / np.sqrt(3))
+
+
+def test_config():
+    """The config, explicit or global at construction, reaches the products."""
+    config = Config(tensor_product=TensorProduct.DENSE)
+    explicit = PowerExpansion("0e + 1o", 3, "0e + 1o", config=config)
+    with e3j.config.use(tensor_product="DENSE"):
+        implicit = PowerExpansion("0e + 1o", 3, "0e + 1o")
+    for module in (explicit, implicit):
+        impls = [otimes.config.tensor_product for otimes in module.otimes_layers]
+        assert impls == [TensorProduct.DENSE, TensorProduct.DENSE]

@@ -14,6 +14,7 @@
 
 import e3nn_jax as e3nn
 import jax.numpy as np
+import numpy
 
 from e3j.spaces import O3Space
 
@@ -32,9 +33,10 @@ class Filter:
             if ir not in keep_ir_out:
                 continue
             target.append((m, ir))
-            indices.append(np.arange(slc.start, slc.stop))
+            indices.extend(range(slc.start, slc.stop))
         self.target = O3Space(target)
-        self.indices = np.concat(indices)
+        # numpy, not jax: a filter built while tracing must not hold tracers.
+        self.indices = numpy.array(indices, dtype=int)
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         """Filter out features not in `target`."""

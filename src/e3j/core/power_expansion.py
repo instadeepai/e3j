@@ -16,6 +16,7 @@ import functools
 
 import jax.numpy as np
 
+from e3j import utils
 from e3j.core.filter import Filter
 from e3j.core.tensor_product import TensorProduct
 from e3j.spaces import O3Space
@@ -38,6 +39,7 @@ class PowerExpansion:
         target_filter: None | str | O3Space = None,
         l_max: int | None = None,
         layout: str | Layout = "TRAILING_CHANNELS",
+        config: utils.Config | None = None,
     ):
         """Initialize power expansion block.
 
@@ -53,7 +55,10 @@ class PowerExpansion:
             l_max: any intermediate irreducible block over this degree will
                    be skipped.
             layout: I/O array layout.
+            config: tensor product configuration, the global one if None.
         """
+        if exponent < 1:
+            raise ValueError(f"Expected an exponent of at least 1, got {exponent}.")
         if not isinstance(source, O3Space):
             source = O3Space(source)
         if not isinstance(target_filter, (O3Space, type(None))):
@@ -64,6 +69,8 @@ class PowerExpansion:
         self.target_filter = target_filter
         self.l_max = l_max
         self.layout = Layout.parse(layout)
+        # Frozen now since the tensor products are built lazily.
+        self.config = utils.config.snapshot(config)
 
     @property
     def hidden(self) -> tuple[O3Space, ...]:
@@ -77,9 +84,12 @@ class PowerExpansion:
         To exclude hidden representations based on a momentum threshold,
         set the `l_max` attribute. This parameter allows for a trade-off
         between expressivity vs. speed and memory.
+
+        Powers past the last tensor product are empty.
         """
         layers = self.otimes_layers
-        return (self.source, *(otimes.target for otimes in layers))
+        hidden = (self.source, *(otimes.target for otimes in layers))
+        return hidden + (O3Space([]),) * (self.exponent - len(hidden))
 
     @property
     def target(self) -> tuple[O3Space, ...]:
@@ -167,18 +177,24 @@ class PowerExpansion:
 
     @functools.cached_property
     def otimes_layers(self) -> list[TensorProduct]:
-        """Return list of :class:`e3j.core.TensorProduct` instances."""
+        """Return list of :class:`e3j.core.TensorProduct` instances.
+
+        Stops at the first empty power: all later ones are empty too.
+        """
         layers = []
         irrep_nu = self.source
         for nu in range(2, self.exponent + 1):
             # Filter output
             irreps_out = self.get_target_filter(nu)
+            if TensorProduct.infer_target((irrep_nu, self.source), irreps_out).dim == 0:
+                break
             # Accumulate TP layer
             otimes = TensorProduct(
                 (irrep_nu, self.source),
                 irreps_out,
                 layout=self.layout,
                 mode=MixingMode.MAP,
+                config=self.config,
             )
             irrep_nu = otimes.target
             layers.append(otimes)
@@ -192,5 +208,7 @@ class PowerExpansion:
             x_nu = out[-1]
             x_nu = otimes(x_nu, x)
             out.append(x_nu)
+        # Empty powers: filtering any input gives the right batch shape.
+        out += [x] * (self.exponent - len(out))
         filters = self.filter_layers
         return [filter_out(x_nu) for x_nu, filter_out in zip(out, filters)]
