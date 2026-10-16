@@ -14,7 +14,6 @@
 
 import functools
 
-import e3nn_jax as e3nn
 import jax.numpy as np
 
 from e3j.core.filter import Filter
@@ -183,7 +182,6 @@ class PowerExpansion:
             )
             irrep_nu = otimes.target
             layers.append(otimes)
-            lhs, rhs = otimes.source
 
         return layers
 

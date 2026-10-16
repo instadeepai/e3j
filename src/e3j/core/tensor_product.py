@@ -152,7 +152,7 @@ class TensorProduct(SparseMixin):
 
         # --- Sparse/Dense switch ---
 
-        self.config = utils.config.state() if config is None else config
+        self.config = utils.config.snapshot(config)
         self.aggregation_method = self.config.aggregation
         self.layout = Layout.parse(layout)
         self.mode = options.MixingMode.parse(mode)

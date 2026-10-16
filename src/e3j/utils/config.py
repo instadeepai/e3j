@@ -33,7 +33,7 @@ _E3J_OPS_AVAILABLE = importlib.util.find_spec("e3j_ops") is not None
 _TPU_AVAILABLE = importlib.util.find_spec("libtpu") is not None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config(YamlConfig):
     """Global configuration for e3j.
 
@@ -41,7 +41,7 @@ class Config(YamlConfig):
     debug verbosity. Values can be set programmatically or loaded from a
     YAML file (see ``E3J_CONFIG`` environment variable).
 
-    While :class:`Config` objects are plain dataclasses with additional
+    While :class:`Config` objects are frozen dataclasses with additional
     I/O and serialization support, the global mutable state is of type
     :class:`config` (lower case).
 
@@ -67,6 +67,16 @@ class Config(YamlConfig):
     aggregation: Aggregation = Aggregation.SCATTER
     convolution: Convolution = Convolution.UNFUSED
     debug_level: int = 0
+
+    def __post_init__(self):
+        for key in self.fields():
+            object.__setattr__(self, key, _cast(key, getattr(self, key)))
+
+
+def _cast(key: str, value):
+    """Cast ``value`` to the type of field ``key``, e.g. a string to an enum."""
+    key_t = Config.fields()[key]
+    return value if isinstance(value, key_t) else key_t(value)
 
 
 # ------ Platform-dependent defaults ------
@@ -102,6 +112,8 @@ class config(Config):
     """
 
     _state: type["config"] = None
+
+    __hash__ = None  # mutable
 
     _path = E3J_CONFIG if E3J_CONFIG.exists() else None
 
@@ -166,9 +178,7 @@ class config(Config):
                 f"{key} is not an e3j configuration field. Valid keys are:\n"
                 f"{list(fields.keys())}"
             )
-        if not isinstance(value, fields[key]):
-            value = fields[key](value)
-        super().__setattr__(key, value)
+        object.__setattr__(self, key, _cast(key, value))
 
     @classmethod
     @contextmanager
@@ -178,9 +188,7 @@ class config(Config):
         old = {key: getattr(_state, key) for key in cls.fields()}
         try:
             cls(**kwargs)
-            new = Config(**kwargs)
-            yield new
-
+            yield cls.state()
         finally:
             cls(**old)
 
@@ -190,6 +198,14 @@ class config(Config):
         _state = cls()
         fields = {key: getattr(_state, key) for key in cls.fields()}
         return Config(**fields)
+
+    @classmethod
+    def snapshot(cls, config: Config | None = None) -> Config:
+        """Return ``config``, or a frozen copy of the global state if ``config``
+        is None or the global state itself."""
+        if config is None or isinstance(config, cls):
+            return cls.state()
+        return config
 
 
 # ==== Read configuration from file ====

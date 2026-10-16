@@ -14,6 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   on the host, at trace time, instead of on the device.
 - The CUDA convolution now requires a concrete `coef`: a traced one (e.g. a jit
   argument) raises a `TypeError`, like the tensor product and Mosaic kernels.
+- `e3j.utils.Config` is frozen and hashable (use `dataclasses.replace`), and
+  casts string values, e.g. `Config(tensor_product="DENSE")`.
+- `TensorProduct`, `Bigotimes` and `Convolution` given `config=e3j.config()`
+  keep a frozen copy instead of following later global changes.
 
 ### Fixed
 
@@ -31,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 - `e3j.core.Linear` and `e3j.core.LinearIndexwise`, flax-free compute cores of the
   `e3j.linen` modules, which now only own the weights.
 - `e3j.linen.LinearIndexwise` accepts any number of leading batch axes.
+- `e3j.config.snapshot(config)`: `config`, or a frozen copy of the global state.
 
 ### Removed
 

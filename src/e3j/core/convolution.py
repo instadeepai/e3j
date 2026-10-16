@@ -122,7 +122,7 @@ class Convolution:
             convolution is trailing channels only, so it never hits the
             `atomicAdd` float16 restriction.
         """
-        self.config = utils.config.state() if config is None else config
+        self.config = utils.config.snapshot(config)
         # Tensor product block
         otimes = TensorProduct(
             (source[0], source[1]),

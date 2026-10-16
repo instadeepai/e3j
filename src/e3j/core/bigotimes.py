@@ -110,7 +110,7 @@ class Bigotimes(SparseMixin):
             self.coef = other.coef
             self.target = other.target
 
-        self.config = utils.config.state() if config is None else config
+        self.config = utils.config.snapshot(config)
         self.aggregation_method = self.config.aggregation
 
     @classmethod
