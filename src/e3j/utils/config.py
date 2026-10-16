@@ -22,7 +22,13 @@ from pathlib import Path
 import yaml
 
 from e3j.utils._yaml_config import YamlConfig
-from e3j.utils.options import Aggregation, Convolution, Layout, TensorProduct
+from e3j.utils.options import (
+    Aggregation,
+    Convolution,
+    Layout,
+    SymmetricContraction,
+    TensorProduct,
+)
 
 E3J_CONFIG = Path(os.environ.get("E3J_CONFIG") or "e3j.yaml")
 
@@ -50,6 +56,8 @@ class Config(YamlConfig):
             See :class:`~e3j.utils.options.Layout`.
         tensor_product: Evaluation strategy for tensor products.
             See :class:`~e3j.utils.options.TensorProduct`.
+        symmetric_contraction: Implementation strategy for the symmetric
+            contraction. See :class:`~e3j.utils.options.SymmetricContraction`.
         aggregation: Aggregation method for sparse reduction steps.
             Only used if `tensor_product` option is "UNFUSED".
             See :class:`~e3j.utils.options.Aggregation`.
@@ -64,6 +72,7 @@ class Config(YamlConfig):
 
     layout: Layout = Layout.TRAILING_CHANNELS
     tensor_product: TensorProduct = TensorProduct.UNFUSED
+    symmetric_contraction: SymmetricContraction = SymmetricContraction.UNFUSED
     aggregation: Aggregation = Aggregation.SCATTER
     convolution: Convolution = Convolution.UNFUSED
     debug_level: int = 0
@@ -201,8 +210,7 @@ class config(Config):
 
     @classmethod
     def snapshot(cls, config: Config | None = None) -> Config:
-        """Return ``config``, or a frozen copy of the global state if ``config``
-        is None or the global state itself."""
+        """`config`, or a frozen copy of the global state if None or global."""
         if config is None or isinstance(config, cls):
             return cls.state()
         return config

@@ -23,3 +23,4 @@ core
     Filter
     Linear
     LinearIndexwise
+    SymmetricContraction

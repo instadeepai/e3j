@@ -22,6 +22,7 @@ from .permutation import Permutation
 from .polynomials import Monomial, Polynomial
 from .power_expansion import PowerExpansion
 from .scalar_mixing import ScalarMixing
+from .symmetric_contraction import SymmetricContraction
 from .tensor_product import TensorProduct
 
 __all__ = [
@@ -36,5 +37,6 @@ __all__ = [
     "Polynomial",
     "PowerExpansion",
     "ScalarMixing",
+    "SymmetricContraction",
     "TensorProduct",
 ]

@@ -17,6 +17,7 @@ import dataclasses
 import pytest
 from jax import random
 
+from e3j.core.symmetric_contraction import SymmetricContraction
 from e3j.core.tensor_product import TensorProduct
 from e3j.utils.config import Config, config
 
@@ -24,6 +25,7 @@ from e3j.utils.config import Config, config
 STRINGS = dict(
     layout="LEADING_CHANNELS",
     tensor_product="UNFUSED",
+    symmetric_contraction="UNFUSED",
     aggregation="SCATTER",
     convolution="UNFUSED",
 )
@@ -48,7 +50,14 @@ def test_strings_are_cast(make, tmp_path):
     for key, value in STRINGS.items():
         assert getattr(cfg, key) == Config.fields()[key][value]
     assert hash(cfg) == hash(Config(**STRINGS))
-    feats = random.normal(random.key(0), (5, 2, 4))
+    key = random.key(0)
+    contraction = SymmetricContraction(
+        "0e + 1o", 2, "0e + 1o", 3, 4, "LEADING_CHANNELS", config=cfg
+    )
+    weights = [random.normal(key, (3, 4, *b.shape)) for b in contraction.linear_blocks]
+    feats = random.normal(key, (5, 4, 4))
+    y = contraction(feats, random.choice(key, 3, (5,)), weights)
+    assert y.shape == (5, 4, 4)
     tp = TensorProduct(("0e + 1o", "0e + 1o"), None, config=cfg)
     assert tp(feats[:, 0], feats[:, 1]).shape == (5, tp.target.dim)
 

@@ -37,6 +37,17 @@ class TensorProduct(Enum):
     FUSED_MOSAIC_GPU = "FUSED_MOSAIC_GPU"
 
 
+class SymmetricContraction(Enum):
+    """Implementation strategy for :class:`~e3j.core.SymmetricContraction`.
+
+    Values:
+        UNFUSED: power expansion, permutation and index-wise linear as
+            separate ops, each following its own config option.
+    """
+
+    UNFUSED = "UNFUSED"
+
+
 class Aggregation(Enum):
     """Aggregation method for the sparse reduction step.
 

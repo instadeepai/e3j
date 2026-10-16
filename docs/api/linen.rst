@@ -14,3 +14,4 @@ linen
 
     Linear
     LinearIndexwise
+    SymmetricContraction

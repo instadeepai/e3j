@@ -14,8 +14,10 @@
 
 from .linear import Linear
 from .linear_indexwise import LinearIndexwise
+from .symmetric_contraction import SymmetricContraction
 
 __all__ = [
     "Linear",
     "LinearIndexwise",
+    "SymmetricContraction",
 ]
