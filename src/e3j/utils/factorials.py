@@ -26,7 +26,7 @@ def fact(n: np.ndarray) -> np.ndarray:
 def bifact(n: np.ndarray) -> np.ndarray:
     """Bifactorial n!!"""
     even = n % 2 == 0
-    out = even * bifact_even(n) + (~even) * bifact_odd(n)
+    out = np.where(even, bifact_even(n), bifact_odd(n))
     return np.round(out)
 
 
