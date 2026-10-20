@@ -16,7 +16,7 @@ import e3nn_jax as e3nn
 import jax
 import pytest
 from conftest import assert_allclose
-from jax import numpy as np
+from jax import numpy as jnp
 from jax import random
 
 from e3j.core.linear_indexwise import LinearIndexwise as LinearIndexwiseCore
@@ -61,7 +61,7 @@ class _TestLinearIndexwise:
         return e3j_module.init(self.key, *inputs)
 
     @pytest.fixture(scope="class")
-    def rotations(self, e3j_module) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[jnp.ndarray]:
         """Prepare output and input rotations."""
         in_irreps = e3nn.Irreps(e3j_module.source)
         out_irreps = e3nn.Irreps(e3j_module.target)
@@ -74,7 +74,7 @@ class _TestLinearIndexwise:
         return x @ g
 
     def assert_zero(self, data, tol: float = 5e-6):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         assert norm < tol
 
     # --- Test functions ---
@@ -114,11 +114,11 @@ class _TestLinearIndexwise:
 
         input_features, input_indices = inputs
 
-        y1 = np.swapaxes(
+        y1 = jnp.swapaxes(
             e3j_module.apply(params, input_features, input_indices), -1, -2
         )
         y2 = other_module.apply(
-            params, np.swapaxes(input_features, -1, -2), input_indices
+            params, jnp.swapaxes(input_features, -1, -2), input_indices
         )
 
         assert_allclose(y1, y2)
@@ -209,7 +209,7 @@ class _TestLinearIndexwiseTrailing(_TestLinearIndexwise):
         return (input_features, input_indices)
 
     def rotate(self, g, x):
-        return np.einsum("nic,ij->njc", x, g)
+        return jnp.einsum("nic,ij->njc", x, g)
 
 
 class TestLinearIndexwiseTrailing(_TestLinearIndexwiseTrailing):
@@ -273,7 +273,7 @@ class TestLinearIndexwiseFanInFCTP(_TestLinearIndexwise):
         y_none = module_none.apply(params_none, feats, indices)
         y_fctp = module_fctp.apply(params_fctp, feats, indices)
 
-        var_ratio = float(np.var(y_fctp)) / float(np.var(y_none))
+        var_ratio = float(jnp.var(y_fctp)) / float(jnp.var(y_none))
         expected_ratio = 1.0 / self.num_indices
         assert_allclose(expected_ratio, var_ratio, rtol=0.15, atol=1e-4)
 
@@ -312,7 +312,7 @@ class TestLinearIndexwiseBatchAxes:
             self.in1, self.out, self.num_indices, num_channels, layout=layout
         )
         x = random.normal(key, (5, *self.feat_shape(setting)))
-        params = module.init(key, x, np.zeros(5, dtype=int))
+        params = module.init(key, x, jnp.zeros(5, dtype=int))
         return lambda x, i: module.apply(params, x, i)
 
     def feat_shape(self, setting) -> tuple[int, ...]:
@@ -337,9 +337,9 @@ class TestLinearIndexwiseBatchAxes:
         assert_allclose(y, y_flat.reshape(y.shape))
 
     def test_index_shape_mismatch(self, apply, setting):
-        feats = np.ones((2, 5, *self.feat_shape(setting)))
+        feats = jnp.ones((2, 5, *self.feat_shape(setting)))
         with pytest.raises(ValueError, match="do not match the batch axes"):
-            apply(feats, np.zeros(10, dtype=int))
+            apply(feats, jnp.zeros(10, dtype=int))
 
 
 class TestLinearIndexwiseIrrepsInput:

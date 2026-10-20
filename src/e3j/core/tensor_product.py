@@ -19,11 +19,9 @@ from math import log2
 from typing import Optional
 
 import e3nn_jax as e3nn
-import jax
-import jax.numpy as np
-import numpy
+import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jax.experimental import sparse
 
 import e3j.utils as utils
 from e3j.ops import CUDATensorProductParams, tensor_product
@@ -37,7 +35,7 @@ from e3j.pallas_ops.tensor_product import (
 from e3j.spaces import O3Space
 from e3j.utils import cache, options
 from e3j.utils.options import Layout
-from e3j.utils.sparse import SparseMixin, sparse_bcoo
+from e3j.utils.sparse import SparseCOO, SparseMixin, sparse_coo
 
 from .permutation import Permutation
 
@@ -51,7 +49,7 @@ class TensorProduct(SparseMixin):
 
         z_i = \sum_{jk} c_{ijk}\, x_j\, y_k,
 
-    defined by a 3D coefficient array `c` in sparse BCOO format.
+    defined by a 3D coefficient array `c` in sparse COO format.
 
     The sparse evaluation algorithm consists of a loop over non-zero coefficients,
 
@@ -77,14 +75,13 @@ class TensorProduct(SparseMixin):
         Either computed or retrieved from cache. The `coef` descriptor
         is writable and may be assigned a value during `__init__`.
         """
-        with jax.ensure_compile_time_eval():
-            return self.clebsch_gordan(self.target, *self.source, self.normalization)
+        return self.clebsch_gordan(self.target, *self.source, self.normalization)
 
     def __init__(
         self,
         source: tuple[O3Space, O3Space] | tuple[str, str],
         target: O3Space | str | None,
-        coef: Optional[sparse.BCOO] = None,
+        coef: Optional[SparseCOO] = None,
         sort: bool = True,
         config: utils.Config | None = None,
         layout: str | options.Layout = "LEADING_CHANNELS",
@@ -114,7 +111,7 @@ class TensorProduct(SparseMixin):
 
         mode: specifies how to mix the channels, can take three values:
 
-          * `OUTER` : tensor product of channels in `np.outer` fashion.
+          * `OUTER` : tensor product of channels in `jnp.outer` fashion.
             Also used to broadcast one operand on the channel axis.
           * `INNER` : scalar product of channels, summed over after the
             Clebsch-Gordan tensor product.
@@ -166,9 +163,8 @@ class TensorProduct(SparseMixin):
 
         # sort irreducible output blocks
         if sort and infer_out:
-            with jax.ensure_compile_time_eval():
-                other = self.sort()
-                self.target, self.coef = other.target, other.coef
+            other = self.sort()
+            self.target, self.coef = other.target, other.coef
 
     @classmethod
     def infer_target(
@@ -192,15 +188,9 @@ class TensorProduct(SparseMixin):
         on the coefficient tensor by permuting target coordinates.
         """
         perm = Permutation.sort(self.target)
-        if self.config.tensor_product == options.TensorProduct.DENSE:
-            coef = self.coef[perm.sigma]
-        else:
-            idx_out = perm.sigma_1[self.indices[:, 0]]
-            indices = np.concat(
-                (idx_out[:, None], self.indices[:, 1:]),
-                axis=-1,
-            )
-            coef = sparse_bcoo(self.values, indices, self.shape)
+        idx_out = perm.sigma_1[self.indices[:, 0]]
+        indices = np.concatenate((idx_out[:, None], self.indices[:, 1:]), axis=-1)
+        coef = sparse_coo(self.values, indices, self.shape)
 
         return self.__class__(
             self.source,
@@ -215,7 +205,7 @@ class TensorProduct(SparseMixin):
         source_1: O3Space,
         source_2: O3Space,
         normalization: options.TensorProductNormalization = options.TensorProductNormalization.NONE,
-    ) -> sparse.BCOO:
+    ) -> SparseCOO:
         """
         Stack Clebsch-Gordan coefficients.
 
@@ -232,7 +222,7 @@ class TensorProduct(SparseMixin):
             zip(in2, in2.slices()),
         ):
             l1, l2 = ir1.l, ir2.l
-            k1, k2 = numpy.mgrid[:m1, :m2].reshape(2, -1)
+            k1, k2 = np.mgrid[:m1, :m2].reshape(2, -1)
 
             # Fully-connected: ⊗  of channel dimensions
             m0 = m1 * m2
@@ -245,31 +235,31 @@ class TensorProduct(SparseMixin):
                     continue
 
                 # 3D Clebsch-Gordan tensor on irreducible block (convert from JAX)
-                cg_dense = numpy.array(e3nn.clebsch_gordan(l0, l1, l2))
-                nz = numpy.nonzero(cg_dense)
+                cg_dense = np.array(e3nn.clebsch_gordan(l0, l1, l2))
+                nz = np.nonzero(cg_dense)
                 cg_data = cg_dense[nz]
-                cg_indices = numpy.stack(nz, axis=-1)  # shape (nnz, 3)
+                cg_indices = np.stack(nz, axis=-1)  # shape (nnz, 3)
 
                 # optionally, rescale coefficients
                 if normalization == options.TensorProductNormalization.SQRT_DIM_OUT:
-                    cg_data = cg_data * numpy.sqrt(2 * l0 + 1)
+                    cg_data = cg_data * np.sqrt(2 * l0 + 1)
 
                 # accumulate repeated coefficient values
                 values.append(
-                    numpy.tile(cg_data, m1 * m2),
+                    np.tile(cg_data, m1 * m2),
                 )
 
                 # accumulate indices shifted by offsets:
                 #   1) offset_0 points to one reducible 3D block
                 #   2) offsets point to irreducible 3D sub-blocks
-                offset_0 = numpy.array(
+                offset_0 = np.array(
                     [begin_out, slc1.start, slc2.start],
                 )
-                dim_irreps = numpy.array([ir0.dim, ir1.dim, ir2.dim])
+                dim_irreps = np.array([ir0.dim, ir1.dim, ir2.dim])
 
                 # k0 = row-major of k1, k2 for e3nn compatibility
                 k0 = k1 * m2 + k2
-                mul_grid = numpy.stack((k0, k1, k2), axis=-1)
+                mul_grid = np.stack((k0, k1, k2), axis=-1)
 
                 offsets = offset_0 + mul_grid * dim_irreps
 
@@ -277,15 +267,15 @@ class TensorProduct(SparseMixin):
                 begin_out += m0 * ir0.dim
 
         # return sparse COO coefficients
-        values = numpy.concatenate(values)
-        indices = numpy.concatenate(indices, axis=0)
+        values = np.concatenate(values)
+        indices = np.concatenate(indices, axis=0)
         shape = (target.dim, in1.dim, in2.dim)
 
-        return sparse_bcoo(values, indices, shape)
+        return sparse_coo(values, indices, shape)
 
-    def _dense_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _dense_eval(self, x: Array, y: Array, coef: SparseCOO) -> Array:
         """Evaluate bilinear map on pair of inputs."""
-        return np.einsum("ijk, ...j, ...k -> ...i", coef, x, y)
+        return jnp.einsum("ijk, ...j, ...k -> ...i", coef.todense(), x, y)
 
     @staticmethod
     def _broadcast_operands_leading(x: Array, y: Array) -> tuple[Array, Array]:
@@ -307,7 +297,7 @@ class TensorProduct(SparseMixin):
             return x[..., None], y
         raise ValueError(f"Incompatible operand ranks: {x.ndim} vs {y.ndim}")
 
-    def _sparse_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _sparse_eval(self, x: Array, y: Array, coef: SparseCOO) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         ijk, c_ijk = coef.indices, coef.data
         # Gather inputs
@@ -332,11 +322,11 @@ class TensorProduct(SparseMixin):
         self,
         x: Array,
         y: Array,
-        coef: Array,
+        coef: SparseCOO,
     ) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         # One kernel dtype for every buffer, coefficients included.
-        val_dtype = resolve_val_dtype(np.result_type(x, y))
+        val_dtype = resolve_val_dtype(jnp.result_type(x, y))
         x = x.astype(val_dtype)
         y = y.astype(val_dtype)
 
@@ -348,16 +338,14 @@ class TensorProduct(SparseMixin):
             mode=self.mode,
         )
         # Pack coefficients as opaque `idx_t` vector.
-        with jax.ensure_compile_time_eval():
-            coef = Coef(val, idx, val_dtype=val_dtype, idx_dtype=idx.dtype).pack_jax()
+        coef = Coef(val, idx, val_dtype=val_dtype, idx_dtype=idx.dtype).pack()
         return tensor_product(coef, x, y, params)
 
-    def _mtpu_params(self, coef: sparse.BCOO | None = None):
+    def _mtpu_params(self, coef: SparseCOO | None = None):
         """Build Pallas Mosaic TPU kernel parameters from this tensor product.
 
         The kernel statically unrolls the Clebsch-Gordan structure from the
-        COO `(idx, coef)` arrays, so they are materialized as concrete numpy
-        arrays at trace time.
+        COO `(idx, coef)` numpy arrays at trace time.
         """
 
         if coef is None:
@@ -367,12 +355,9 @@ class TensorProduct(SparseMixin):
                 f"Mosaic TPU tensor product does not support mode {self.mode}; "
                 "use 'OUTER' or 'MAP'."
             )
-        with jax.ensure_compile_time_eval():
-            idx = numpy.asarray(coef.indices)
-            val = numpy.asarray(coef.data)
         return PallasMosaicTPUTensorProductParams(
-            indices=idx,
-            values=val,
+            indices=coef.indices,
+            values=coef.data,
             layout=self.layout,
             mode=self.mode,
             x_space=self.source[0],
@@ -380,17 +365,16 @@ class TensorProduct(SparseMixin):
             z_space=self.target,
         )
 
-    def _mtpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _mtpu_eval(self, x: Array, y: Array, coef: SparseCOO) -> Array:
         """Evaluate bilinear map via the Pallas Mosaic TPU kernel."""
         params = self._mtpu_params(coef)
         return tensor_product_pallas_mosaic_tpu(x, y, params)
 
-    def _mgpu_params(self, coef: sparse.BCOO | None = None):
+    def _mgpu_params(self, coef: SparseCOO | None = None):
         """Build Pallas Mosaic GPU kernel parameters from this tensor product.
 
         As on Mosaic TPU, the kernels unroll the Clebsch-Gordan structure
-        statically from the COO `(idx, coef)` arrays, so those are materialized
-        as concrete numpy arrays at trace time.
+        statically from the COO `(idx, coef)` numpy arrays at trace time.
         """
         if coef is None:
             coef = self.coef
@@ -399,12 +383,9 @@ class TensorProduct(SparseMixin):
                 f"Mosaic GPU tensor product does not support mode {self.mode}; "
                 "use 'OUTER' or 'MAP'."
             )
-        with jax.ensure_compile_time_eval():
-            idx = numpy.asarray(coef.indices)
-            val = numpy.asarray(coef.data)
         return PallasMosaicGPUTensorProductParams(
-            indices=idx,
-            values=val,
+            indices=coef.indices,
+            values=coef.data,
             layout=self.layout,
             mode=self.mode,
             x_space=self.source[0],
@@ -412,12 +393,12 @@ class TensorProduct(SparseMixin):
             z_space=self.target,
         )
 
-    def _mgpu_eval(self, x: Array, y: Array, coef: Array) -> Array:
+    def _mgpu_eval(self, x: Array, y: Array, coef: SparseCOO) -> Array:
         """Evaluate bilinear map via the Pallas Mosaic GPU kernel."""
         params = self._mgpu_params(coef)
         return tensor_product_pallas_mosaic_gpu(x, y, params)
 
-    def __call__(self, x: Array, y: Array, coef: Array | None = None) -> Array:
+    def __call__(self, x: Array, y: Array, coef: SparseCOO | None = None) -> Array:
         """Evaluate bilinear map on pair of inputs."""
         # Only load coefficients from `self` if not passed explicitly
         if coef is None:

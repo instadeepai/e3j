@@ -478,8 +478,8 @@ class _MessagePassingBwdKernel:
                 edge_is_real, n_edge_blocks, edge_block_size
             )
         else:
-            block_order = jnp.zeros((1,), jnp.int32)  # unread: index maps stay static
-            n_walked_blocks = jnp.int32(n_edge_blocks)
+            block_order = np.zeros((1,), np.int32)  # unread: index maps stay static
+            n_walked_blocks = np.int32(n_edge_blocks)
         n_walked_blocks = jnp.reshape(n_walked_blocks.astype(jnp.int32), (1,))
 
         ops = _BwdOperands(

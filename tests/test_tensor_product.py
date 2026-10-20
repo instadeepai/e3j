@@ -14,23 +14,22 @@
 
 import e3nn_jax as e3nn
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
-import numpy.testing
+import numpy as np
 import pytest
-from jax.experimental import sparse
 
 import e3j
 from e3j.core.tensor_product import TensorProduct
-from e3j.utils.sparse import narrow_index_dtype
+from e3j.utils.sparse import narrow_index_dtype, sparse_coo
 
-np.set_printoptions(edgeitems=12, precision=3)
+jnp.set_printoptions(edgeitems=12, precision=3)
 
 
 def assert_allclose(expect, result, rtol=5e-6, atol=5e-6, debug: int = 1):
     """Show more on assertion errors to help diagnose addressing errors."""
     try:
-        numpy.testing.assert_allclose(expect, result, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(expect, result, rtol=rtol, atol=atol)
     except AssertionError as err:
         if debug >= 1:
             print("expect == result\n", abs(expect - result) < atol)
@@ -40,13 +39,33 @@ def assert_allclose(expect, result, rtol=5e-6, atol=5e-6, debug: int = 1):
         raise err
 
 
-@pytest.mark.xfail
-def test_BCOO_is_mocked():  # noqa
+def test_sparse_coo_out_of_bounds():
     """Check that in-bound checks are performed."""
     coef = np.ones(3)
     index = np.array([[0, 1], [1, 2], [7, 8]])
-    shape = (7, 8)
-    matrix = sparse.BCOO((coef, index), shape=shape)  # noqa: unused-variable
+    with pytest.raises(ValueError, match="Out of bounds"):
+        sparse_coo(coef, index, shape=(7, 8))
+
+
+def test_sparse_coo_indices_shape():
+    """Check that indices must have shape `(nnz, len(shape))`."""
+    coef = np.ones(2)
+    index = np.array([[0, 1, 2], [1, 2, 0]])
+    with pytest.raises(ValueError, match="Expected indices of shape"):
+        sparse_coo(coef, index, shape=(7, 8))
+
+
+def test_sparse_coo_coalesce():
+    """Check that indices are sorted, duplicates summed and zeros dropped."""
+    coef = np.array([1.0, 2.0, 3.0, 4.0, 5.0, -5.0])
+    index = np.array([[2, 1], [0, 3], [2, 1], [0, 0], [1, 1], [1, 1]])
+    coo = sparse_coo(coef, index, shape=(3, 4))
+    np.testing.assert_array_equal(coo.indices, [[0, 0], [0, 3], [2, 1]])
+    np.testing.assert_array_equal(coo.data, [4.0, 2.0, 4.0])
+    assert coo.indices.dtype == np.uint8
+    dense = np.zeros((3, 4))
+    np.add.at(dense, tuple(index.T), coef)
+    np.testing.assert_array_equal(coo.todense(), dense)
 
 
 class _TestTensorProduct:
@@ -93,7 +112,7 @@ class _TestTensorProduct:
         return TensorProduct((self.in1, self.in2), self.out, sort=True)
 
     @pytest.fixture(scope="class")
-    def rotations(self, e3j_module) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[jnp.ndarray]:
         """Prepare output and input rotations."""
         rotation = e3nn.rand_matrix(self.key)
         lhs, rhs = e3j_module.source
@@ -104,7 +123,7 @@ class _TestTensorProduct:
         return [rotation_out, rotation_in1, rotation_in2]
 
     def assert_zero(self, data, tol: float = 5e-6):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         assert norm < tol
 
     # --- Test functions ---
@@ -145,8 +164,8 @@ class _TestTensorProduct:
     def test_jittable(self, inputs, e3j_module):
         """Check that module can be compiled.
 
-        May fail if some BCOO manipulations are not excluded from the
-        JIT context with `jax.ensure_compile_time_eval()`.
+        May fail if some coefficient manipulations are traced by JAX
+        instead of being computed with numpy.
         """
         x1, x2 = inputs
         in1, in2, tgt = self.in1, self.in2, self.out
@@ -213,11 +232,11 @@ class _TestTensorProductLayout(_TestTensorProduct):
         z_lc = tp_leading(x1_lc, x2)
         assert z_lc.shape == (self.batch_size, K, e3j_module.target.dim)
 
-        x1_tc = np.swapaxes(x1_lc, -1, -2)
+        x1_tc = jnp.swapaxes(x1_lc, -1, -2)
         z_tc = tp_trailing(x1_tc, x2)
         assert z_tc.shape == (self.batch_size, e3j_module.target.dim, K)
 
-        assert_allclose(np.swapaxes(z_lc, -1, -2), z_tc)
+        assert_allclose(jnp.swapaxes(z_lc, -1, -2), z_tc)
 
 
 class TestLayout_1_1(_TestTensorProductLayout):
@@ -272,14 +291,14 @@ class TestTensorProductFused(_TestTensorProduct):
             @jax.jit
             def grad_fused(x, y):
                 def f(x, y):
-                    return np.sum(TensorProduct((in1, in2), tgt, sort=True)(x, y))
+                    return jnp.sum(TensorProduct((in1, in2), tgt, sort=True)(x, y))
 
                 return jax.grad(f, argnums=(0, 1))(x, y)
 
             dx, dy = grad_fused(x1, x2)
 
         def f_ref(x, y):
-            return np.sum(e3nn_module(x, y))
+            return jnp.sum(e3nn_module(x, y))
 
         dx_ref, dy_ref = jax.grad(f_ref, argnums=(0, 1))(x1, x2)
         assert_allclose(dx_ref, dx, rtol=2e-3, atol=2e-3)
@@ -294,13 +313,13 @@ class TestTensorProductFused(_TestTensorProduct):
         with e3j.config.use(tensor_product="FUSED_CUDA"):
             tp = TensorProduct((in1, in2), tgt, sort=True)
             if batched == "x":
-                stack = np.stack([x1, x1 * 2.0, x1 * 3.0], axis=0)
+                stack = jnp.stack([x1, x1 * 2.0, x1 * 3.0], axis=0)
                 result = jax.vmap(tp, in_axes=(0, None))(stack, x2)
-                expect = np.stack([e3nn_module(s, x2) for s in stack])
+                expect = jnp.stack([e3nn_module(s, x2) for s in stack])
             else:
-                stack = np.stack([x2, x2 * 2.0, x2 * 3.0], axis=0)
+                stack = jnp.stack([x2, x2 * 2.0, x2 * 3.0], axis=0)
                 result = jax.vmap(tp, in_axes=(None, 0))(x1, stack)
-                expect = np.stack([e3nn_module(x1, s) for s in stack])
+                expect = jnp.stack([e3nn_module(x1, s) for s in stack])
 
         assert_allclose(expect, result, rtol=2e-3, atol=2e-3)
 
@@ -310,12 +329,12 @@ class TestTensorProductFused(_TestTensorProduct):
         in1, in2, tgt = self.in1, self.in2, self.out
 
         def loss_ref(x, y):
-            return np.sum(e3nn_module(x, y))
+            return jnp.sum(e3nn_module(x, y))
 
         with e3j.config.use(tensor_product="FUSED_CUDA"):
 
             def loss_fused(x, y):
-                return np.sum(TensorProduct((in1, in2), tgt, sort=True)(x, y))
+                return jnp.sum(TensorProduct((in1, in2), tgt, sort=True)(x, y))
 
             d2_fused = jax.jacrev(jax.grad(loss_fused, argnums=0), argnums=1)(x1, x2)
 

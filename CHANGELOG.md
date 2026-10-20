@@ -18,6 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   casts string values, e.g. `Config(tensor_product="DENSE")`.
 - `TensorProduct`, `Bigotimes` and `Convolution` given `config=e3j.config()`
   keep a frozen copy instead of following later global changes.
+- Coefficients are computed and manipulated with numpy on the host, instead of
+  with `jax.numpy` under `jax.ensure_compile_time_eval()`. `TensorProduct.coef`
+  and `Bigotimes.coef` are a numpy `e3j.utils.sparse.SparseCOO` (with `.data`,
+  `.indices`, `.shape`, `.nnz`, `.todense()`) instead of a JAX `BCOO`. Building
+  coefficients is much faster, e.g. 25s down to 0.04s for a 4-ary `Bigotimes`.
+- `Permutation.sigma`, `Permutation.sigma_1` and `ScalarMixing.mix_indices` are
+  numpy arrays.
 
 ### Fixed
 
@@ -40,6 +47,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   MACE index-wise symmetric contraction, with a `symmetric_contraction` config
   field selecting its implementation.
 - `PowerExpansion` takes a `config` for its tensor products.
+- `e3j.utils.sparse.sparse_coo` builds a coalesced `SparseCOO`, and raises on
+  out-of-bounds indices.
+- `Coef.pack()` returns the packed coefficients as a numpy array.
 
 ### Removed
 
@@ -50,6 +60,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   not match the leading batch axes of the features, instead of silently
   using the first axis. Indices of shape `(N, 1)`, which used to broadcast
   against `(N,)` features, now raise too.
+- `e3j.utils.sparse.sparse_bcoo` is replaced by `sparse_coo`, and
+  `TensorProduct`/`Bigotimes` no longer accept a `BCOO` as `coef`.
 
 ## [0.1.2] — 2026-10-05
 

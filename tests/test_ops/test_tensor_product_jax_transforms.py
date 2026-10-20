@@ -17,7 +17,7 @@
 import re
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import numpy.testing as testing
 import pytest
 from jax import Array
@@ -60,22 +60,22 @@ def generate_tp_data(
 
     # lexsorted indices
     num_out, num_x, num_y = 2, 2, 3
-    idx_0 = np.tile(np.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
-    idx_1 = np.tile(np.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
-    idx_2 = np.tile(np.array([0, 1, 2, 0, 1, 2]), NUM_STRIPS)
-    offsets = np.array([num_out, num_x, num_y])[:, None]
-    offsets *= np.arange(NUM_STRIPS).repeat(LEN_STRIPS)
-    idx = np.stack([idx_0, idx_1, idx_2]) + offsets
+    idx_0 = jnp.tile(jnp.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
+    idx_1 = jnp.tile(jnp.array([0, 0, 0, 1, 1, 1]), NUM_STRIPS)
+    idx_2 = jnp.tile(jnp.array([0, 1, 2, 0, 1, 2]), NUM_STRIPS)
+    offsets = jnp.array([num_out, num_x, num_y])[:, None]
+    offsets *= jnp.arange(NUM_STRIPS).repeat(LEN_STRIPS)
+    idx = jnp.stack([idx_0, idx_1, idx_2]) + offsets
 
-    x = np.stack([np.tile(np.array([1.0, 2.0]), NUM_STRIPS)] * num_rows)
-    y = np.stack([np.tile(np.array([3.0, 4.0, 5.0]), NUM_STRIPS)] * num_rows)
+    x = jnp.stack([jnp.tile(jnp.array([1.0, 2.0]), NUM_STRIPS)] * num_rows)
+    y = jnp.stack([jnp.tile(jnp.array([3.0, 4.0, 5.0]), NUM_STRIPS)] * num_rows)
 
     if channels[0] is not None:
-        x = np.tile(x[:, None, :], (1, channels[0], 1))
+        x = jnp.tile(x[:, None, :], (1, channels[0], 1))
     if channels[1] is not None:
-        y = np.tile(y[:, None, :], (1, channels[1], 1))
+        y = jnp.tile(y[:, None, :], (1, channels[1], 1))
 
-    coef = np.ones(idx.shape[-1])
+    coef = jnp.ones(idx.shape[-1])
     return num_out * NUM_STRIPS, idx, coef, x, y
 
 
@@ -85,18 +85,18 @@ def tensor_product_reference(
     """Reference tensor_product implementation."""
 
     if layout == "TRAILING_CHANNELS":
-        x_t = x if x.ndim < 3 else np.matrix_transpose(x)
-        y_t = y if y.ndim < 3 else np.matrix_transpose(y)
+        x_t = x if x.ndim < 3 else jnp.matrix_transpose(x)
+        y_t = y if y.ndim < 3 else jnp.matrix_transpose(y)
         z_t = tensor_product_reference(idx, coef, x_t, y_t, num_out, mode)
         if z_t.ndim < 3:
             return z_t
-        return np.matrix_transpose(z_t)
+        return jnp.matrix_transpose(z_t)
 
     n_rows = x.shape[0]
 
     if mode == "MAP":
         shape_out = (n_rows, x.shape[1], num_out)
-        out = np.zeros(shape_out, dtype=x.dtype)
+        out = jnp.zeros(shape_out, dtype=x.dtype)
         cxy = coef * x[..., idx[1]] * y[..., idx[2]]
         return out.at[..., idx[0]].add(cxy)
 
@@ -114,16 +114,16 @@ def tensor_product_reference(
             shape_out = (n_rows, y.shape[1], num_out)
             x = x[:, None]
 
-        out = np.zeros(shape_out, dtype=x.dtype)
+        out = jnp.zeros(shape_out, dtype=x.dtype)
         cxy = coef * x[..., idx[1]] * y[..., idx[2]]
         return out.at[..., idx[0]].add(cxy)
 
     if mode == "INNER":
         assert x.shape[-2] == y.shape[-2]
         shape_out = (n_rows, num_out)
-        out = np.zeros(shape_out, dtype=x.dtype)
+        out = jnp.zeros(shape_out, dtype=x.dtype)
         cxy = coef * x[..., idx[1]] * y[..., idx[2]]
-        sum_cxy = np.sum(cxy, axis=-2)
+        sum_cxy = jnp.sum(cxy, axis=-2)
         return out.at[..., idx[0]].add(sum_cxy)
 
 
@@ -133,7 +133,7 @@ def test_forward_tensor_product():
     params = Params(num_out=num_out, mode="OUTER")
     expect = tensor_product_reference(idx, val, x, y, num_out)
     result = tensor_product(pack_coef(val, idx), x, y, params)
-    assert np.allclose(expect, result, atol=1e-5)
+    assert jnp.allclose(expect, result, atol=1e-5)
 
 
 def test_forward_tensor_product_inner():
@@ -142,7 +142,7 @@ def test_forward_tensor_product_inner():
     params = Params(num_out=num_out, mode="INNER")
     expect = tensor_product_reference(idx, val, x, y, num_out, mode="INNER")
     result = tensor_product(pack_coef(val, idx), x, y, params)
-    assert np.allclose(expect, result, atol=1e-5)
+    assert jnp.allclose(expect, result, atol=1e-5)
 
 
 def test_jit_tensor_product():
@@ -163,8 +163,8 @@ def test_jit_tensor_product_vmap():
     num_out, idx, val, x, y = generate_tp_data()
     params = Params(num_out=num_out, mode="OUTER")
     coef = pack_coef(val, idx)
-    xs = np.stack([x, x])
-    ys = np.stack([y, y])
+    xs = jnp.stack([x, x])
+    ys = jnp.stack([y, y])
 
     def tp(x, y):
         return tensor_product(coef, x, y, params)
@@ -174,8 +174,8 @@ def test_jit_tensor_product_vmap():
     assert out_normal.shape[-1] == num_out
     assert out_vmap.shape[-1] == num_out
     assert out_vmap[0].shape == out_normal.shape
-    assert np.allclose(out_vmap[0], out_normal, atol=1e-5)
-    assert np.allclose(out_vmap[1], out_normal, atol=1e-5)
+    assert jnp.allclose(out_vmap[0], out_normal, atol=1e-5)
+    assert jnp.allclose(out_vmap[1], out_normal, atol=1e-5)
 
 
 # Target config to simulate H100 GPU for testing
@@ -316,7 +316,7 @@ def test_vmap_grad_tensor_product_multi_devices():
         return tensor_product(coef, x, y, params)
 
     def sum_vmap_tp(x, y):
-        return np.sum(jax.vmap(tp)(x, y))
+        return jnp.sum(jax.vmap(tp)(x, y))
 
     # A function with forward + backward tensor product passes
     fn = jax.grad(sum_vmap_tp, argnums=(0, 1))
@@ -366,7 +366,7 @@ def test_vmap_raises_on_batched_coef():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
     params = Params(num_out=num_out, mode="OUTER")
-    coef_batch = np.stack([coef, coef, coef])
+    coef_batch = jnp.stack([coef, coef, coef])
     with pytest.raises(jax.errors.UnexpectedTracerError):
         jax.vmap(lambda c: tensor_product(c, x, y, params))(coef_batch)
 
@@ -375,7 +375,7 @@ def test_vmap_batches_on_x_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
     params = Params(num_out=num_out, mode="OUTER")
-    xs = np.stack([x, x, x])
+    xs = jnp.stack([x, x, x])
     zs = jax.vmap(lambda xi: tensor_product(coef, xi, y, params))(xs)
     assert zs.shape[0] == xs.shape[0]
     testing.assert_allclose(zs[0], zs[-1])
@@ -385,7 +385,7 @@ def test_vmap_batches_on_y_only():
     num_out, idx, val, x, y = generate_tp_data()
     coef = pack_coef(val, idx)
     params = Params(num_out=num_out, mode="OUTER")
-    ys = np.stack([y, y, y])
+    ys = jnp.stack([y, y, y])
     zs = jax.vmap(lambda yi: tensor_product(coef, x, yi, params))(ys)
     assert zs.shape[0] == ys.shape[0]
     testing.assert_allclose(zs[0], zs[-1])
@@ -398,18 +398,18 @@ def test_backward_tensor_product():
     coef = pack_coef(val, idx)
 
     def f_custom(x, y):
-        return np.sum(tensor_product(coef, x, y, params))
+        return jnp.sum(tensor_product(coef, x, y, params))
 
     def f_ref(x, y):
-        return np.sum(tensor_product_reference(idx, val, x, y, num_out=num_out))
+        return jnp.sum(tensor_product_reference(idx, val, x, y, num_out=num_out))
 
     grads_custom = jax.grad(f_custom, argnums=(0, 1))(x, y)
     grads_ref = jax.grad(f_ref, argnums=(0, 1))(x, y)
 
     ct_x, ct_y = grads_custom
     ct_x_ref, ct_y_ref = grads_ref
-    assert np.allclose(ct_x, ct_x_ref)
-    assert np.allclose(ct_y, ct_y_ref)
+    assert jnp.allclose(ct_x, ct_x_ref)
+    assert jnp.allclose(ct_y, ct_y_ref)
 
 
 def test_backward2_tensor_product():
@@ -419,17 +419,17 @@ def test_backward2_tensor_product():
     coef = pack_coef(val, idx)
 
     def prod_custom(x, y):
-        return np.sum(tensor_product(coef, x, y, params))
+        return jnp.sum(tensor_product(coef, x, y, params))
 
     def prod_ref(x, y):
-        return np.sum(tensor_product_reference(idx, val, x, y, num_out=num_out))
+        return jnp.sum(tensor_product_reference(idx, val, x, y, num_out=num_out))
 
     def force_grads(prod: callable) -> callable:
-        force_norm_x = lambda x, y: np.sum((jax.grad(prod)(x, y)) ** 2)
+        force_norm_x = lambda x, y: jnp.sum((jax.grad(prod)(x, y)) ** 2)
         return jax.grad(force_norm_x, argnums=(0, 1))
 
     d2x, d2y = force_grads(prod_custom)(x, y)
     d2x_ref, d2y_ref = force_grads(prod_ref)(x, y)
 
-    assert np.allclose(d2x, d2x_ref)
-    assert np.allclose(d2y, d2y_ref)
+    assert jnp.allclose(d2x, d2x_ref)
+    assert jnp.allclose(d2y, d2y_ref)

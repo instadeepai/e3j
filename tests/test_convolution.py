@@ -14,9 +14,9 @@
 
 import e3nn_jax as e3nn
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
-import numpy
+import numpy as np
 import pytest
 from conftest import assert_allclose
 
@@ -47,10 +47,10 @@ class _TestConvolution:
     def is_trailing(self) -> bool:
         return Layout.parse(self.layout) == Layout.TRAILING_CHANNELS
 
-    def _rotate(self, x: np.ndarray, D: np.ndarray) -> np.ndarray:
+    def _rotate(self, x: jnp.ndarray, D: jnp.ndarray) -> jnp.ndarray:
         """Act with representation matrix `D` on the irrep axis of `x`."""
         # Irrep axis is trailing under LEADING_CHANNELS, else second-to-last.
-        return x @ D if not self.is_trailing else np.einsum("nic,ij->njc", x, D)
+        return x @ D if not self.is_trailing else jnp.einsum("nic,ij->njc", x, D)
 
     def _feature_shape(self, dim: int) -> tuple[int, ...]:
         """Node/edge-scalar shape `(dim, K)` or `(K, dim)` from the irrep `dim`."""
@@ -58,7 +58,7 @@ class _TestConvolution:
         return (dim, K) if self.is_trailing else (K, dim)
 
     def assert_zero(self, data, tol: float = 5e-6):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         assert norm < tol
 
     # --- Fixtures ---
@@ -75,16 +75,16 @@ class _TestConvolution:
             )
 
     @pytest.fixture(scope="class")
-    def graph(self) -> tuple[np.ndarray, np.ndarray]:
+    def graph(self) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Random graph with edges sorted by receiver (CSR requirement)."""
         k1, k2 = random.split(random.key(7))
         senders = random.randint(k1, (self.num_edges,), 0, self.num_nodes)
         receivers = random.randint(k2, (self.num_edges,), 0, self.num_nodes)
-        order = np.argsort(receivers)
+        order = jnp.argsort(receivers)
         return senders[order], receivers[order]
 
     @pytest.fixture
-    def inputs(self, module) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def inputs(self, module) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         node_space, edge_space, scalar_space = module.source
         k1, k2, k3 = random.split(random.key(123), 3)
         node_features = random.normal(
@@ -97,7 +97,7 @@ class _TestConvolution:
         return node_features, edge_features, edge_scalars
 
     @pytest.fixture(scope="class")
-    def rotations(self, module) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def rotations(self, module) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Output, node and edge rotation matrices for a shared SO3 element."""
         rotation = e3nn.rand_matrix(self.key)
         node_space, edge_space, _ = module.source
@@ -135,20 +135,20 @@ class _TestConvolution:
             module.source[1].dim,
             module.source[2].dim,
         )
-        assert numpy.dtype(coef.idx.dtype) == numpy.dtype(coef.idx_dtype)
-        assert numpy.dtype(coef.idx_dtype) == numpy.dtype(narrow_index_dtype(bounds))
-        assert numpy.dtype(coef.val.dtype) == numpy.dtype(coef.val_dtype)
+        assert np.dtype(coef.idx.dtype) == np.dtype(coef.idx_dtype)
+        assert np.dtype(coef.idx_dtype) == np.dtype(narrow_index_dtype(bounds))
+        assert np.dtype(coef.val.dtype) == np.dtype(coef.val_dtype)
 
         # Indices stay in bounds and the scalar column routes via mix_indices.
         assert int(coef.idx.min()) >= 0
-        assert bool((coef.idx.max(axis=0) < numpy.array(bounds)).all())
-        numpy.testing.assert_array_equal(
+        assert bool((coef.idx.max(axis=0) < np.array(bounds)).all())
+        np.testing.assert_array_equal(
             coef.idx[:, 3], module._mix.mix_indices[coef.idx[:, 0]]
         )
 
         # Packing preserves the index dtype through a round-trip.
         unpacked = Coef4D.unpack(coef.pack_jax(), val_dtype=coef.val_dtype)
-        assert numpy.dtype(unpacked.idx.dtype) == numpy.dtype(coef.idx_dtype)
+        assert np.dtype(unpacked.idx.dtype) == np.dtype(coef.idx_dtype)
 
     def test_equivariance(self, module, inputs, graph, rotations):
         """Convolution commutes with SO3 acting on node and edge features."""
@@ -212,7 +212,7 @@ class TestConvolution_pseudotensors(_TestConvolution):
     out = None
 
     @pytest.fixture(scope="class")
-    def rotations(self, module) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def rotations(self, module) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Output, node and edge action matrices for an improper rotation.
 
         Negating a proper rotation `R` (det +1) yields `-R`, which stays
@@ -277,12 +277,11 @@ class TestConvolutionFused(_TestConvolution):
         assert_allclose(expect, result, rtol=2e-3, atol=2e-3)
 
     def test_jit_pack_jax(self, inputs, reference, graph):
-        """`coef.pack_jax()` must succeed at trace time inside _fused_eval.
+        """`coef.pack()` must succeed at trace time inside _fused_eval.
 
         Building the module within the traced function forces the packed
         Coef4D to be materialized during compilation, which only works if the
-        coefficient setup is excluded from the trace via
-        `jax.ensure_compile_time_eval()`.
+        coefficient setup is computed with numpy rather than traced by JAX.
         """
         senders, receivers = graph
         source = (self.node_irreps, self.edge_irreps)
@@ -303,7 +302,7 @@ class TestConvolutionFused(_TestConvolution):
         """Quadratic loss closing over `conv`; indices are plain arguments."""
 
         def loss(node, edge, scalar, snd, rcv):
-            return np.sum(conv(node, edge, scalar, snd, rcv) ** 2)
+            return jnp.sum(conv(node, edge, scalar, snd, rcv) ** 2)
 
         return loss
 
@@ -400,29 +399,29 @@ class TestConvolutionFusedSender:
         b = (a + off) % self.num_nodes  # off in [1, num_nodes) avoids self-loops
 
         # Directed edges: forward pairs followed by their reverses.
-        snd = np.concatenate([a, b])
-        rcv = np.concatenate([b, a])
+        snd = jnp.concatenate([a, b])
+        rcv = jnp.concatenate([b, a])
 
         # Graded-symmetric y and reversal-symmetric s across edge reversal.
-        y_signs = np.concatenate(
-            [np.full(mul * ir.dim, float(ir.p)) for mul, ir in edge_space]
+        y_signs = jnp.concatenate(
+            [jnp.full(mul * ir.dim, float(ir.p)) for mul, ir in edge_space]
         )
         y_fwd = random.normal(k[2], (self.num_pairs, edge_space.dim))
-        y = np.concatenate([y_fwd, y_fwd * y_signs[None, :]])
+        y = jnp.concatenate([y_fwd, y_fwd * y_signs[None, :]])
         s_fwd = random.normal(k[3], (self.num_pairs, scalar_space.dim, K))
-        s = np.concatenate([s_fwd, s_fwd])
+        s = jnp.concatenate([s_fwd, s_fwd])
 
         x = random.normal(k[4], (self.num_nodes, node_space.dim, K))
 
         def reorder(order):
             return snd[order], rcv[order], y[order], s[order]
 
-        return x, reorder(np.argsort(rcv)), reorder(np.argsort(snd))
+        return x, reorder(jnp.argsort(rcv)), reorder(jnp.argsort(snd))
 
     @staticmethod
     def _loss(conv):
         def loss(x, y, s, snd, rcv):
-            return np.sum(conv(x, y, s, snd, rcv) ** 2)
+            return jnp.sum(conv(x, y, s, snd, rcv) ** 2)
 
         return loss
 

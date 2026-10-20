@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
 import numpy.testing as testing
 import pytest
@@ -58,7 +58,7 @@ def mode(request):
     request.cls.mode = request.param
 
 
-np.set_printoptions(
+jnp.set_printoptions(
     precision=4,
     suppress=True,
     formatter={"bool": lambda t: "1" if t else "0"},
@@ -90,12 +90,12 @@ def tensor_product_reference(
     """Reference tensor_product implementation."""
 
     if layout == "TRAILING_CHANNELS":
-        x_t = x if x.ndim < 3 else np.matrix_transpose(x)
-        y_t = y if y.ndim < 3 else np.matrix_transpose(y)
+        x_t = x if x.ndim < 3 else jnp.matrix_transpose(x)
+        y_t = y if y.ndim < 3 else jnp.matrix_transpose(y)
         z_t = tensor_product_reference(idx, coef, x_t, y_t, num_out, mode)
         if z_t.ndim < 3:
             return z_t
-        return np.matrix_transpose(z_t)
+        return jnp.matrix_transpose(z_t)
 
     n_rows = x.shape[0]
 
@@ -105,7 +105,7 @@ def tensor_product_reference(
         ), "MAP mode requires channel dims on both x and y"
         assert x.shape[1] == y.shape[1], "MAP mode requires channels_x == channels_y"
         shape_out = (n_rows, x.shape[1], num_out)
-        out = np.zeros(shape_out, dtype=x.dtype)
+        out = jnp.zeros(shape_out, dtype=x.dtype)
         cxy = coef * x[..., idx[1]] * y[..., idx[2]]
         return out.at[..., idx[0]].add(cxy)
 
@@ -123,7 +123,7 @@ def tensor_product_reference(
             shape_out = (n_rows, y.shape[1], num_out)
             x = x[:, None]
 
-        out = np.zeros(shape_out, dtype=x.dtype)
+        out = jnp.zeros(shape_out, dtype=x.dtype)
         cxy = coef * x[..., idx[1]] * y[..., idx[2]]
         return out.at[..., idx[0]].add(cxy)
 
@@ -133,9 +133,9 @@ def tensor_product_reference(
         ), "INNER mode requires channel dims on both x and y"
         assert x.shape[1] == y.shape[1], "INNER mode requires channels_x == channels_y"
         shape_out = (n_rows, num_out)
-        out = np.zeros(shape_out, dtype=x.dtype)
+        out = jnp.zeros(shape_out, dtype=x.dtype)
         cxy = coef * x[..., idx[1]] * y[..., idx[2]]
-        sum_cxy = np.sum(cxy, axis=-2)
+        sum_cxy = jnp.sum(cxy, axis=-2)
         return out.at[..., idx[0]].add(sum_cxy)
 
 
@@ -166,11 +166,11 @@ class _TestTensorProductOp:
         def make_idx(dim: int, n: int, key=None) -> Array:
             if key is None:
                 key = random.key(n + dim)
-            idx_all = np.arange(dim)
+            idx_all = jnp.arange(dim)
             # Last index has only one occurence, to detect a previous
             # bug where last store would have been skipped.
             idx_rdm = random.randint(key, (n - dim,), 0, dim - 1)
-            return np.concat((idx_all, idx_rdm))
+            return jnp.concat((idx_all, idx_rdm))
 
         indices = [
             make_idx(nz, nnz, next(keys)),
@@ -178,8 +178,8 @@ class _TestTensorProductOp:
             make_idx(ny, nnz, next(keys)),
         ]
 
-        sigma = np.argsort(indices[0])
-        idx = np.stack(indices)[:, sigma]
+        sigma = jnp.argsort(indices[0])
+        idx = jnp.stack(indices)[:, sigma]
         idx = idx.astype(narrow_index_dtype((nz, nx, ny)))
         val = random.normal(next(keys), (nnz,))
 
@@ -206,14 +206,14 @@ class _TestTensorProductOp:
     @property
     def bwd_ref(self):
         return jax.grad(
-            lambda x, y: np.sum(self.fwd_ref(x, y)),
+            lambda x, y: jnp.sum(self.fwd_ref(x, y)),
             argnums=(0, 1),
         )
 
     @property
     def bwd_op(self):
         return jax.grad(
-            lambda x, y: np.sum(self.fwd_op(x, y)),
+            lambda x, y: jnp.sum(self.fwd_op(x, y)),
             argnums=(0, 1),
         )
 
@@ -222,11 +222,11 @@ class _TestTensorProductOp:
         def sum_bwd(x, y, dz):
             """A backward operation consuming dz cotangents."""
             df = jax.grad(
-                lambda x, y, dz: np.sum(self.fwd_op(x, y) * dz),
+                lambda x, y, dz: jnp.sum(self.fwd_op(x, y) * dz),
                 argnums=(0, 1),
             )
             dx, dy = df(x, y, dz)
-            return np.sum(dx) + np.sum(dy)
+            return jnp.sum(dx) + jnp.sum(dy)
 
         # Differentiate once more, yield 3 cotangents
         return jax.grad(sum_bwd, argnums=(0, 1, 2))
@@ -236,11 +236,11 @@ class _TestTensorProductOp:
         def sum_bwd(x, y, dz):
             """A backward operation consuming dz cotangents."""
             df = jax.grad(
-                lambda x, y, dz: np.sum(self.fwd_ref(x, y) * dz),
+                lambda x, y, dz: jnp.sum(self.fwd_ref(x, y) * dz),
                 argnums=(0, 1),
             )
             dx, dy = df(x, y, dz)
-            return np.sum(dx) + np.sum(dy)
+            return jnp.sum(dx) + jnp.sum(dy)
 
         # Differentiate once more, yield 3 cotangents
         return jax.grad(sum_bwd, argnums=(0, 1, 2))
@@ -431,17 +431,17 @@ def _map_trailing_small_num_out_inputs(
     keys = list(random.split(random.key(0), 6))
 
     def make_idx(d, n, key):
-        idx_all = np.arange(d)
+        idx_all = jnp.arange(d)
         idx_rdm = random.randint(key, (n - d,), 0, d - 1)
-        return np.concat((idx_all, idx_rdm))
+        return jnp.concat((idx_all, idx_rdm))
 
     indices = [
         make_idx(num_out, nnz, keys[0]),
         make_idx(dim, nnz, keys[1]),
         make_idx(dim, nnz, keys[2]),
     ]
-    sigma = np.argsort(indices[0])
-    idx = np.stack(indices)[:, sigma]
+    sigma = jnp.argsort(indices[0])
+    idx = jnp.stack(indices)[:, sigma]
     idx = idx.astype(narrow_index_dtype((num_out, dim, dim)))
     val = random.normal(keys[3], (nnz,))
     x = random.normal(keys[4], (num_rows, dim, channels))

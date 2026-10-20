@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import e3nn_jax as e3nn
-import jax.numpy as np
-import numpy
+import jax.numpy as jnp
+import numpy as np
 
 from e3j.spaces import O3Space
 
@@ -36,8 +36,8 @@ class Filter:
             indices.extend(range(slc.start, slc.stop))
         self.target = O3Space(target)
         # numpy, not jax: a filter built while tracing must not hold tracers.
-        self.indices = numpy.array(indices, dtype=int)
+        self.indices = np.array(indices, dtype=int)
 
-    def __call__(self, x: np.ndarray) -> np.ndarray:
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """Filter out features not in `target`."""
-        return np.take(x, self.indices, self.axis)
+        return jnp.take(x, self.indices, self.axis)

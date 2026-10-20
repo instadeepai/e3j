@@ -21,6 +21,7 @@ the last real edge.
 """
 
 import jax.numpy as jnp
+import numpy as np
 from jax import Array, lax
 
 from e3j.data.graph import is_dummy_edge
@@ -50,7 +51,7 @@ def core_edge_bounds(
     follow `block_order`.
     """
     base, remainder = jnp.divmod(jnp.reshape(n_walked_blocks, ()), num_cores)
-    core = jnp.arange(num_cores, dtype=jnp.int32)
+    core = np.arange(num_cores, dtype=np.int32)
     walked = jnp.where(core < remainder, base + 1, base)
     offset = jnp.where(core < remainder, core * (base + 1), core * base + remainder)
     first_block = block_order[offset]

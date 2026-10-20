@@ -16,7 +16,7 @@ import math
 
 import e3nn_jax as e3nn
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import pytest
 from jax import random
 
@@ -69,7 +69,7 @@ class _TestHarmonics:
             r[:, 2] * v[:, 0] - r[:, 0] * v[:, 2],
             r[:, 0] * v[:, 1] - r[:, 1] * v[:, 0],
         ]
-        return np.stack(r_cross_v, axis=-1)
+        return jnp.stack(r_cross_v, axis=-1)
 
     @pytest.fixture(scope="class")
     def e3j_module(self):
@@ -84,7 +84,7 @@ class _TestHarmonics:
         else:
             out = e3nn.Irreps(self.out)
 
-        def e3nn_harmonics(x: np.ndarray) -> np.ndarray:
+        def e3nn_harmonics(x: jnp.ndarray) -> jnp.ndarray:
             return e3nn.spherical_harmonics(
                 out, x, True, normalization=self.normalization
             ).array
@@ -92,7 +92,7 @@ class _TestHarmonics:
         return e3nn_harmonics
 
     @pytest.fixture(scope="class")
-    def rotations(self, e3j_module) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[jnp.ndarray]:
         """Prepare output and input rotations."""
         rotation_in = e3nn.rand_matrix(self.key)
         rotation_out = e3j_module.target.action(rotation_in)
@@ -100,7 +100,7 @@ class _TestHarmonics:
 
     def assert_proportional(self, expect, result, tol: int = 1e-5):
         ratio = result / (expect + 1e-8)
-        avg_ratio = np.mean(ratio, axis=0)
+        avg_ratio = jnp.mean(ratio, axis=0)
         norm = safe_norm(ratio - avg_ratio, eps=0.0) / ratio.size
         try:
             assert norm < tol
@@ -116,7 +116,7 @@ class _TestHarmonics:
         accumulates ~1e-4 worst-case error on TPU (even at the ``highest`` matmul
         precision pinned in ``pytest.ini``).
         """
-        max_abs = float(np.max(np.abs(result - expect)))
+        max_abs = float(jnp.max(jnp.abs(result - expect)))
         try:
             assert max_abs < tol
         except AssertionError as err:
@@ -124,12 +124,12 @@ class _TestHarmonics:
             raise err
 
     def assert_zero(self, data, tol: int = 1e-6):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         try:
             assert norm < tol
         except BaseException as err:
             print(self.__class__.__name__ + ".assert_zero")
-            print("error.std", np.std(data, axis=0), sep="\n")
+            print("error.std", jnp.std(data, axis=0), sep="\n")
             raise err
 
     def expected_s2_norm(self, l: int) -> float:
@@ -163,13 +163,13 @@ class _TestHarmonics:
         """Check Monte-Carlo expectation on the sphere."""
         N = self.batch_size
         results = e3j_module(inputs)
-        s2_mass = 4 * np.pi
-        s2_expectation = (1 / N) * np.sum(np.abs(results) ** 2, axis=0)
+        s2_mass = 4 * jnp.pi
+        s2_expectation = (1 / N) * jnp.sum(jnp.abs(results) ** 2, axis=0)
         s2_integral = s2_expectation * s2_mass
-        s2_norm = np.sqrt(s2_integral)
-        expected = np.concatenate(
+        s2_norm = jnp.sqrt(s2_integral)
+        expected = jnp.concatenate(
             [
-                np.full(2 * irrep_out.l + 1, self.expected_s2_norm(irrep_out.l))
+                jnp.full(2 * irrep_out.l + 1, self.expected_s2_norm(irrep_out.l))
                 for _, irrep_out in e3j_module.target
             ]
         )
@@ -193,13 +193,13 @@ class _TestHarmonics:
         self.assert_close(expect, result)
 
     def test_grad_jit(self, inputs, e3j_module):
-        sum_P = jax.jit(lambda r: np.sum(e3j_module(r)))
+        sum_P = jax.jit(lambda r: jnp.sum(e3j_module(r)))
         dP = jax.grad(sum_P)
         dPx = dP(inputs)
         assert dPx.shape == (inputs.shape[0], 3)
 
     def test_jit_grad(self, inputs, e3j_module):
-        dP = jax.grad(lambda r: np.sum(e3j_module(r)))
+        dP = jax.grad(lambda r: jnp.sum(e3j_module(r)))
         jit_dP = jax.jit(dP)
         dPx = jit_dP(inputs)
         assert dPx.shape == (inputs.shape[0], 3)

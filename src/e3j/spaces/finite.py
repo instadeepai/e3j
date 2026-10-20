@@ -14,7 +14,7 @@
 
 from typing import Iterator
 
-import jax.numpy as np
+import jax.numpy as jnp
 from jax import Array
 
 from e3j.spaces.space import Irrep, Space
@@ -38,7 +38,7 @@ class Finite(Space):
         return 1
 
     def action(self, matrix: Array) -> Array:
-        return np.array(1.0)
+        return jnp.array(1.0)
 
     def __iter__(self) -> Iterator[tuple[int, Irrep]]:
         return iter([])
@@ -46,5 +46,5 @@ class Finite(Space):
     def slices(self) -> list[slice]:
         return []
 
-    def in_bounds(self, i: int | np.ndarray) -> bool | np.ndarray:
+    def in_bounds(self, i: int | jnp.ndarray) -> bool | jnp.ndarray:
         return (i >= 0) & (i < self.cardinal)

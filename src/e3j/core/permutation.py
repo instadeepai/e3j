@@ -16,7 +16,8 @@ import functools
 from typing import Self
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
+import numpy as np
 
 from e3j.spaces import O3Space
 
@@ -37,13 +38,13 @@ class Permutation:
     """
 
     def __init__(self, sigma: np.ndarray, axis: int = -1):
-        self.sigma = sigma
+        self.sigma = np.asarray(sigma)
         self.axis = axis
 
     @functools.partial(jax.jit, static_argnames=["self"])
-    def __call__(self, x: np.ndarray) -> np.ndarray:
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """Return `x[...,σ[i]]` for `i <= x.shape[axis]`."""
-        return np.take(x, self.sigma, axis=self.axis)
+        return jnp.take(x, self.sigma, axis=self.axis)
 
     @functools.cached_property
     def sigma_1(self) -> np.ndarray:
@@ -66,9 +67,7 @@ class Permutation:
         rep_sorted, inv = rep.sort(return_inverse=True)
         slices = rep.slices()
         slices_p = [(slices[pi].start, slices[pi].stop) for pi in inv]
-        sigma = np.concat(
-            [i0 + np.arange(i1 - i0) for i0, i1 in slices_p],
-        )
+        sigma = np.concatenate([np.arange(i0, i1) for i0, i1 in slices_p])
         perm = cls(sigma, axis=axis)
         perm.source = rep
         perm.target = rep_sorted.regroup()

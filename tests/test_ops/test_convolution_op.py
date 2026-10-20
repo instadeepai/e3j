@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
 import numpy.testing as testing
 import pytest
@@ -28,7 +28,7 @@ e3j.config(debug_level=0)
 
 pytestmark = pytest.mark.e3j_ops
 
-np.set_printoptions(
+jnp.set_printoptions(
     precision=4,
     suppress=True,
     formatter={"bool": lambda t: "1" if t else "0"},
@@ -61,11 +61,11 @@ def convolution_reference(idx, val, x, y, s, s_index, sender, receiver, num_out)
 
     x_e = x[sender]
 
-    z_e = np.zeros((num_edges, num_out, channels_x), dtype=x.dtype)
+    z_e = jnp.zeros((num_edges, num_out, channels_x), dtype=x.dtype)
     cxy = val[:, None] * x_e[:, idx[1], :] * y[:, idx[2], None]
     z_e = z_e.at[:, idx[0], :].add(cxy)
 
-    z = np.zeros((num_nodes, num_out, channels_x), dtype=x.dtype)
+    z = jnp.zeros((num_nodes, num_out, channels_x), dtype=x.dtype)
     z = z.at[receiver].add(z_e * s[:, s_index, :])
     return z
 
@@ -81,7 +81,7 @@ def make_graph(num_nodes, num_edges, key):
     sender = random.randint(k1, (num_edges,), 0, num_nodes)
     receiver = random.randint(k2, (num_edges,), 0, num_nodes)
 
-    perm = np.argsort(receiver)
+    perm = jnp.argsort(receiver)
 
     sender_sorted = sender[perm]
     receiver_sorted = receiver[perm]
@@ -107,9 +107,9 @@ class _TestConvolutionOp:
         keys = iter(random.split(random.key(42), 5))
 
         def make_idx(dim, n, key):
-            idx_all = np.arange(dim)
+            idx_all = jnp.arange(dim)
             idx_rdm = random.randint(key, (n - dim,), 0, dim - 1)
-            return np.concat((idx_all, idx_rdm))
+            return jnp.concat((idx_all, idx_rdm))
 
         indices = [
             make_idx(nz, nnz, next(keys)),
@@ -117,15 +117,15 @@ class _TestConvolutionOp:
             make_idx(ny, nnz, next(keys)),
         ]
 
-        sigma = np.argsort(indices[0])
-        idx = np.stack(indices)[:, sigma]
+        sigma = jnp.argsort(indices[0])
+        idx = jnp.stack(indices)[:, sigma]
         idx = idx.astype(narrow_index_dtype((nz, nx, ny)))
         val = random.normal(next(keys), (nnz,))
 
-        s_index = np.concat(
-            (np.arange(ns), random.randint(next(keys), (nz - ns,), 0, ns))
+        s_index = jnp.concat(
+            (jnp.arange(ns), random.randint(next(keys), (nz - ns,), 0, ns))
         )
-        s_index = np.sort(s_index)
+        s_index = jnp.sort(s_index)
         params = CUDAConvolutionParams(num_out=nz, num_scalars=ns)
 
         return idx, val, s_index, params
@@ -168,7 +168,7 @@ class _TestConvolutionOp:
     def fwd_op(self):
         idx, val, s_index, params = self.closure()
         sender, receiver = self.graph()
-        idx4 = np.stack([idx[0], idx[1], idx[2], s_index[idx[0]]])
+        idx4 = jnp.stack([idx[0], idx[1], idx[2], s_index[idx[0]]])
         coef = pack_coef4d(val, idx4)
         return lambda x, y, s: convolution(
             coef,
@@ -183,14 +183,14 @@ class _TestConvolutionOp:
     @property
     def bwd_ref(self):
         return jax.grad(
-            lambda x, y, s: np.sum(self.fwd_ref(x, y, s)),
+            lambda x, y, s: jnp.sum(self.fwd_ref(x, y, s)),
             argnums=(0, 1, 2),
         )
 
     @property
     def bwd_op(self):
         return jax.grad(
-            lambda x, y, s: np.sum(self.fwd_op(x, y, s)),
+            lambda x, y, s: jnp.sum(self.fwd_op(x, y, s)),
             argnums=(0, 1, 2),
         )
 
@@ -270,7 +270,7 @@ def test_convolution_bwd_wide():
     op.channels_x = 8192
     idx, val, s_index, params = op.closure()
     sender, receiver = op.graph()
-    coef = pack_coef4d(val, np.stack([idx[0], idx[1], idx[2], s_index[idx[0]]]))
+    coef = pack_coef4d(val, jnp.stack([idx[0], idx[1], idx[2], s_index[idx[0]]]))
     x, y, s = op.inputs()
     out, vjp = jax.vjp(op.fwd_ref, x, y, s)
     dm = random.normal(random.key(7), out.shape)
@@ -311,7 +311,9 @@ class TestConvolutionSmallNumOutRegression(_TestConvolutionOp):
         # re-runs `pack_coef4d`) on every access, so `jax.jit(self.bwd_op)`
         # would retrace on each repeat below.
         fwd = self.fwd_op
-        bwd = jax.jit(jax.grad(lambda x, y, s: np.sum(fwd(x, y, s)), argnums=(0, 1, 2)))
+        bwd = jax.jit(
+            jax.grad(lambda x, y, s: jnp.sum(fwd(x, y, s)), argnums=(0, 1, 2))
+        )
         base = bwd(x, y, s)
         for _ in range(50):
             out = bwd(x, y, s)

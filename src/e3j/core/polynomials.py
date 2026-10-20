@@ -278,24 +278,21 @@ class Polynomial:
         """
         Differential of polynomials.
         """
-        # Escape the tracer context:
-        # caching the differential is a side-effect
-        with jax.ensure_compile_time_eval():
-            m, c = self.exp.T, self.coef
-            diffs = []
-            # Loop over input dimensions
-            for i in range(m.shape[0]):
-                mi = m[i : i + 1]
-                mask_i = mi[0] > 0
-                # d(xi^mi) / dxi = mi . xi^(mi - 1)
-                dmi = np.concatenate((m[:i], (mi - 1), m[i + 1 :])).T
-                dmi = np.where(mask_i[:, None], dmi, 0)
-                dci = mi[0] * c
-                Mi = Monomial(dmi, self.coords)
-                dPi = Polynomial(Mi, dci, self.shape)
-                diffs.append(dPi)
-            # Stack the dP / dxi derivatives
-            return Polynomial.stack(diffs, axis=-1).coalesce()
+        m, c = self.exp.T, self.coef
+        diffs = []
+        # Loop over input dimensions
+        for i in range(m.shape[0]):
+            mi = m[i : i + 1]
+            mask_i = mi[0] > 0
+            # d(xi^mi) / dxi = mi . xi^(mi - 1)
+            dmi = np.concatenate((m[:i], (mi - 1), m[i + 1 :])).T
+            dmi = np.where(mask_i[:, None], dmi, 0)
+            dci = mi[0] * c
+            Mi = Monomial(dmi, self.coords)
+            dPi = Polynomial(Mi, dci, self.shape)
+            diffs.append(dPi)
+        # Stack the dP / dxi derivatives
+        return Polynomial.stack(diffs, axis=-1).coalesce()
 
     @property
     def exp(self) -> Array:

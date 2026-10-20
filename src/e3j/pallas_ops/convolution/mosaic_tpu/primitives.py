@@ -22,6 +22,7 @@ shard_map-based data parallelism over the device mesh.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec
 
 from e3j.pallas_ops.convolution.mosaic_tpu.bwd import (
@@ -134,7 +135,7 @@ def _split_batch_to_leading(a: jax.Array, v: int) -> jax.Array:
 def _shift_edges(senders, receivers, n_nodes: int):
     """Offset graph `v`'s edge indices into the merged node block `[v*N, (v+1)*N)`."""
     v = senders.shape[0]
-    offsets = (jnp.arange(v, dtype=senders.dtype) * n_nodes)[:, None]
+    offsets = (np.arange(v, dtype=senders.dtype) * n_nodes)[:, None]
     return senders + offsets, receivers + offsets
 
 

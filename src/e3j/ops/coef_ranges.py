@@ -25,7 +25,7 @@ balanced independently.
 
 import functools
 
-import numpy
+import numpy as np
 
 # CUDA limit on threads per block.
 MAX_BLOCK_SIZE = 1024
@@ -44,8 +44,8 @@ def device_properties():
 @functools.lru_cache(maxsize=None)
 def kernel_registers(kernel, idx_dtype, val_dtype, N):
     """Registers per thread of the compiled `kernel<Idx, Val, N>` (cached)."""
-    idx_name = numpy.dtype(idx_dtype).name
-    val_name = numpy.dtype(val_dtype).name
+    idx_name = np.dtype(idx_dtype).name
+    val_name = np.dtype(val_dtype).name
     import e3j_ops
 
     return e3j_ops.get_kernel_registers(kernel, idx_name, val_name, N)
@@ -89,7 +89,7 @@ def _assign_rows(passes, num_coef, num_warps, barrier_between_passes=False):
     per-warp loads.
     """
     rows = [_pass_rows(out_idx, num_coef) for out_idx in passes]
-    loads = numpy.zeros((len(rows), num_warps), dtype=numpy.int64)
+    loads = np.zeros((len(rows), num_warps), dtype=np.int64)
     assign = [[[] for _ in range(num_warps)] for _ in rows]
 
     if barrier_between_passes:
@@ -102,13 +102,13 @@ def _assign_rows(passes, num_coef, num_warps, barrier_between_passes=False):
         ]
         items.sort(key=lambda item: (-item[0], item[1], item[2]))
         for weight, p, r in items:
-            w = int(numpy.argmin(loads[group].sum(axis=0)))
+            w = int(np.argmin(loads[group].sum(axis=0)))
             assign[p][w].append(r)
             loads[p, w] += weight
 
     # Rows in ascending order within each warp.
     perms = []
-    endpoints = numpy.empty((len(rows), num_warps), dtype=numpy.int32)
+    endpoints = np.empty((len(rows), num_warps), dtype=np.int32)
     for p, pass_rows in enumerate(rows):
         perm = []
         cursor = 0
@@ -118,7 +118,7 @@ def _assign_rows(passes, num_coef, num_warps, barrier_between_passes=False):
                 perm.extend(range(begin, begin + weight))
                 cursor += weight
             endpoints[p, w] = cursor
-        perms.append(numpy.asarray(perm, dtype=numpy.int64))
+        perms.append(np.asarray(perm, dtype=np.int64))
     return tuple(perms), endpoints, loads
 
 

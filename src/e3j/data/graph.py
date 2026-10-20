@@ -14,11 +14,11 @@
 
 
 import jax.numpy as jnp
-import numpy
+import numpy as np
 from jax import Array
 from numpy import int32
 
-DUMMY_INDEX = int32(numpy.iinfo(int32).max)
+DUMMY_INDEX = int32(np.iinfo(int32).max)
 
 #: Index dtype the CUDA FFI handlers declare. Pinned because `jax_enable_x64`,
 #: which float64 values require, would default derived buffers to int64.

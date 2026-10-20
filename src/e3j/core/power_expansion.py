@@ -14,7 +14,7 @@
 
 import functools
 
-import jax.numpy as np
+import jax.numpy as jnp
 
 from e3j import utils
 from e3j.core.filter import Filter
@@ -201,7 +201,7 @@ class PowerExpansion:
 
         return layers
 
-    def __call__(self, x: np.ndarray) -> list[np.ndarray]:
+    def __call__(self, x: jnp.ndarray) -> list[jnp.ndarray]:
         """Compute list of (filter-projected) equivariant powers [x, x2, ...]."""
         out = [x]
         for otimes in self.otimes_layers:

@@ -16,7 +16,7 @@ import e3nn_jax as e3nn
 import jax
 import pytest
 from conftest import assert_allclose
-from jax import numpy as np
+from jax import numpy as jnp
 from jax import random
 
 from e3j.core.scalar_mixing import ScalarMixing
@@ -81,8 +81,8 @@ class _TestScalarMixing:
             rotated = features @ D
             y_then_rotate = module(scalars, features) @ D
         elif self.layout == "TRAILING_CHANNELS":
-            rotated = np.einsum("nic,ij->njc", features, D)
-            y_then_rotate = np.einsum("nic,ij->njc", module(scalars, features), D)
+            rotated = jnp.einsum("nic,ij->njc", features, D)
+            y_then_rotate = jnp.einsum("nic,ij->njc", module(scalars, features), D)
         else:
             rotated = features @ D
             y_then_rotate = module(scalars, features) @ D
@@ -128,10 +128,10 @@ class _TestScalarMixing:
             scalars_3d = scalars.reshape(-1, self.num_channels, num_scalars)
         else:
             scalars_3d = scalars.reshape(-1, num_scalars, self.num_channels)
-        other_scalars = np.swapaxes(scalars_3d, -1, -2).reshape(scalars.shape[0], -1)
-        other_features = np.swapaxes(features, -1, -2)
+        other_scalars = jnp.swapaxes(scalars_3d, -1, -2).reshape(scalars.shape[0], -1)
+        other_features = jnp.swapaxes(features, -1, -2)
 
-        y1 = np.swapaxes(module(scalars, features), -1, -2)
+        y1 = jnp.swapaxes(module(scalars, features), -1, -2)
         y2 = other_module(other_scalars, other_features)
 
         assert_allclose(y1, y2)

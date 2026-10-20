@@ -14,7 +14,7 @@
 
 """Host-side coefficient partition in `e3j.ops.coef_ranges` (pure numpy)."""
 
-import numpy
+import numpy as np
 import pytest
 
 from e3j.ops import coef_ranges
@@ -46,12 +46,12 @@ def _random_passes(seed, num_coef, num_passes=3):
     kernel, with `num_passes=1`): each output index is one contiguous, sorted
     run, but passes partition the coefs into rows independently.
     """
-    rng = numpy.random.default_rng(seed)
+    rng = np.random.default_rng(seed)
     passes = []
     for _ in range(num_passes):
         weights = _weights_summing_to(rng, num_coef)
-        out_idx = numpy.repeat(numpy.arange(len(weights)), weights)
-        passes.append(out_idx.astype(numpy.int32))
+        out_idx = np.repeat(np.arange(len(weights)), weights)
+        passes.append(out_idx.astype(np.int32))
     return passes
 
 
@@ -76,7 +76,7 @@ def test_permutations_are_bijections(seed, num_warps, num_passes, barrier):
     perms, _ = balance_coef_ranges(passes, NUM_COEF, num_warps, barrier)
     for perm in perms:
         assert perm.shape == (NUM_COEF,)
-        numpy.testing.assert_array_equal(numpy.sort(perm), numpy.arange(NUM_COEF))
+        np.testing.assert_array_equal(np.sort(perm), np.arange(NUM_COEF))
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -91,7 +91,7 @@ def test_endpoints_contiguous_and_cover(seed, num_warps, num_passes, barrier):
     for p in range(num_passes):
         endpoints = coef_ranges[p * num_warps : (p + 1) * num_warps]
         assert endpoints[-1] == NUM_COEF
-        assert numpy.all(numpy.diff(endpoints) >= 0)
+        assert np.all(np.diff(endpoints) >= 0)
         assert endpoints[0] >= 0
 
 
@@ -118,17 +118,17 @@ def test_rows_contiguous_and_single_warp(seed, num_warps, num_passes, barrier):
         permuted = out_idx[perm]
         cursor = 0
         for begin, weight in _row_blocks_in(perm, rows):
-            numpy.testing.assert_array_equal(
+            np.testing.assert_array_equal(
                 perm[cursor : cursor + weight],
-                numpy.arange(begin, begin + weight),
+                np.arange(begin, begin + weight),
             )
             block = permuted[cursor : cursor + weight]
-            assert numpy.all(block == block[0])
+            assert np.all(block == block[0])
             cursor += weight
 
         # Each warp span is a whole number of rows: its output indices are a
         # set disjoint from every other warp's.
-        begins = numpy.concatenate([[0], endpoints[:-1]])
+        begins = np.concatenate([[0], endpoints[:-1]])
         seen = set()
         for b, e in zip(begins, endpoints):
             warp_rows = set(int(v) for v in permuted[b:e])
@@ -155,8 +155,8 @@ def test_critical_path_consistent_with_endpoints(seed, num_warps, num_passes, ba
     """The reported per-pass per-warp loads match the packed endpoints."""
     passes = _random_passes(seed, NUM_COEF, num_passes)
     _, endpoints, loads = _assign_rows(passes, NUM_COEF, num_warps, barrier)
-    per_pass = numpy.diff(endpoints, prepend=0, axis=1)
-    numpy.testing.assert_array_equal(loads, per_pass)
+    per_pass = np.diff(endpoints, prepend=0, axis=1)
+    np.testing.assert_array_equal(loads, per_pass)
     expect = int(loads.max(axis=1).sum()) if barrier else int(loads.sum(axis=0).max())
     assert _critical_path(passes, NUM_COEF, num_warps, barrier) == expect
 
@@ -170,7 +170,7 @@ def test_barrier_between_passes_balances_independently(seed, num_warps, num_pass
     _, _, loads = _assign_rows(passes, NUM_COEF, num_warps, barrier_between_passes=True)
     for p, out_idx in enumerate(passes):
         _, _, alone = _assign_rows([out_idx], NUM_COEF, num_warps)
-        numpy.testing.assert_array_equal(loads[p], alone[0])
+        np.testing.assert_array_equal(loads[p], alone[0])
     # Summing per-pass maxima cannot beat the maximum of summed loads.
     barrier_path = _critical_path(
         passes, NUM_COEF, num_warps, barrier_between_passes=True
@@ -216,7 +216,7 @@ def test_choose_block_y_fits_register_file(monkeypatch, registers):
     """
     monkeypatch.setattr(coef_ranges, "device_properties", lambda: A100)
     num_coef = 1200
-    passes = [numpy.arange(num_coef, dtype=numpy.int32)] * 3
+    passes = [np.arange(num_coef, dtype=np.int32)] * 3
     threads_x, _N = launch_threads_x(256)
 
     block_y = choose_block_y(passes, num_coef, 256, registers_per_thread=registers)

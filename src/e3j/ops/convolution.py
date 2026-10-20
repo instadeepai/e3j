@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import jax
 import jax.experimental.custom_partitioning
 import jax.numpy as jnp
-import numpy
+import numpy as np
 from jax import Array, custom_vjp
 from jax.ffi import ffi_call
 from numpy import int32
@@ -71,7 +71,7 @@ def _fold_endpoints(
         while padding `receiver` nodes are mapped in bound to support non-terminal
         padding edges (interleaved with real edges under `vmap`).
     """
-    node_offsets = jnp.arange(axis_size, dtype=receiver.dtype)[:, None] * num_nodes
+    node_offsets = np.arange(axis_size, dtype=receiver.dtype)[:, None] * num_nodes
     last_node = node_offsets + (num_nodes - 1)
     receiver = jnp.where(is_dummy_index(receiver), last_node, receiver + node_offsets)
     sender = jnp.where(is_dummy_index(sender), sender, sender + node_offsets)
@@ -112,7 +112,7 @@ def convolution(
     receiver: Array,
     params: CUDAConvolutionParams,
     graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
-    y_parity: numpy.ndarray | None = None,
+    y_parity: np.ndarray | None = None,
 ) -> Array:
     """Primitive bound to the CUDA convolution kernel.
 
@@ -169,45 +169,43 @@ def convolution(
     if graph_ordering == GraphOrdering.SENDER:
         if y_parity is None:
             raise ValueError("SENDER graph ordering requires `y_parity`.")
-        with jax.ensure_compile_time_eval():
-            c = Coef4D.unpack(coef, val_dtype=x.dtype)
-            signs = jnp.asarray(y_parity, dtype=c.val.dtype)[c.idx[:, 2]]
-            coef_fwd = Coef4D(
-                c.val * signs, c.idx, val_dtype=c.val_dtype, idx_dtype=c.idx_dtype
-            ).pack_jax()
+        c = Coef4D.unpack(coef, val_dtype=x.dtype)
+        signs = np.asarray(y_parity, dtype=c.val.dtype)[c.idx[:, 2]]
+        coef_fwd = Coef4D(
+            c.val * signs, c.idx, val_dtype=c.val_dtype, idx_dtype=c.idx_dtype
+        ).pack()
 
     # Balance coefficients across blockDim.y, in a single pass.
-    with jax.ensure_compile_time_eval():
-        c = Coef4D.unpack(coef, val_dtype=x.dtype)
-        num_coef = int(c.idx.shape[0])
-        out_idx = [numpy.asarray(c.idx[:, 0])]
-        # Shared memory at blockDim.y = 1: [lhs | rhs | out | mix].
-        val_bytes = numpy.dtype(c.val_dtype).itemsize
-        threads_x, N = launch_threads_x(channels_x)
-        unroll_x = min(threads_x * N, channels_x)
-        smem = estimate_smem_bytes(
-            [
-                unroll_x * x.shape[1],
-                y.shape[1],
-                unroll_x * num_out,
-                unroll_x * s.shape[1],
-            ],
-            num_coef,
-            c.dtype.itemsize,
-            val_bytes=val_bytes,
-        )
-        registers = kernel_registers("convolution", c.idx_dtype, c.val_dtype, N)
-        block_y = choose_block_y(
-            out_idx,
-            num_coef,
-            channels_x,
-            max_block_size=512,
-            smem_bytes=smem,
-            registers_per_thread=registers,
-        )
-        (perm,), ranges = balance_coef_ranges(out_idx, num_coef, block_y)
-        coef_fwd = coef_fwd[perm]
-        coef_ranges = jnp.asarray(ranges)
+    c = Coef4D.unpack(coef, val_dtype=x.dtype)
+    num_coef = int(c.idx.shape[0])
+    out_idx = [c.idx[:, 0]]
+    # Shared memory at blockDim.y = 1: [lhs | rhs | out | mix].
+    val_bytes = np.dtype(c.val_dtype).itemsize
+    threads_x, N = launch_threads_x(channels_x)
+    unroll_x = min(threads_x * N, channels_x)
+    smem = estimate_smem_bytes(
+        [
+            unroll_x * x.shape[1],
+            y.shape[1],
+            unroll_x * num_out,
+            unroll_x * s.shape[1],
+        ],
+        num_coef,
+        c.dtype.itemsize,
+        val_bytes=val_bytes,
+    )
+    registers = kernel_registers("convolution", c.idx_dtype, c.val_dtype, N)
+    block_y = choose_block_y(
+        out_idx,
+        num_coef,
+        channels_x,
+        max_block_size=512,
+        smem_bytes=smem,
+        registers_per_thread=registers,
+    )
+    (perm,), ranges = balance_coef_ranges(out_idx, num_coef, block_y)
+    coef_fwd = np.asarray(coef_fwd)[perm]
+    coef_ranges = ranges
 
     # ---- custom_partitioning ----
     #
@@ -343,7 +341,7 @@ def convolution_bwd(
     dm,
     params,
     graph_ordering: GraphOrdering = GraphOrdering.RECEIVER,
-    y_parity: numpy.ndarray | None = None,
+    y_parity: np.ndarray | None = None,
 ):
     """Primitive bound to the CUDA convolution backward kernel.
 
@@ -360,53 +358,50 @@ def convolution_bwd(
     """
     has_cx = x.ndim > 2
 
-    with jax.ensure_compile_time_eval():
-        # Transpose coefficients for backward kernel, passed as a triple
-        # (coef_dx, coef_dy, coef_ds) such that:
-        #   - dx = bigotimes(coef_dx, dm, y, s)
-        #   - dy = bigotimes(coef_dy, dm, x, s)
-        #   - ds = bigotimes(coef_ds, dm, y, x)
-        c = Coef4D.unpack(coef, val_dtype=x.dtype)
-        c_dx = c.transpose((1, 0, 2, 3))
-        c_dy = c.transpose((2, 0, 1, 3))
-        c_ds = c.transpose((3, 0, 2, 1))
+    # Transpose coefficients for backward kernel, passed as a triple
+    # (coef_dx, coef_dy, coef_ds) such that:
+    #   - dx = bigotimes(coef_dx, dm, y, s)
+    #   - dy = bigotimes(coef_dy, dm, x, s)
+    #   - ds = bigotimes(coef_ds, dm, y, x)
+    c = Coef4D.unpack(coef, val_dtype=x.dtype)
+    c_dx = c.transpose((1, 0, 2, 3))
+    c_dy = c.transpose((2, 0, 1, 3))
+    c_ds = c.transpose((3, 0, 2, 1))
 
-        # Balance the dx, dy, ds passes jointly, as no barrier separates them.
-        num_coef = int(c_dx.idx.shape[0])
-        channels_x = int(x.shape[-1]) if has_cx else 1
-        passes = [numpy.asarray(c_bwd.idx[:, 0]) for c_bwd in (c_dx, c_dy, c_ds)]
-        # Shared memory at blockDim.y = 1: [dm | x | y | mix | dy scratch].
-        val_bytes = numpy.dtype(c_dx.val_dtype).itemsize
-        threads_x, N = launch_threads_x(channels_x)
-        unroll_x = min(threads_x * N, channels_x)
-        warps_x = max(1, threads_x // 32)
-        smem = estimate_smem_bytes(
-            [
-                unroll_x * dm.shape[1],
-                unroll_x * x.shape[1],
-                y.shape[1],
-                unroll_x * s.shape[1],
-            ],
-            3 * num_coef,
-            c_dx.dtype.itemsize,
-            val_bytes=val_bytes,
-            extra_bytes=warps_x * y.shape[1] * val_bytes,
-        )
-        registers = kernel_registers(
-            "convolution_bwd", c_dx.idx_dtype, c_dx.val_dtype, N
-        )
-        block_y = choose_block_y(
-            passes,
-            num_coef,
-            channels_x,
-            smem_bytes=smem,
-            registers_per_thread=registers,
-        )
-        perms, ranges = balance_coef_ranges(passes, num_coef, block_y)
-        coef_bwd = jnp.stack(
-            [c_bwd.pack_jax()[perm] for c_bwd, perm in zip((c_dx, c_dy, c_ds), perms)]
-        )
-        coef_ranges = jnp.asarray(ranges)
+    # Balance the dx, dy, ds passes jointly, as no barrier separates them.
+    num_coef = int(c_dx.idx.shape[0])
+    channels_x = int(x.shape[-1]) if has_cx else 1
+    passes = [c_bwd.idx[:, 0] for c_bwd in (c_dx, c_dy, c_ds)]
+    # Shared memory at blockDim.y = 1: [dm | x | y | mix | dy scratch].
+    val_bytes = np.dtype(c_dx.val_dtype).itemsize
+    threads_x, N = launch_threads_x(channels_x)
+    unroll_x = min(threads_x * N, channels_x)
+    warps_x = max(1, threads_x // 32)
+    smem = estimate_smem_bytes(
+        [
+            unroll_x * dm.shape[1],
+            unroll_x * x.shape[1],
+            y.shape[1],
+            unroll_x * s.shape[1],
+        ],
+        3 * num_coef,
+        c_dx.dtype.itemsize,
+        val_bytes=val_bytes,
+        extra_bytes=warps_x * y.shape[1] * val_bytes,
+    )
+    registers = kernel_registers("convolution_bwd", c_dx.idx_dtype, c_dx.val_dtype, N)
+    block_y = choose_block_y(
+        passes,
+        num_coef,
+        channels_x,
+        smem_bytes=smem,
+        registers_per_thread=registers,
+    )
+    perms, ranges = balance_coef_ranges(passes, num_coef, block_y)
+    coef_bwd = np.stack(
+        [c_bwd.pack()[perm] for c_bwd, perm in zip((c_dx, c_dy, c_ds), perms)]
+    )
+    coef_ranges = ranges
 
     # ---- custom_partitioning ----
 
@@ -539,8 +534,8 @@ def convolution_bwd(
 
     def _bwd(res, cotangents):
         """Return (Dx, Dy, Ds, Ddm) cotangents from (Ddx, Ddy, Dds)."""
-        (Ddx, Ddy, Dds) = cotangents
-        (x, y, s, dm, sender, receiver) = res
+        Ddx, Ddy, Dds = cotangents
+        x, y, s, dm, sender, receiver = res
 
         def conv(x, y, s):
             return convolution(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax.numpy as np
+import jax.numpy as jnp
 
 from e3j.utils.options import LinearIndexwiseInitialization, LinearInitialization
 
@@ -32,7 +32,7 @@ def _get_weights_std_and_scaling(
     weights_normalization: _InitializationOption = "FAN_IN",
     rescale_gradients: bool = True,
     num_indices: int | None = None,
-) -> tuple[float | np.ndarray, float | np.ndarray]:
+) -> tuple[float | jnp.ndarray, float | jnp.ndarray]:
     """Return (std, scale) pair for weight initialization of Linear modules.
 
     When `rescale_gradients` is True, normal initial weights are rescaled within
@@ -72,4 +72,4 @@ def _get_weights_std_and_scaling(
     else:
         raise ValueError(f"Unknown weights_normalization: {weights_normalization}")
 
-    return (1.0, np.sqrt(alpha)) if rescale_gradients else (np.sqrt(alpha), 1.0)
+    return (1.0, jnp.sqrt(alpha)) if rescale_gradients else (jnp.sqrt(alpha), 1.0)

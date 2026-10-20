@@ -14,7 +14,6 @@
 
 import functools
 
-import jax
 import jax.numpy as jnp
 
 from e3j import utils
@@ -98,14 +97,13 @@ class SymmetricContraction:
     @functools.cached_property
     def permutation(self) -> Permutation:
         """Groups equivalent irreps before the output linear transform."""
-        with jax.ensure_compile_time_eval():
-            combined = " + ".join(str(s) for s in self.expansion.target if s.dim)
-            if not combined:
-                raise ValueError(
-                    f"No power of {self.source_irreps!r} up to correlation "
-                    f"{self.correlation} holds any of {self.keep_irrep_out!r}."
-                )
-            return Permutation.sort(combined, axis=self.layout.axis_lm)
+        combined = " + ".join(str(s) for s in self.expansion.target if s.dim)
+        if not combined:
+            raise ValueError(
+                f"No power of {self.source_irreps!r} up to correlation "
+                f"{self.correlation} holds any of {self.keep_irrep_out!r}."
+            )
+        return Permutation.sort(combined, axis=self.layout.axis_lm)
 
     @functools.cached_property
     def linear(self) -> LinearIndexwise:

@@ -16,7 +16,7 @@ import contextlib
 
 import jax
 import jax.numpy as jnp
-import numpy
+import numpy as np
 import pytest
 
 from e3j.ops.coef import Coef, Coef4D, IdxDtype, ValDtype
@@ -50,18 +50,18 @@ class TestCoefDtypeSize:
     """Check that aligned numpy dtypes match CUDA struct sizes.
 
     CUDA structs are padded to a multiple of their `alignas(next_pow2(...))`
-    alignment. `numpy.dtype(align=True)`, inflated to `next_pow2` by
+    alignment. `np.dtype(align=True)`, inflated to `next_pow2` by
     `_numpy_dtype`, must agree.
     """
 
     @pytest.mark.parametrize("val_dtype, idx_dtype, itemsize", COEF_ITEMSIZE)
     def test_coef_itemsize(self, val_dtype, idx_dtype, itemsize):
-        dt = Coef._numpy_dtype(numpy.dtype(val_dtype), numpy.dtype(idx_dtype))
+        dt = Coef._numpy_dtype(np.dtype(val_dtype), np.dtype(idx_dtype))
         assert dt.itemsize == itemsize
 
     @pytest.mark.parametrize("val_dtype, idx_dtype, itemsize", COEF4D_ITEMSIZE)
     def test_coef4d_itemsize(self, val_dtype, idx_dtype, itemsize):
-        dt = Coef4D._numpy_dtype(numpy.dtype(val_dtype), numpy.dtype(idx_dtype))
+        dt = Coef4D._numpy_dtype(np.dtype(val_dtype), np.dtype(idx_dtype))
         assert dt.itemsize == itemsize
 
     @pytest.mark.parametrize(
@@ -74,11 +74,11 @@ class TestCoefDtypeSize:
         padding, so the indices start at 4 instead of 2.
         """
         for val_dtype, idx_dtype, _ in table:
-            dt = coef_cls._numpy_dtype(numpy.dtype(val_dtype), numpy.dtype(idx_dtype))
+            dt = coef_cls._numpy_dtype(np.dtype(val_dtype), np.dtype(idx_dtype))
             assert dt.fields["val"][1] == 0
-            stride = numpy.dtype(idx_dtype).itemsize
+            stride = np.dtype(idx_dtype).itemsize
             # first index offset: sizeof(val) rounded up to the index alignment
-            base = -(-numpy.dtype(val_dtype).itemsize // stride) * stride
+            base = -(-np.dtype(val_dtype).itemsize // stride) * stride
             for n, name in enumerate(coef_cls.index_names):
                 assert dt.fields[name][1] == base + n * stride
 
@@ -106,14 +106,14 @@ class _TestIdxDtypeRoundTrip:
     @pytest.fixture(params=DTYPE_PAIRS)
     def coef(self, request):
         val_dtype, idx_dtype = request.param
-        val = numpy.array([1.0, -0.5, 3.14], dtype=val_dtype)
-        idx = numpy.array(self.sample_idx, dtype=idx_dtype)
+        val = np.array([1.0, -0.5, 3.14], dtype=val_dtype)
+        idx = np.array(self.sample_idx, dtype=idx_dtype)
         return self.coef_cls(val, idx, val_dtype=val_dtype, idx_dtype=idx_dtype)
 
     def _assert_fields(self, structured, coef):
-        numpy.testing.assert_array_equal(structured["val"], coef.val)
+        np.testing.assert_array_equal(structured["val"], coef.val)
         for col, name in enumerate(type(coef).index_names):
-            numpy.testing.assert_array_equal(structured[name], coef.idx[:, col])
+            np.testing.assert_array_equal(structured[name], coef.idx[:, col])
 
     def test_pack_numpy_roundtrip(self, coef):
         """Structured numpy array preserves val and idx fields exactly."""
@@ -122,11 +122,11 @@ class _TestIdxDtypeRoundTrip:
         self._assert_fields(packed, coef)
 
     def test_view_cast_roundtrip(self, coef):
-        """reinterpret_cast via numpy.view -> JAX -> numpy recovers original data."""
+        """reinterpret_cast via np.view -> JAX -> numpy recovers original data."""
         packed = coef.pack_numpy()
         idx_t = IdxDtype(coef.idx_dtype).value
         itemsize = packed.dtype.itemsize
-        idx_itemsize = numpy.dtype(idx_t).itemsize
+        idx_itemsize = np.dtype(idx_t).itemsize
         numel = itemsize // idx_itemsize
 
         # reinterpret_cast to flat idx_t array
@@ -134,7 +134,7 @@ class _TestIdxDtypeRoundTrip:
 
         # round-trip through JAX
         jax_arr = jnp.asarray(opaque)
-        recovered = numpy.asarray(jax_arr)
+        recovered = np.asarray(jax_arr)
 
         # cast back to structured dtype
         structured = recovered.view(packed.dtype).reshape(-1)
@@ -145,7 +145,7 @@ class _TestIdxDtypeRoundTrip:
         jax_arr = coef.pack_jax()
 
         # recover structured array from JAX
-        np_arr = numpy.asarray(jax_arr)
+        np_arr = np.asarray(jax_arr)
         structured = np_arr.view(coef.dtype).reshape(-1)
         self._assert_fields(structured, coef)
 
@@ -153,29 +153,21 @@ class _TestIdxDtypeRoundTrip:
         """unpack() recovers original val and idx from a packed JAX array."""
         jax_arr = coef.pack_jax()
         # JAX only holds float64 values with x64 enabled, as in production.
-        needs_x64 = numpy.dtype(coef.val_dtype).itemsize > 4
+        needs_x64 = np.dtype(coef.val_dtype).itemsize > 4
         ctx = jax.enable_x64() if needs_x64 else contextlib.nullcontext()
         with ctx:
             recovered = type(coef).unpack(jax_arr, val_dtype=coef.val_dtype)
 
-        numpy.testing.assert_array_equal(
-            numpy.asarray(recovered.val), numpy.asarray(coef.val)
-        )
-        numpy.testing.assert_array_equal(
-            numpy.asarray(recovered.idx), numpy.asarray(coef.idx)
-        )
+        np.testing.assert_array_equal(np.asarray(recovered.val), np.asarray(coef.val))
+        np.testing.assert_array_equal(np.asarray(recovered.idx), np.asarray(coef.idx))
 
     def test_unpack_from_numpy(self, coef):
         """unpack() recovers original val and idx from a packed numpy structured array."""
         packed = coef.pack_numpy()
         recovered = type(coef).unpack(packed, val_dtype=coef.val_dtype)
 
-        numpy.testing.assert_array_equal(
-            numpy.asarray(recovered.val), numpy.asarray(coef.val)
-        )
-        numpy.testing.assert_array_equal(
-            numpy.asarray(recovered.idx), numpy.asarray(coef.idx)
-        )
+        np.testing.assert_array_equal(np.asarray(recovered.val), np.asarray(coef.val))
+        np.testing.assert_array_equal(np.asarray(recovered.idx), np.asarray(coef.idx))
 
     def test_unpack_empty(self, coef):
         """unpack() of an empty table, packed by numpy or JAX, stays empty."""
@@ -197,16 +189,16 @@ class TestNarrowValueWideIndex:
     @pytest.mark.parametrize("coef_cls", [Coef, Coef4D])
     def test_float16_int32_roundtrip(self, coef_cls):
         rank = coef_cls.rank
-        val = numpy.array([1.0, -0.5], dtype="float16")
+        val = np.array([1.0, -0.5], dtype="float16")
         # Indices out of the uint8 range, to check int32 is really kept.
-        idx = numpy.array(
+        idx = np.array(
             [[70_000 + i for i in range(rank)], [80_000 + i for i in range(rank)]],
             dtype="int32",
         )
         coef = coef_cls(val, idx, val_dtype="float16", idx_dtype="int32")
         recovered = coef_cls.unpack(coef.pack_numpy(), val_dtype="float16")
-        numpy.testing.assert_array_equal(numpy.asarray(recovered.val), val)
-        numpy.testing.assert_array_equal(numpy.asarray(recovered.idx), idx)
+        np.testing.assert_array_equal(np.asarray(recovered.val), val)
+        np.testing.assert_array_equal(np.asarray(recovered.idx), idx)
 
 
 class TestIdxDtypeRoundTrip(_TestIdxDtypeRoundTrip):

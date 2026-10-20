@@ -17,15 +17,14 @@ from __future__ import annotations
 from typing import Iterable, Literal, Optional
 
 import e3nn_jax as e3nn
-import jax
-import jax.numpy as np
-from jax.experimental import sparse
+import jax.numpy as jnp
+import numpy as np
 
 import e3j.utils as utils
 from e3j.spaces import O3Space
 from e3j.utils.cache import cache
 from e3j.utils.irreps import irrep_range
-from e3j.utils.sparse import SparseMixin, sparse_bcoo
+from e3j.utils.sparse import SparseCOO, SparseMixin, sparse_coo
 
 from .permutation import Permutation
 from .tensor_product import TensorProduct
@@ -36,8 +35,7 @@ class Bigotimes(SparseMixin):
 
     @cache
     def coef(self):
-        with jax.ensure_compile_time_eval():
-            return self.clebsch_gordan(self.target, *self.source, self.l_max)
+        return self.clebsch_gordan(self.target, *self.source, self.l_max)
 
     @classmethod
     def clebsch_gordan(
@@ -65,14 +63,13 @@ class Bigotimes(SparseMixin):
             downstream = cls((upstream.target, ins[k]), out_filter, None, sort=False)
             # accumulate composed coefficients
             upstream = downstream.pullback(upstream)
-            jax.clear_caches()
         return upstream
 
     def __init__(
         self,
         source: list[O3Space | str],
         target: O3Space | str,
-        coef: jax.Array | None = None,
+        coef: SparseCOO | None = None,
         l_max: int | None = None,
         sort: bool = True,
         config: utils.Config | None = None,
@@ -139,7 +136,7 @@ class Bigotimes(SparseMixin):
         out = O3Space(in_0)
         return out.regroup() if sort else out
 
-    def __call__(self, *xs: np.ndarray) -> np.ndarray:
+    def __call__(self, *xs: jnp.ndarray) -> jnp.ndarray:
         """Evaluate N-linear product on N inputs.
 
         By default, this method uses a dense-dense matrix multiplication
@@ -151,8 +148,10 @@ class Bigotimes(SparseMixin):
         if not len(xs) == self.arity:
             raise TypeError(f"{n}-ary tensor product called with {len(xs)} arguments")
         ijk = self.indices
-        xs_by_coef = np.stack([xr[:, ijk[:, r + 1]] for r, xr in enumerate(xs)], axis=0)
-        prod_xs_coef = self.values * np.prod(xs_by_coef, axis=0)
+        xs_by_coef = jnp.stack(
+            [xr[:, ijk[:, r + 1]] for r, xr in enumerate(xs)], axis=0
+        )
+        prod_xs_coef = self.values * jnp.prod(xs_by_coef, axis=0)
         return self.aggregate(prod_xs_coef)
 
     def pullback(self, prod: Bigotimes, position: int = 0) -> Bigotimes:
@@ -192,25 +191,25 @@ class Bigotimes(SparseMixin):
                     m = self.arity + prod.arity - 1
         """
         # pointers to incoming coefs by pulled coordinate
-        zero = np.zeros(1, dtype=np.int32)
-        sizes_y = prod.target_matrix.T @ np.ones(prod.nnz)
-        sizes_y = sizes_y.astype(np.int32)
-        ptr_y = np.cumsum(np.concat((zero, sizes_y)))
+        # (upstream coefs are sorted by output coordinate)
+        sizes_y = np.bincount(prod.indices[:, 0], minlength=prod.shape[0])
+        ptr_y = np.concatenate(([0], np.cumsum(sizes_y)))
 
         # repeat downstream coefs by nb of incoming coefs above coordinate
         y_down = self.indices[:, position + 1]
-        indices_down = np.repeat(self.indices, sizes_y[y_down], axis=0)
-        values_down = np.repeat(self.values, sizes_y[y_down])
+        repeats = sizes_y[y_down]
+        indices_down = np.repeat(self.indices, repeats, axis=0)
+        values_down = np.repeat(self.values, repeats)
 
-        # concatenate upstream coef blocks index by pulled coordinate value
-        indices_up = np.concat(
-            [prod.indices[ptr_y[i] : ptr_y[i + 1], 1:] for i in y_down],
-            axis=0,
+        # gather upstream coef blocks by pulled coordinate value:
+        # rows ptr_y[i], ..., ptr_y[i + 1] - 1 for each i in y_down
+        block_start = np.repeat(ptr_y[y_down], repeats)
+        block_offset = np.arange(repeats.sum()) - np.repeat(
+            np.cumsum(repeats) - repeats, repeats
         )
-        values_up = np.concat(
-            [prod.values[ptr_y[i] : ptr_y[i + 1]] for i in y_down],
-            axis=0,
-        )
+        rows_up = block_start + block_offset
+        indices_up = prod.indices[rows_up, 1:]
+        values_up = prod.values[rows_up]
         # compose values
         values = values_up * values_down
 
@@ -225,12 +224,12 @@ class Bigotimes(SparseMixin):
             indices_up,  # upstream tree
             indices_down[:, p + 2 :],  # r.h.s. branches
         ]
-        indices = np.concat(indices, axis=-1)
+        indices = np.concatenate([idx.astype(np.int64) for idx in indices], axis=-1)
 
-        # return Bigotimes module with BCOO coefficients
+        # return Bigotimes module with COO coefficients
         source = [*self.source[:position], *prod.source, *self.source[position + 1 :]]
         shape = (self.target.dim, *(in_k.dim for in_k in source))
-        coef = sparse_bcoo(values, indices, shape=shape)
+        coef = sparse_coo(values, indices, shape=shape)
 
         return self.__class__(
             source,
@@ -245,11 +244,8 @@ class Bigotimes(SparseMixin):
         perm = Permutation.sort(self.target)
         target = perm.target
         idx_out = perm.sigma_1[self.indices[:, 0]]
-        indices = np.concat(
-            (idx_out[:, None], self.indices[:, 1:]),
-            axis=-1,
-        )
-        coef = sparse_bcoo(self.values, indices, shape=self.shape)
+        indices = np.concatenate((idx_out[:, None], self.indices[:, 1:]), axis=-1)
+        coef = sparse_coo(self.values, indices, shape=self.shape)
 
         return self.__class__(
             self.source,

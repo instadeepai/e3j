@@ -14,7 +14,7 @@
 
 import e3nn_jax as e3nn
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import pytest
 from jax import random
 
@@ -32,7 +32,7 @@ class _TestPermutationSort:
         return random.key(self._seed)
 
     @pytest.fixture
-    def inputs(self) -> np.ndarray:
+    def inputs(self) -> jnp.ndarray:
         key = random.key(123)
         dim_in = e3nn.Irreps(self.rep_in).dim
         return random.normal(key, (self.batch_size, dim_in))
@@ -43,14 +43,14 @@ class _TestPermutationSort:
 
     @pytest.fixture(scope="class")
     def e3nn_module(self):
-        def sort(x: np.ndarray) -> np.ndarray:
+        def sort(x: jnp.ndarray) -> jnp.ndarray:
             x_in = e3nn.IrrepsArray(self.rep_in, x)
             return x_in.sort().array
 
         return sort
 
     @pytest.fixture(scope="class")
-    def rotations(self, e3j_module) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[jnp.ndarray]:
         """Prepare output and input rotations."""
         rotation = e3nn.rand_matrix(self.key)
         rotation_in = e3j_module.source.action(rotation)
@@ -58,7 +58,7 @@ class _TestPermutationSort:
         return [rotation_in, rotation_out]
 
     def assert_zero(self, data, tol=1e-7):
-        norm = float(np.sqrt(np.sum(data**2)) / data.size)
+        norm = float(jnp.sqrt(jnp.sum(data**2)) / data.size)
         assert norm < tol
 
     # --- Test functions ---

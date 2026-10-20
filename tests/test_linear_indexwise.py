@@ -14,7 +14,7 @@
 
 import jax
 import pytest
-from jax import numpy as np
+from jax import numpy as jnp
 
 from e3j.core.linear_indexwise import LinearIndexwise as LinearIndexwiseCore
 from e3j.utils.options import Layout
@@ -32,16 +32,16 @@ class TestLinearIndexwiseCoreWeights:
             "2x0e + 1o + 2e", "0e + 2x1o + 2e", request.param, self.num_channels
         )
 
-    def weights(self, core) -> list[np.ndarray]:
+    def weights(self, core) -> list[jnp.ndarray]:
         shape = (self.num_indices, self.num_channels)
-        return [np.ones((*shape, *block.shape)) for block in core.blocks]
+        return [jnp.ones((*shape, *block.shape)) for block in core.blocks]
 
     def inputs(self, core):
         dim = core.blocks[-1].end
-        feats = np.ones((5, self.num_channels, dim))
+        feats = jnp.ones((5, self.num_channels, dim))
         if core.layout == Layout.TRAILING_CHANNELS:
-            feats = np.swapaxes(feats, -1, -2)
-        return feats, np.zeros(5, dtype=int)
+            feats = jnp.swapaxes(feats, -1, -2)
+        return feats, jnp.zeros(5, dtype=int)
 
     @pytest.mark.parametrize("jit", [False, True])
     @pytest.mark.parametrize("drop", [-1, 0])
@@ -53,7 +53,7 @@ class TestLinearIndexwiseCoreWeights:
             apply(*self.inputs(core), weights)
 
     def test_extra_weights(self, core):
-        weights = self.weights(core) + [np.ones((self.num_indices, 1, 1, 1))]
+        weights = self.weights(core) + [jnp.ones((self.num_indices, 1, 1, 1))]
         with pytest.raises(ValueError, match="Expected 3 weights"):
             core(*self.inputs(core), weights)
 
@@ -62,6 +62,6 @@ class TestLinearIndexwiseCoreWeights:
     )
     def test_misshapen_weight(self, core, shape):
         weights = self.weights(core)
-        weights[1] = np.ones(shape)
+        weights[1] = jnp.ones(shape)
         with pytest.raises(ValueError, match=r"Weight 1 has shape .* \(_, 4, 2, 1\)"):
             core(*self.inputs(core), weights)

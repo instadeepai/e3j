@@ -14,7 +14,7 @@
 
 import math
 
-import jax.numpy as np
+import jax.numpy as jnp
 
 from e3j.core.polynomials import Polynomial
 from e3j.spaces import O3Space
@@ -90,7 +90,7 @@ class Harmonics:
         self.normalization = normalization
         self.real = real
 
-    def __call__(self, r: np.ndarray) -> np.ndarray:
+    def __call__(self, r: jnp.ndarray) -> jnp.ndarray:
         """Evaluate polynomials on a 3D point cloud."""
         if self.normalize:
             norm = safe_norm(r, axis=-1)

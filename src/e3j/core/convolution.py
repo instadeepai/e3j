@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax
-import jax.numpy as np
-import numpy
+import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from e3j import utils
@@ -35,7 +34,7 @@ from e3j.spaces import O3Space
 from e3j.utils import options
 from e3j.utils.cache import cache
 from e3j.utils.options import Layout
-from e3j.utils.sparse import sparse_bcoo
+from e3j.utils.sparse import sparse_coo
 
 
 class Convolution:
@@ -134,12 +133,11 @@ class Convolution:
         # Statically rescale coefficients by num_neighbors to skip
         # the node-wise message rescaling overhead.
         if avg_num_neighbors is not None:
-            with jax.ensure_compile_time_eval():
-                otimes.coef = sparse_bcoo(
-                    values=otimes.values / avg_num_neighbors,
-                    indices=otimes.indices,
-                    shape=otimes.coef.shape,
-                )
+            otimes.coef = sparse_coo(
+                values=otimes.values / avg_num_neighbors,
+                indices=otimes.indices,
+                shape=otimes.coef.shape,
+            )
 
         # Scalar mixing block
         mix = ScalarMixing(otimes.target, layout=layout)
@@ -161,17 +159,15 @@ class Convolution:
     @cache
     def coef(self) -> Coef4D:
         """Return packed Coef4D coefficients for the forward pass."""
-        with jax.ensure_compile_time_eval():
-            mix, otimes = self._mix, self._otimes
-            idx = otimes.indices.T
-            mix_idx = np.array(mix.mix_indices, dtype=idx.dtype)
-            coef4D = Coef4D(
-                otimes.values,
-                np.stack([idx[0], idx[1], idx[2], mix_idx[idx[0]]], axis=-1),
-                val_dtype=np.float32,
-                idx_dtype=idx.dtype,
-            )
-            return coef4D
+        mix, otimes = self._mix, self._otimes
+        idx = otimes.indices.T
+        mix_idx = mix.mix_indices.astype(idx.dtype)
+        return Coef4D(
+            otimes.values,
+            np.stack([idx[0], idx[1], idx[2], mix_idx[idx[0]]], axis=-1),
+            val_dtype=np.float32,
+            idx_dtype=idx.dtype,
+        )
 
     def _unfused_eval(
         self,
@@ -186,7 +182,7 @@ class Convolution:
         messages = self._otimes(sender_features, edge_features)
         messages = self._mix(edge_scalars, messages)
         receiver_feats = (
-            np.zeros(
+            jnp.zeros(
                 (node_features.shape[0], *messages.shape[1:]), dtype=messages.dtype
             )
             .at[receivers]
@@ -220,17 +216,16 @@ class Convolution:
 
         # One kernel dtype for every buffer, coefficients included.
         val_dtype = resolve_val_dtype(
-            np.result_type(node_features, edge_features, edge_scalars)
+            jnp.result_type(node_features, edge_features, edge_scalars)
         )
         node_features = node_features.astype(val_dtype)
         edge_features = edge_features.astype(val_dtype)
         edge_scalars = edge_scalars.astype(val_dtype)
 
-        with jax.ensure_compile_time_eval():
-            coef = self.coef
-            coef4D_packed = Coef4D(
-                coef.val, coef.idx, val_dtype=val_dtype, idx_dtype=coef.idx_dtype
-            ).pack_jax()
+        coef = self.coef
+        coef4D_packed = Coef4D(
+            coef.val, coef.idx, val_dtype=val_dtype, idx_dtype=coef.idx_dtype
+        ).pack()
 
         params = CUDAConvolutionParams(
             num_out=self.target.dim,
@@ -243,9 +238,9 @@ class Convolution:
         y_parity = None
         if self.graph_ordering == options.GraphOrdering.SENDER:
             y_space = self._otimes.source[1]
-            y_parity = numpy.concatenate(
+            y_parity = np.concatenate(
                 [
-                    numpy.full(m * ir.dim, float(ir.p), dtype=numpy.float32)
+                    np.full(m * ir.dim, float(ir.p), dtype=np.float32)
                     for m, ir in y_space
                 ]
             )
@@ -290,8 +285,8 @@ class Convolution:
         coef = self._otimes.coef
         params = (
             PallasMosaicTPUMessagePassingConvolutionParams.build_from_sender_sorted(
-                indices=numpy.array(coef.indices),
-                values=numpy.array(coef.data),
+                indices=coef.indices,
+                values=coef.data,
                 x_space=O3Space(str(self._otimes.source[0])),
                 y_space=O3Space(str(self._otimes.source[1])),
                 z_space=O3Space(str(self._otimes.target)),
@@ -327,8 +322,8 @@ class Convolution:
 
         coef = self._otimes.coef
         params = PallasMosaicGPUMessagePassingConvolutionParams(
-            indices=numpy.asarray(coef.indices),
-            values=numpy.asarray(coef.data),
+            indices=coef.indices,
+            values=coef.data,
             layout=self.layout,
             x_space=self._otimes.source[0],
             y_space=self._otimes.source[1],

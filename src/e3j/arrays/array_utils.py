@@ -17,7 +17,7 @@ from typing import Any
 import e3nn_jax as e3nn
 import jax
 import jax.numpy as jnp
-import numpy
+import numpy as np
 
 from e3j.arrays.array import Array, IndexArray, O3Array, SO3Array
 from e3j.spaces import Finite, O3Space, SO3Space, Space
@@ -28,7 +28,7 @@ def as_array(space: Space | str, x: Any, layout: Layout | None = None) -> Array:
     """Helper constructor for `e3j.Array` instances.
 
     Currently, string descriptors for the space argument will be cast to `O3Array`.
-    Input data can be either `jax.Array`, `e3nn.IrrepsArray`, `numpy.ndarray` or
+    Input data can be either `jax.Array`, `e3nn.IrrepsArray`, `np.ndarray` or
     list.
 
     Note that shape checks on the feature axis will be enforced by the `O3Array`
@@ -43,7 +43,7 @@ def as_array(space: Space | str, x: Any, layout: Layout | None = None) -> Array:
     if isinstance(x, jax.Array):
         return Arr(space, x)
 
-    if isinstance(x, (numpy.ndarray, list)):
+    if isinstance(x, (np.ndarray, list)):
         return Arr(space, jnp.asarray(x))
 
     if isinstance(x, Array):

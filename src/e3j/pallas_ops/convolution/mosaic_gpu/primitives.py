@@ -197,7 +197,7 @@ def _fold_index(index: jax.Array, n_nodes: int) -> jax.Array:
     as they are. Because of that, dummy edges can now appear in the middle
     of the edge list, so the folded call cannot assume the edges are sorted.
     """
-    offsets = jnp.arange(index.shape[0], dtype=index.dtype)[:, None] * n_nodes
+    offsets = np.arange(index.shape[0], dtype=index.dtype)[:, None] * n_nodes
     return jnp.where(is_dummy_index(index), index, index + offsets).reshape(-1)
 
 

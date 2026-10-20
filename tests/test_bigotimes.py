@@ -16,7 +16,7 @@ from typing import Literal
 
 import e3nn_jax as e3nn
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
 import pytest
 
@@ -24,7 +24,7 @@ from e3j.core.bigotimes import Bigotimes
 from e3j.spaces import O3Space
 from e3j.utils.irreps import irrep_range
 
-np.set_printoptions(edgeitems=6, precision=3)
+jnp.set_printoptions(edgeitems=6, precision=3)
 
 
 class _TestBigotimesPullback:
@@ -63,12 +63,12 @@ class _TestBigotimesPullback:
         return composed
 
     def assert_zero(self, data, tol: int = 1e-6):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         try:
             assert norm < tol
         except BaseException as err:
             print(self.__class__.__name__ + ".assert_zero")
-            print("error.std", np.std(data, axis=0), sep="\n")
+            print("error.std", jnp.std(data, axis=0), sep="\n")
             raise err
 
     def test_pullback_eval(self, inputs, sequential, pullback):
@@ -152,7 +152,7 @@ class _TestBigotimes:
         return tp
 
     @pytest.fixture
-    def rotations(self, e3j_module) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[jnp.ndarray]:
         """Prepare output and input rotations."""
         rots = []
         rotation = e3nn.rand_matrix(self.key)
@@ -165,11 +165,11 @@ class _TestBigotimes:
         return rots
 
     def assert_zero(self, data, tol: int = 1e-6):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         try:
             assert norm < tol
         except BaseException as err:
-            print("error.std", np.std(data, axis=0), sep="\n")
+            print("error.std", jnp.std(data, axis=0), sep="\n")
             raise err
 
     # --- Test functions ---

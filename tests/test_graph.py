@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
-import numpy
+import numpy as np
 import pytest
 from conftest import assert_allclose
 
@@ -27,17 +27,17 @@ from e3j.ops.convolution import _wrap_global_index
 # padding edges. All dummy endpoints carry `DUMMY_INDEX` so they should be
 # excluded from every CSR adjacency.
 num_nodes = 4
-sender_real = np.array([1, 2, 0, 1, 3, 2], dtype=np.int32)
-receiver_real = np.array([0, 1, 1, 2, 2, 3], dtype=np.int32)
+sender_real = jnp.array([1, 2, 0, 1, 3, 2], dtype=jnp.int32)
+receiver_real = jnp.array([0, 1, 1, 2, 2, 3], dtype=jnp.int32)
 num_real = sender_real.shape[0]
 num_dummy = 3
 
 
 def _padded_graph():
     """Real edges followed by `num_dummy` `DUMMY_INDEX`-marked padding edges."""
-    dummy = np.full(num_dummy, DUMMY_INDEX, dtype=np.int32)
-    sender = np.concatenate([sender_real, dummy])
-    receiver = np.concatenate([receiver_real, dummy])
+    dummy = jnp.full(num_dummy, DUMMY_INDEX, dtype=jnp.int32)
+    sender = jnp.concatenate([sender_real, dummy])
+    receiver = jnp.concatenate([receiver_real, dummy])
     return sender, receiver
 
 
@@ -47,17 +47,17 @@ class TestMaskEdges:
 
     @pytest.mark.parametrize("real", range(num_nodes + 1))
     def test_matches_the_endpoint_gather(self, real):
-        node_mask = np.arange(num_nodes) < real
+        node_mask = jnp.arange(num_nodes) < real
         expected = node_mask[sender_real] & node_mask[receiver_real]
         sender, receiver = GraphCSR.mask_edges(sender_real, receiver_real, node_mask)
         masked = (sender == DUMMY_INDEX) | (receiver == DUMMY_INDEX)
-        numpy.testing.assert_array_equal(masked, ~expected)
+        np.testing.assert_array_equal(masked, ~expected)
 
     def test_all_real_is_identity(self):
-        node_mask = np.ones(num_nodes, dtype=bool)
+        node_mask = jnp.ones(num_nodes, dtype=bool)
         sender, receiver = GraphCSR.mask_edges(sender_real, receiver_real, node_mask)
-        numpy.testing.assert_array_equal(sender, sender_real)
-        numpy.testing.assert_array_equal(receiver, receiver_real)
+        np.testing.assert_array_equal(sender, sender_real)
+        np.testing.assert_array_equal(receiver, receiver_real)
 
 
 class TestWrapGlobalIndex:
@@ -65,15 +65,15 @@ class TestWrapGlobalIndex:
     padding sentinel so it stays out of range for `bincount`."""
 
     def test_preserves_sentinel(self):
-        index = np.array([0, 3, DUMMY_INDEX], dtype=np.int32)
+        index = jnp.array([0, 3, DUMMY_INDEX], dtype=jnp.int32)
         wrapped = _wrap_global_index(index, num_nodes)
         assert int(wrapped[-1]) == int(DUMMY_INDEX)
 
     def test_wraps_in_range(self):
         # Global indices from a folded second graph wrap back to local nodes.
-        index = np.array([num_nodes, num_nodes + 1], dtype=np.int32)
+        index = jnp.array([num_nodes, num_nodes + 1], dtype=jnp.int32)
         wrapped = _wrap_global_index(index, num_nodes)
-        numpy.testing.assert_array_equal(wrapped, np.array([0, 1]))
+        np.testing.assert_array_equal(wrapped, jnp.array([0, 1]))
 
 
 class TestDummyEdgesCSR:
@@ -81,7 +81,7 @@ class TestDummyEdgesCSR:
     the real-edge ranges unchanged in both forward and transposed directions."""
 
     def _reference_ptr(self, receiver):
-        return np.append(0, np.cumsum(np.bincount(receiver, length=num_nodes)))
+        return jnp.append(0, jnp.cumsum(jnp.bincount(receiver, length=num_nodes)))
 
     def test_forward_drops_dummies(self):
         sender, receiver = _padded_graph()
@@ -90,7 +90,7 @@ class TestDummyEdgesCSR:
         ptr = GraphCSR(num_nodes, sender_local, receiver_local).receiver_ptr
 
         # Ranges match the unpadded graph; the final pointer excludes dummies.
-        numpy.testing.assert_array_equal(ptr, self._reference_ptr(receiver_real))
+        np.testing.assert_array_equal(ptr, self._reference_ptr(receiver_real))
         assert int(ptr[-1]) == num_real
 
     def test_transpose_drops_dummies(self):
@@ -100,7 +100,7 @@ class TestDummyEdgesCSR:
         _, graph_t, _ = GraphCSR(num_nodes, sender_local, receiver_local).transpose()
 
         # The backward CSR buckets by sender; dummies drop there too.
-        numpy.testing.assert_array_equal(
+        np.testing.assert_array_equal(
             graph_t.receiver_ptr, self._reference_ptr(sender_real)
         )
         assert int(graph_t.receiver_ptr[-1]) == num_real
@@ -119,11 +119,11 @@ class TestDummyEdgesCSR:
         def fold(index, group):
             # Real edges take a per-graph node offset; a dummy's grouping endpoint
             # takes its graph's last node, its guard endpoint keeps the sentinel.
-            offset = np.array([0, num_nodes], dtype=np.int32)[:, None]
+            offset = jnp.array([0, num_nodes], dtype=jnp.int32)[:, None]
             last_node = offset + (num_nodes - 1)
-            stacked = np.stack([index, index])
+            stacked = jnp.stack([index, index])
             fill = last_node if group else DUMMY_INDEX
-            return np.where(stacked == DUMMY_INDEX, fill, stacked + offset).reshape(-1)
+            return jnp.where(stacked == DUMMY_INDEX, fill, stacked + offset).reshape(-1)
 
         sender_local = fold(sender, group=False)
         receiver_local = fold(receiver, group=True)  # RECEIVER forward CSR key
@@ -132,12 +132,12 @@ class TestDummyEdgesCSR:
 
         # The grouping key is non-decreasing, so the physical edge order matches
         # the CSR ranges (contiguous adjacency).
-        assert bool(np.all(np.diff(receiver_local) >= 0))
-        assert bool(np.all(np.diff(ptr) >= 0))
+        assert bool(jnp.all(jnp.diff(receiver_local) >= 0))
+        assert bool(jnp.all(jnp.diff(ptr) >= 0))
         # Every folded edge is counted now that dummies land in the last node.
         assert int(ptr[-1]) == 2 * num_edges
         # Dummy guard endpoints stay out of range, so the kernel skips them.
-        assert int(np.sum(sender_local == DUMMY_INDEX)) == 2 * num_dummy
+        assert int(jnp.sum(sender_local == DUMMY_INDEX)) == 2 * num_dummy
 
 
 class TestUnfusedConvolutionDummyEdges:
@@ -168,10 +168,10 @@ class TestUnfusedConvolutionDummyEdges:
 
         # Pad with dummy edges carrying arbitrary (non-zero) feature data.
         sender, receiver = _padded_graph()
-        edge_features_pad = np.concatenate(
+        edge_features_pad = jnp.concatenate(
             [edge_features, random.normal(k[3], (num_dummy, edge_space.dim))]
         )
-        edge_scalars_pad = np.concatenate(
+        edge_scalars_pad = jnp.concatenate(
             [
                 edge_scalars,
                 random.normal(k[4], (num_dummy, scalar_space.dim, num_channels)),

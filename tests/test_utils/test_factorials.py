@@ -12,27 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax.numpy as np
+import jax.numpy as jnp
 
 from e3j.utils.factorials import bifact, bifact_even, bifact_odd
 
 
 def test_bifact_even():
-    evens = np.array([0, 2, 4, 6, 8])
-    expect = np.array([1, 2, 8, 48, 384])
+    evens = jnp.array([0, 2, 4, 6, 8])
+    expect = jnp.array([1, 2, 8, 48, 384])
     result = bifact_even(evens)
-    assert np.allclose(expect, result)
+    assert jnp.allclose(expect, result)
 
 
 def test_bifact_odd():
-    odds = np.array([1, 3, 5, 7])
-    expect = np.array([1, 3, 15, 105])
+    odds = jnp.array([1, 3, 5, 7])
+    expect = jnp.array([1, 3, 15, 105])
     result = bifact_odd(odds)
-    assert np.allclose(expect, result)
+    assert jnp.allclose(expect, result)
 
 
 def test_bifact():
-    ints = np.arange(9)
-    expect = np.array([1, 1, 2, 3, 8, 15, 48, 105, 384])
+    ints = jnp.arange(9)
+    expect = jnp.array([1, 1, 2, 3, 8, 15, 48, 105, 384])
     result = bifact(ints)
-    assert np.allclose(expect, result)
+    assert jnp.allclose(expect, result)

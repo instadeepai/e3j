@@ -14,14 +14,12 @@
 
 from dataclasses import dataclass, field
 
-import jax.numpy as np
+import numpy as np
 from jax import Array
-from jax.experimental import sparse
 
 from e3j.spaces.o3 import O3Space
 from e3j.utils.config import config
 from e3j.utils.options import Layout
-from e3j.utils.sparse import sparse_bcoo
 
 
 @dataclass
@@ -61,16 +59,12 @@ class ScalarMixing:
         return sum(m for m, ir in self.source)
 
     @property
-    def mix_indices(self) -> Array:
+    def mix_indices(self) -> np.ndarray:
         """Return index map from equivariant coordinates to scalars."""
         repeats = []
         for mul, ir in self.source:
             repeats.extend([ir.dim] * mul)
-        return np.repeat(
-            np.arange(self.num_irreps),
-            np.array(repeats),
-            total_repeat_length=self.source.dim,
-        )
+        return np.repeat(np.arange(self.num_irreps), repeats)
 
     def __call__(self, scalars: Array, features: Array) -> Array:
         """Mix scalars with equivariant features."""

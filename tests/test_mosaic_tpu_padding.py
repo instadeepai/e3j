@@ -15,7 +15,7 @@
 """Block ordering that keeps padded edges off the Mosaic TPU pipeline."""
 
 import jax.numpy as jnp
-import numpy
+import numpy as np
 import pytest
 
 from e3j.pallas_ops.convolution.mosaic_tpu.padding import block_order
@@ -25,7 +25,7 @@ BLOCK = 4
 
 def _order(edge_is_real, n_batch_blocks=4, block=BLOCK):
     order, walked = block_order(jnp.asarray(edge_is_real, bool), n_batch_blocks, block)
-    return numpy.asarray(order), int(walked)
+    return np.asarray(order), int(walked)
 
 
 class TestBlockOrder:
@@ -35,12 +35,12 @@ class TestBlockOrder:
     def test_all_real_walks_every_block(self):
         order, walked = _order([True] * 16)
         assert walked == 4
-        numpy.testing.assert_array_equal(order, [0, 1, 2, 3])
+        np.testing.assert_array_equal(order, [0, 1, 2, 3])
 
     def test_all_padding_walks_nothing(self):
         order, walked = _order([False] * 16)
         assert walked == 0
-        numpy.testing.assert_array_equal(sorted(order), [0, 1, 2, 3])
+        np.testing.assert_array_equal(sorted(order), [0, 1, 2, 3])
 
     def test_partial_block_is_walked(self):
         # one real edge is enough to keep its block on the pipeline
@@ -53,13 +53,13 @@ class TestBlockOrder:
         edge_is_real = [True] * 4 + [False] * 4 + [True] * 4 + [False] * 4
         order, walked = _order(edge_is_real)
         assert walked == 2, "a scalar bound would stop past the last graph's padding"
-        numpy.testing.assert_array_equal(order[:walked], [0, 2])
-        numpy.testing.assert_array_equal(sorted(order[walked:]), [1, 3])
+        np.testing.assert_array_equal(order[:walked], [0, 2])
+        np.testing.assert_array_equal(sorted(order[walked:]), [1, 3])
 
     @pytest.mark.parametrize("n_real", range(17))
     def test_walked_and_skipped_partition_the_blocks(self, n_real):
         order, walked = _order([True] * n_real + [False] * (16 - n_real))
-        numpy.testing.assert_array_equal(sorted(order), range(4))
+        np.testing.assert_array_equal(sorted(order), range(4))
         assert walked == -(-n_real // BLOCK)
         assert list(order[:walked]) == sorted(order[:walked])
         assert list(order[walked:]) == sorted(order[walked:])

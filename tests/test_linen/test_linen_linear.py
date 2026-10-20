@@ -16,7 +16,7 @@ import e3nn_jax as e3nn
 import jax
 import pytest
 from conftest import assert_allclose
-from jax import numpy as np
+from jax import numpy as jnp
 from jax import random
 
 from e3j.linen.linear import Linear
@@ -64,7 +64,7 @@ class _TestLinear:
         return e3j_module.init(self.key, inputs)
 
     @pytest.fixture(scope="class")
-    def rotations(self, e3j_module) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[jnp.ndarray]:
         """Prepare output and input rotations."""
         in_irreps = e3nn.Irreps(str(e3j_module.source))
         out_irreps = e3nn.Irreps(str(e3j_module.target))
@@ -77,12 +77,12 @@ class _TestLinear:
         if self.layout == "E3NN":
             return x @ g
         elif self.layout == "LEADING_CHANNELS":
-            return np.einsum("...i,ij->...j", x, g)
+            return jnp.einsum("...i,ij->...j", x, g)
         elif self.layout == "TRAILING_CHANNELS":
-            return np.einsum("nic,ij->njc", x, g)
+            return jnp.einsum("nic,ij->njc", x, g)
 
     def assert_zero(self, data, tol: float = 1e-7):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         assert norm < tol
 
     # --- Test functions ---
@@ -117,8 +117,8 @@ class _TestLinear:
             kernel_init=e3j_module.kernel_init,
         )
 
-        y1 = np.swapaxes(e3j_module.apply(params, inputs), -1, -2)
-        y2 = other_module.apply(params, np.swapaxes(inputs, -1, -2))
+        y1 = jnp.swapaxes(e3j_module.apply(params, inputs), -1, -2)
+        y2 = other_module.apply(params, jnp.swapaxes(inputs, -1, -2))
 
         assert_allclose(y1, y2)
 

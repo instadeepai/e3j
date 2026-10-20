@@ -22,7 +22,7 @@ import contextlib
 import jax
 import jax.numpy as jnp
 import jax.random as random
-import numpy
+import numpy as np
 import numpy.testing as testing
 import pytest
 
@@ -53,7 +53,7 @@ def tolerances(dtype, reference, nnz=NNZ):
     """Error budget in dtype ULP: both sides accumulate in the same dtype, so
     they only differ by summation order, which grows like `sqrt(nnz)`.
     """
-    eps = float(numpy.finfo(numpy.dtype(dtype)).eps)
+    eps = float(np.finfo(np.dtype(dtype)).eps)
     scale = max(float(jnp.max(jnp.abs(reference.astype("float32")))), 1.0)
     return {"atol": 8 * eps * scale, "rtol": 8 * eps * nnz**0.5}
 
@@ -61,8 +61,8 @@ def tolerances(dtype, reference, nnz=NNZ):
 def assert_close(expect, result, dtype, nnz=NNZ):
     tol = tolerances(dtype, expect, nnz)
     testing.assert_allclose(
-        numpy.asarray(result, dtype="float64"),
-        numpy.asarray(expect, dtype="float64"),
+        np.asarray(result, dtype="float64"),
+        np.asarray(expect, dtype="float64"),
         **tol,
     )
 
@@ -326,7 +326,7 @@ def test_core_promotes_mixed_operands():
 def test_unsupported_val_dtype_raises():
     """Non-float value dtypes are rejected with a clear error."""
     with pytest.raises(TypeError, match="support value dtypes"):
-        resolve_val_dtype(numpy.dtype("int32"))
+        resolve_val_dtype(np.dtype("int32"))
 
 
 # --- LEADING_CHANNELS layout ----------------------------------------------

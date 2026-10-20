@@ -14,7 +14,7 @@
 
 import e3nn_jax as e3nn
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
 import pytest
 from conftest import assert_allclose
@@ -155,7 +155,7 @@ class TestPowerExpansionVectorToScalar(_TestPowerExpansion):
         x1, x2, x3 = module(x)
         assert x1.shape == x3.shape == (self.batch_size, 4, 0)
         # 1o x 1o -> 0e has unit-norm Clebsch-Gordan coefficients delta_ij / sqrt(3)
-        assert_allclose(np.abs(x2[..., 0]), np.sum(x**2, axis=-1) / np.sqrt(3))
+        assert_allclose(jnp.abs(x2[..., 0]), jnp.sum(x**2, axis=-1) / jnp.sqrt(3))
 
 
 def test_config():

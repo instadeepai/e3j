@@ -17,9 +17,9 @@
 import re
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
-import numpy as onp
+import numpy as np
 import numpy.testing as testing
 import pytest
 from jax.experimental.topologies import get_topology_desc
@@ -58,7 +58,7 @@ def make_graph(num_nodes, num_edges, key):
     k1, k2 = random.split(key)
     sender = random.randint(k1, (num_edges,), 0, num_nodes)
     receiver = random.randint(k2, (num_edges,), 0, num_nodes)
-    perm = np.argsort(receiver)
+    perm = jnp.argsort(receiver)
     return sender[perm], receiver[perm]
 
 
@@ -68,10 +68,10 @@ def convolution_reference(idx, val, x, y, s, s_index, sender, receiver, num_out)
     num_edges = sender.shape[0]
     channels_x = x.shape[-1]
     x_e = x[sender]
-    z_e = np.zeros((num_edges, num_out, channels_x), dtype=x.dtype)
+    z_e = jnp.zeros((num_edges, num_out, channels_x), dtype=x.dtype)
     cxy = val[:, None] * x_e[:, idx[1], :] * y[:, idx[2], None]
     z_e = z_e.at[:, idx[0], :].add(cxy)
-    z = np.zeros((num_nodes, num_out, channels_x), dtype=x.dtype)
+    z = jnp.zeros((num_nodes, num_out, channels_x), dtype=x.dtype)
     z = z.at[receiver].add(z_e * s[:, s_index, :])
     return z
 
@@ -81,15 +81,15 @@ def generate_conv_data():
     keys = iter(random.split(random.key(42), 10))
 
     nnz = 20
-    idx_0 = np.sort(random.randint(next(keys), (nnz,), 0, NUM_OUT))
+    idx_0 = jnp.sort(random.randint(next(keys), (nnz,), 0, NUM_OUT))
     idx_1 = random.randint(next(keys), (nnz,), 0, NUM_X)
     idx_2 = random.randint(next(keys), (nnz,), 0, NUM_Y)
-    idx = np.stack([idx_0, idx_1, idx_2])
+    idx = jnp.stack([idx_0, idx_1, idx_2])
     idx = idx.astype(narrow_index_dtype((NUM_OUT, NUM_X, NUM_Y)))
     val = random.normal(next(keys), (nnz,))
 
-    s_index = np.sort(random.randint(next(keys), (NUM_OUT,), 0, NUM_SCALARS))
-    idx4 = np.stack([idx_0, idx_1, idx_2, s_index[idx_0]])
+    s_index = jnp.sort(random.randint(next(keys), (NUM_OUT,), 0, NUM_SCALARS))
+    idx4 = jnp.stack([idx_0, idx_1, idx_2, s_index[idx_0]])
     coef = pack_coef4d(val, idx4)
     params = CUDAConvolutionParams(num_out=NUM_OUT, num_scalars=NUM_SCALARS)
 
@@ -113,7 +113,7 @@ def test_jit_convolution_vmap():
         return convolution(coef, x, y, s, sender, receiver, params)
 
     out_single = conv(x, y, s)
-    xs, ys, ss = np.stack([x, x]), np.stack([y, y]), np.stack([s, s])
+    xs, ys, ss = jnp.stack([x, x]), jnp.stack([y, y]), jnp.stack([s, s])
     out_vmap = jax.vmap(conv)(xs, ys, ss)
 
     assert out_vmap.shape == (2,) + out_single.shape
@@ -161,30 +161,32 @@ def _masked_graph(ordering, seed=0):
     node_space, edge_space, scalar_space = _masked_module("UNFUSED", ordering).source
     pad = _MASK_NODES - 1
     edges = list(_MASK_PAIRS) + [(b, a) for a, b in _MASK_PAIRS] + [(pad, pad)]
-    sender = np.array([a for a, b in edges], np.int32)
-    receiver = np.array([b for a, b in edges], np.int32)
+    sender = jnp.array([a for a, b in edges], jnp.int32)
+    receiver = jnp.array([b for a, b in edges], jnp.int32)
     key = sender if ordering == "SENDER" else receiver
-    order = np.argsort(key, stable=True)
+    order = jnp.argsort(key, stable=True)
     sender, receiver = sender[order], receiver[order]
 
-    parity = onp.concatenate(
-        [onp.full(m * ir.dim, float(ir.p), onp.float32) for m, ir in edge_space]
+    parity = np.concatenate(
+        [np.full(m * ir.dim, float(ir.p), np.float32) for m, ir in edge_space]
     )
     k = random.split(random.key(seed), 3)
     yh = random.normal(k[0], (len(_MASK_PAIRS), edge_space.dim))
-    y = np.concatenate([yh, yh * parity[None], np.zeros((1, edge_space.dim))])[order]
+    y = jnp.concatenate([yh, yh * parity[None], jnp.zeros((1, edge_space.dim))])[order]
     sh = random.normal(k[1], (len(_MASK_PAIRS), scalar_space.dim, _MASK_CHANNELS))
-    s = np.concatenate([sh, sh, np.zeros((1, scalar_space.dim, _MASK_CHANNELS))])[order]
+    s = jnp.concatenate([sh, sh, jnp.zeros((1, scalar_space.dim, _MASK_CHANNELS))])[
+        order
+    ]
     x = random.normal(k[2], (_MASK_NODES, node_space.dim, _MASK_CHANNELS))
-    node_mask = np.ones(_MASK_NODES, dtype=bool).at[pad].set(False)
+    node_mask = jnp.ones(_MASK_NODES, dtype=bool).at[pad].set(False)
     return x, y, s, sender, receiver, node_mask
 
 
 def _vmap_masked(impl, ordering, x, y, s, sender, receiver, node_mask):
     """Vmap `impl` over two copies of the same masked graph."""
-    xs, ys, ss = np.stack([x, x]), np.stack([y, y]), np.stack([s, s])
-    sm, rm = np.stack([sender, sender]), np.stack([receiver, receiver])
-    mm = np.stack([node_mask, node_mask])
+    xs, ys, ss = jnp.stack([x, x]), jnp.stack([y, y]), jnp.stack([s, s])
+    sm, rm = jnp.stack([sender, sender]), jnp.stack([receiver, receiver])
+    mm = jnp.stack([node_mask, node_mask])
 
     def f(x, y, s, se, re, nm):
         return _masked_module(impl, ordering)(x, y, s, se, re, node_mask=nm)
@@ -212,7 +214,7 @@ def test_masked_vmap_backward_matches_unfused(ordering):
     x, y, s, sender, receiver, node_mask = _masked_graph(ordering)
 
     def loss(impl):
-        return lambda x, y, s: np.sum(
+        return lambda x, y, s: jnp.sum(
             _vmap_masked(impl, ordering, x, y, s, sender, receiver, node_mask)
         )
 
@@ -256,7 +258,7 @@ def test_masked_backward_zeros_padding_dx(ordering):
     def dx(impl):
         module = _masked_module(impl, ordering)
         return jax.grad(
-            lambda x: np.sum(module(x, y, s, sender, receiver, node_mask=node_mask))
+            lambda x: jnp.sum(module(x, y, s, sender, receiver, node_mask=node_mask))
         )(x)
 
     dx_fused = dx("FUSED_CUDA")
@@ -274,10 +276,10 @@ def test_backward_zeros_sender_only_padding_edges(ordering):
     visits them, but must still write their cotangents.
     """
     coef, x, y, s, sender, receiver, params, *_ = generate_conv_data()
-    pad = np.arange(NUM_EDGES) >= NUM_EDGES - 3
-    sender = np.where(pad, DUMMY_INDEX, sender)
+    pad = jnp.arange(NUM_EDGES) >= NUM_EDGES - 3
+    sender = jnp.where(pad, DUMMY_INDEX, sender)
     if ordering == "SENDER":
-        order = np.argsort(sender, stable=True)
+        order = jnp.argsort(sender, stable=True)
         sender, receiver, y, s, pad = (a[order] for a in (sender, receiver, y, s, pad))
 
     def loss(y, s):
@@ -290,18 +292,18 @@ def test_backward_zeros_sender_only_padding_edges(ordering):
             receiver,
             params,
             GraphOrdering[ordering],
-            y_parity=onp.ones(NUM_Y),
+            y_parity=np.ones(NUM_Y),
         )
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     # Recycle NaN-filled device memory, so unwritten cotangents show up.
-    np.full((1 << 24,), np.nan).block_until_ready()
+    jnp.full((1 << 24,), jnp.nan).block_until_ready()
     dy, ds = jax.grad(loss, argnums=(0, 1))(y, s)
 
     testing.assert_array_equal(jax.device_get(dy[pad]), 0.0)
     testing.assert_array_equal(jax.device_get(ds[pad]), 0.0)
-    assert np.isfinite(dy).all()
-    assert np.isfinite(ds).all()
+    assert jnp.isfinite(dy).all()
+    assert jnp.isfinite(ds).all()
 
 
 @pytest.mark.multi_devices
@@ -312,8 +314,8 @@ def test_vmap_convolution_execute_multi_devices():
     batch = 3 * jax.device_count()
     keys = random.split(random.key(5), batch)
     graphs = [make_graph(NUM_NODES, NUM_EDGES, k) for k in keys]
-    senders = np.stack([g[0] for g in graphs])
-    receivers = np.stack([g[1] for g in graphs])
+    senders = jnp.stack([g[0] for g in graphs])
+    receivers = jnp.stack([g[1] for g in graphs])
 
     kx, ky, ks = random.split(random.key(11), 3)
     xs = random.normal(kx, (batch, *x.shape))
@@ -482,7 +484,7 @@ def test_vmap_grad_convolution_multi_devices():
         return convolution(coef, x, y, s, sender, receiver, params)
 
     def sum_vmap_conv(x, y, s):
-        return np.sum(jax.vmap(conv)(x, y, s))
+        return jnp.sum(jax.vmap(conv)(x, y, s))
 
     fn = jax.grad(sum_vmap_conv, argnums=(0, 1, 2))
     jitted_fn = jax.jit(
@@ -550,7 +552,7 @@ def _batched_conv_data(batch, key):
         xs.append(random.normal(kx, x0.shape))
         ys.append(random.normal(ky, y0.shape))
         ss.append(random.normal(ks, s0.shape))
-    stack = lambda arrs: np.stack(arrs)
+    stack = lambda arrs: jnp.stack(arrs)
     return (
         coef,
         stack(xs),
@@ -599,7 +601,7 @@ def test_vmap_grad_convolution_multi_devices_numerical():
         z = jax.vmap(lambda *a: convolution(coef, *a, params))(
             x, y, s, sender, receiver
         )
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     grad_fn = jax.grad(loss, argnums=(0, 1, 2))
     g_ref = grad_fn(x, y, s, sender, receiver)
@@ -622,13 +624,13 @@ def test_grad_convolution_matches_reference():
     coef, x, y, s, sender, receiver, params, idx, val, s_index = generate_conv_data()
 
     def f_op(x, y, s):
-        return np.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
+        return jnp.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
 
     def f_ref(x, y, s):
         z = convolution_reference(
             idx, val, x, y, s, s_index, sender, receiver, params.num_out
         )
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     g_op = jax.grad(f_op, argnums=(0, 1, 2))(x, y, s)
     g_ref = jax.grad(f_ref, argnums=(0, 1, 2))(x, y, s)
@@ -649,13 +651,13 @@ def test_hessian_convolution():
 
     def f_op(x):
         z = convolution(coef, x, y, s, sender, receiver, params)
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     def f_ref(x):
         z = convolution_reference(
             idx, val, x, y, s, s_index, sender, receiver, params.num_out
         )
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     H_op = jax.jacrev(jax.grad(f_op))(x)
     H_ref = jax.jacrev(jax.grad(f_ref))(x)
@@ -677,14 +679,14 @@ def test_hvp_convolution_all_inputs():
     def f_op(inputs):
         x, y, s = inputs
         z = convolution(coef, x, y, s, sender, receiver, params)
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     def f_ref(inputs):
         x, y, s = inputs
         z = convolution_reference(
             idx, val, x, y, s, s_index, sender, receiver, params.num_out
         )
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     primals = (x, y, s)
     kx, ky, ks = random.split(random.key(7), 3)
@@ -697,7 +699,7 @@ def test_hvp_convolution_all_inputs():
     def hvp(f):
         def directional(p):
             grads = jax.grad(f)(p)
-            dots = jax.tree_util.tree_map(lambda g, t: np.vdot(g, t), grads, tangents)
+            dots = jax.tree_util.tree_map(lambda g, t: jnp.vdot(g, t), grads, tangents)
             return jax.tree_util.tree_reduce(lambda a, b: a + b, dots)
 
         return jax.grad(directional)(primals)
@@ -723,14 +725,14 @@ def test_third_order_convolution_all_inputs():
     def f_op(inputs):
         x, y, s = inputs
         z = convolution(coef, x, y, s, sender, receiver, params)
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     def f_ref(inputs):
         x, y, s = inputs
         z = convolution_reference(
             idx, val, x, y, s, s_index, sender, receiver, params.num_out
         )
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     primals = (x, y, s)
     k1, k2, k3 = random.split(random.key(11), 3)
@@ -750,7 +752,7 @@ def test_third_order_convolution_all_inputs():
 
         def d(p):
             grads = jax.grad(f)(p)
-            dots = jax.tree_util.tree_map(lambda g, t: np.vdot(g, t), grads, tangents)
+            dots = jax.tree_util.tree_map(lambda g, t: jnp.vdot(g, t), grads, tangents)
             return jax.tree_util.tree_reduce(lambda a, b: a + b, dots)
 
         return d
@@ -777,7 +779,7 @@ def test_hessian_forward_mode_error():
 
     def f_op(x):
         z = convolution(coef, x, y, s, sender, receiver, params)
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     # eval_shape triggers the trace-time forward-mode guard deterministically,
     # independent of platform / FFI kernel availability.
@@ -800,8 +802,8 @@ def test_double_backward_batched_graph():
     batch = 3
     keys = random.split(random.key(0), batch)
     graphs = [make_graph(NUM_NODES, NUM_EDGES, k) for k in keys]
-    senders = np.stack([g[0] for g in graphs])
-    receivers = np.stack([g[1] for g in graphs])
+    senders = jnp.stack([g[0] for g in graphs])
+    receivers = jnp.stack([g[1] for g in graphs])
     xs = random.normal(random.key(1), (batch, *x.shape))
     ys = random.normal(random.key(2), (batch, *y.shape))
     ss = random.normal(random.key(3), (batch, *s.shape))
@@ -810,9 +812,9 @@ def test_double_backward_batched_graph():
         def scalar(x, y, s, sender, receiver):
             # "force" = grad of a scalar energy wrt node features x
             def energy(x):
-                return np.sum(conv_fn(x, y, s, sender, receiver) ** 2)
+                return jnp.sum(conv_fn(x, y, s, sender, receiver) ** 2)
 
-            return np.sum(jax.grad(energy)(x) ** 2)
+            return jnp.sum(jax.grad(energy)(x) ** 2)
 
         return scalar
 
@@ -852,16 +854,16 @@ def test_hessian_under_vmap():
     xs = random.normal(random.key(3), (batch, *x.shape))
 
     def f_op(x):
-        return np.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
+        return jnp.sum(convolution(coef, x, y, s, sender, receiver, params) ** 2)
 
     def f_ref(x):
         z = convolution_reference(
             idx, val, x, y, s, s_index, sender, receiver, params.num_out
         )
-        return np.sum(z**2)
+        return jnp.sum(z**2)
 
     H_op = jax.vmap(jax.jacrev(jax.grad(f_op)))(xs)
-    H_ref = np.stack([jax.jacrev(jax.grad(f_ref))(xb) for xb in xs])
+    H_ref = jnp.stack([jax.jacrev(jax.grad(f_ref))(xb) for xb in xs])
 
     testing.assert_allclose(H_op, H_ref, atol=1e-4, rtol=1e-4)
 
@@ -896,7 +898,7 @@ def test_vmap_grad_hessian_all_inputs():
 
         def d(p):
             grads = jax.grad(f)(p)
-            dots = jax.tree_util.tree_map(lambda g, t: np.vdot(g, t), grads, tangents)
+            dots = jax.tree_util.tree_map(lambda g, t: jnp.vdot(g, t), grads, tangents)
             return jax.tree_util.tree_reduce(lambda a, b: a + b, dots)
 
         return d
@@ -904,7 +906,7 @@ def test_vmap_grad_hessian_all_inputs():
     def grad_hessian(conv_fn):
         def f(p):
             x, y, s = p
-            return np.sum(conv_fn(x, y, s) ** 2)
+            return jnp.sum(conv_fn(x, y, s) ** 2)
 
         # grad of the twice-contracted Hessian: gradients for x, y and s.
         return jax.grad(directional(directional(f, t1), t2))

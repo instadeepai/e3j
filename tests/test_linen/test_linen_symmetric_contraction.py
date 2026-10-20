@@ -18,7 +18,7 @@ import e3nn_jax as e3nn
 import jax
 import pytest
 from conftest import assert_allclose
-from jax import numpy as np
+from jax import numpy as jnp
 from jax import random
 
 import e3j
@@ -75,7 +75,7 @@ class _TestSymmetricContraction:
         return e3j_module.init(self.key, self._to_layout(feats, self.layout), index)
 
     @pytest.fixture(scope="class")
-    def rotations(self, e3j_module) -> list[np.ndarray]:
+    def rotations(self, e3j_module) -> list[jnp.ndarray]:
         """Input and output rotations in the e3j basis."""
         source = O3Space(self.in1)
         target = e3j_module.target
@@ -84,14 +84,14 @@ class _TestSymmetricContraction:
             return [source.action(rotation), target.action(rotation)]
 
     @staticmethod
-    def _to_layout(feats: np.ndarray, layout: str) -> np.ndarray:
+    def _to_layout(feats: jnp.ndarray, layout: str) -> jnp.ndarray:
         """Swap `(N, C, dim)` to and from `layout` (an involution)."""
         if Layout.parse(layout) == Layout.TRAILING_CHANNELS:
-            return np.swapaxes(feats, -1, -2)
+            return jnp.swapaxes(feats, -1, -2)
         return feats
 
     def assert_zero(self, data, tol: float = 5e-6):
-        norm = float(np.sqrt(np.sum(data**2))) / data.size
+        norm = float(jnp.sqrt(jnp.sum(data**2))) / data.size
         assert norm < tol
 
     # --- Test functions ---
@@ -112,8 +112,8 @@ class _TestSymmetricContraction:
                 e3j_module.apply(params, self._to_layout(feats, self.layout), index),
                 self.layout,
             )
-            gfx = np.einsum("nci,ij->ncj", y, rot_out)
-            feats_rot = np.einsum("nci,ij->ncj", feats, rot_in)
+            gfx = jnp.einsum("nci,ij->ncj", y, rot_out)
+            feats_rot = jnp.einsum("nci,ij->ncj", feats, rot_in)
             fgx = self._to_layout(
                 e3j_module.apply(
                     params, self._to_layout(feats_rot, self.layout), index
@@ -199,10 +199,10 @@ class TestSymmetricContractionGolden:
             y = module.apply(module.init(key, feats, index), feats, index)
 
         assert y.shape == (self.batch_size, self.num_channels, 4)
-        assert_allclose(float(np.sum(y)), 10.716981, atol=1e-3)
-        assert_allclose(float(np.sum(y**2)), 337.169312, atol=1e-2)
+        assert_allclose(float(jnp.sum(y)), 10.716981, atol=1e-3)
+        assert_allclose(float(jnp.sum(y**2)), 337.169312, atol=1e-2)
         assert_allclose(
-            y[0, 0], np.array([0.691399, -0.223694, -0.04847, -0.097783]), atol=1e-4
+            y[0, 0], jnp.array([0.691399, -0.223694, -0.04847, -0.097783]), atol=1e-4
         )
 
 
@@ -227,7 +227,7 @@ class TestSymmetricContraction_1o_0e(_TestSymmetricContraction):
         """The squared norm reaches the output."""
         feats, index = inputs
         y = e3j_module.apply(params, self._to_layout(feats, self.layout), index)
-        assert np.all(np.abs(y) > 0)
+        assert jnp.all(jnp.abs(y) > 0)
 
 
 @pytest.mark.parametrize("source, correlation, out", [("1o", 1, "0e"), ("0e", 2, "1o")])
@@ -437,7 +437,7 @@ class TestSymmetricContractionBatchAxes:
             return lambda x, i: core(x, i, weights)
         module = SymmetricContraction(*args)
         x = random.normal(key, (5, *self.feat_shape(layout)))
-        params = module.init(key, x, np.zeros(5, dtype=int))
+        params = module.init(key, x, jnp.zeros(5, dtype=int))
         return lambda x, i: module.apply(params, x, i)
 
     def feat_shape(self, layout: str) -> tuple[int, int]:
@@ -458,6 +458,6 @@ class TestSymmetricContractionBatchAxes:
         assert_allclose(y, y_flat.reshape(y.shape))
 
     def test_index_shape_mismatch(self, apply, layout):
-        feats = np.ones((2, 5, *self.feat_shape(layout)))
+        feats = jnp.ones((2, 5, *self.feat_shape(layout)))
         with pytest.raises(ValueError, match="do not match the batch axes"):
-            apply(feats, np.zeros(10, dtype=int))
+            apply(feats, jnp.zeros(10, dtype=int))

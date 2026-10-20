@@ -15,11 +15,10 @@
 import os
 from pathlib import Path
 
-import jax.numpy as np
-import numpy
+import jax.numpy as jnp
+import numpy as np
 import numpy.testing as testing
 import pytest
-from jax.experimental import sparse
 
 E3J_OPS_TESTS = Path("tests/test_ops")
 
@@ -52,34 +51,3 @@ def assert_allclose(expect, result, rtol=5e-6, atol=5e-6, debug: int = 1):
             print("expect\n", expect)
             print("result\n", result)
         raise err
-
-
-class InBoundsBCOO(sparse.BCOO):
-    """Subclass BCOO to enforce in-bound checks.
-
-    JAX doesn't do this by itself, and the following is valid:
-
-        >>> coef = np.ones(3)
-        >>> idx = np.array([[0, 1], [2, 3], [20, 42]])
-        >>> matrix = sparse.BCOO((coef, idx), shape=(4, 4))
-        ### This works too
-        >>> matrix.coalesce(), matrix.sort_indices()
-    """
-
-    def __init__(self, data, *, shape):
-        super().__init__(data, shape=shape)
-        # perform additional checks
-        coef, idx = data
-        idx_min = np.min(idx, axis=0)
-        idx_max = np.max(idx, axis=0)
-        bounds = np.array(shape)
-        if not np.prod(idx_min >= 0):
-            raise ValueError(f"Negative indices: {idx_min.tolist()} !>= 0")
-        if not np.prod(idx_max < bounds):
-            raise ValueError(f"Out of bounds: {idx_max.tolist()} !< {shape} ")
-
-
-@pytest.fixture(autouse=True)
-def _mock_BCOO(monkeypatch: pytest.MonkeyPatch):  # noqa: N802
-    """Mock sparse.BCOO with in-bound checks."""
-    monkeypatch.setattr(sparse, "BCOO", InBoundsBCOO)

@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from enum import Enum
+import math
+from dataclasses import dataclass
 from functools import cached_property
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
+import numpy as np
 from jax.experimental import sparse
 
 from e3j.ops import scatter_add_1
@@ -41,42 +42,94 @@ def narrow_index_dtype(shape: tuple[int, ...]) -> np.dtype:
     # NOTE: the value dtype is chosen independently, see `ops.coef.ValDtype`.
     max_dim = max(shape)
     if max_dim <= np.iinfo(np.uint8).max:
-        return np.uint8
-    return np.int32
+        return np.dtype(np.uint8)
+    return np.dtype(np.int32)
 
 
-def sparse_bcoo(
+@dataclass(frozen=True, eq=False)
+class SparseCOO:
+    """Sparse COO array of compile-time constant coefficients.
+
+    Coefficients are held as numpy arrays, so that all manipulations
+    (sorting, composition, packing...) happen on the host at trace time.
+
+    Attributes:
+        data: `(nnz,)` array of non-zero values.
+        indices: `(nnz, ndim)` array of coordinates.
+        shape: dense shape of the array.
+    """
+
+    data: np.ndarray
+    indices: np.ndarray
+    shape: tuple[int, ...]
+
+    @property
+    def nnz(self) -> int:
+        return self.indices.shape[0]
+
+    def todense(self) -> np.ndarray:
+        dense = np.zeros(self.shape, dtype=self.data.dtype)
+        np.add.at(dense, tuple(self.indices.T), self.data)
+        return dense
+
+
+def sparse_coo(
     values: np.ndarray,
     indices: np.ndarray,
     shape: tuple[int, ...],
     coalesce: bool = True,
-) -> sparse.BCOO:
-    """Return a coalesced `sparse.BCOO` array."""
-    with jax.ensure_compile_time_eval():
-        # Widen to int32 for coalescing: BCOO internals (sort_indices,
-        # sum_duplicates) use shape values which may not fit in narrow dtypes.
-        if indices.dtype != np.int32:
-            indices = indices.astype(np.int32)
-        array = sparse.BCOO((values, indices), shape=shape)
-        if coalesce:
-            array = array.sort_indices().sum_duplicates()
-        idx_dtype = narrow_index_dtype(shape)
-        if idx_dtype != array.indices.dtype:
-            array = sparse.BCOO(
-                (array.data, array.indices.astype(idx_dtype)), shape=shape
-            )
-        return array
+) -> SparseCOO:
+    """Return a `SparseCOO` array, coalesced by default.
+
+    Coalescing sorts indices lexicographically, sums duplicate entries and
+    drops the resulting zeros.
+    Indices are narrowed to the smallest supported dtype, see
+    :func:`narrow_index_dtype`.
+    """
+    shape = tuple(int(n) for n in shape)
+    # Match the value dtype JAX would use for these coefficients.
+    values = np.asarray(values)
+    values = values.astype(jax.dtypes.canonicalize_dtype(values.dtype))
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.ndim != 2 or indices.shape[1] != len(shape):
+        raise ValueError(
+            f"Expected indices of shape (nnz, {len(shape)}) for shape {shape}, "
+            f"got {indices.shape}."
+        )
+    if indices.shape[0] != values.shape[0]:
+        raise ValueError(
+            f"Got {values.shape[0]} values for {indices.shape[0]} indices."
+        )
+    if indices.size and ((indices < 0).any() or (indices >= shape).any()):
+        raise ValueError(f"Out of bounds indices for shape {shape}.")
+    if coalesce:
+        first = np.ones(indices.shape[0], dtype=bool)
+        if math.prod(shape) <= np.iinfo(np.intp).max:
+            # Sorting flat keys is much faster than sorting rows, and row-major
+            # raveling preserves the lexicographic order. A stable sort is
+            # fastest here as callers pass mostly sorted indices.
+            keys = np.ravel_multi_index(tuple(indices.T), shape)
+            order = np.argsort(keys, kind="stable")
+            keys = keys[order]
+            np.not_equal(keys[1:], keys[:-1], out=first[1:])
+        else:
+            order = np.lexsort(indices.T[::-1])
+            rows = indices[order]
+            np.any(rows[1:] != rows[:-1], axis=1, out=first[1:])
+        # Sum each run of duplicate indices.
+        summed = np.zeros(np.count_nonzero(first), dtype=values.dtype)
+        np.add.at(summed, np.cumsum(first) - 1, values[order])
+        indices = indices[order[first]]
+        # Drop coefficients cancelling out, as `BCOO.sum_duplicates` does.
+        nonzero = summed != 0
+        indices, values = indices[nonzero], summed[nonzero]
+    return SparseCOO(values, indices.astype(narrow_index_dtype(shape)), shape)
 
 
 class SparseMixin:
     """Properties and methods depending on a `coef` attribute.
 
-    The `coef` attribute can in fact be either of type:
-
-    * `jax.experimental.sparse.BCOO`, or
-
-    * `np.ndarray` : in this case some properties and methods will fail, such as
-      `.aggregate()`, `.nnz`...
+    The `coef` attribute is a :class:`SparseCOO` array of numpy coefficients.
 
     To switch between possible equivalent methods  -- typically,
     a matrix product or scatter-add operation in a final reduction stage,
@@ -86,7 +139,7 @@ class SparseMixin:
     """
 
     @cache
-    def coef(self) -> jax.Array:
+    def coef(self) -> SparseCOO:
         """Compute and cache coefficients."""
         raise NotImplementedError(
             "`SparseMixin` requires `self` to have a `.coef` attribute or (cached) property."
@@ -107,13 +160,12 @@ class SparseMixin:
     @property
     def nnz(self) -> int:
         """Number of non-zero coefficients."""
-        return self.indices.shape[0]
+        return self.coef.nnz
 
     @property
     def nnz_ratio(self) -> float:
         """Density of the coefficient tensor, i.e. `nnz` over its size."""
-        shape = np.array(self.shape)
-        return self.nnz / float(np.prod(shape))
+        return self.nnz / math.prod(self.shape)
 
     @property
     def aggregation_method(self) -> options.Aggregation:
@@ -132,7 +184,7 @@ class SparseMixin:
                 f"{list(options.Aggregation)}"
             ) from err
 
-    @cached_property
+    @property
     def target_matrix(self) -> sparse.BCOO | np.ndarray:
         """
         Return aggregation matrix of shape `(nnz, dim_out)`.
@@ -144,41 +196,38 @@ class SparseMixin:
         -------
         Number of coefficients above each output coordinate::
 
-            >>> num_coefs = jnp.ones(op.nnz) @ op.target_matrix
+            >>> num_coefs = np.ones(op.nnz) @ op.target_matrix
         """
-        with jax.ensure_compile_time_eval():
+        dim_out = self.shape[0]
+        shape = (self.nnz, dim_out)
+        tgt = np.stack(
+            (np.arange(self.nnz, dtype=np.int32), self.indices[:, 0].astype(np.int32)),
+            axis=1,
+        )
+        ones = np.ones(self.nnz, dtype=np.float32)
 
-            dim_out = self.shape[0]
-            shape = (self.nnz, dim_out)
+        if self.aggregation_method == options.Aggregation.DENSE:
+            target_matrix = np.zeros(shape, dtype=np.float32)
+            target_matrix[tgt[:, 0], tgt[:, 1]] = ones
+            return target_matrix
 
-            idx_out = self.indices[:, 0]
-            tgt = np.stack(
-                (
-                    np.arange(self.nnz, dtype=np.int32),
-                    idx_out.astype(np.int32),
-                ),
-                axis=1,
-            )
-            ones = np.ones(self.nnz, dtype=np.float32)
-
-            if self.aggregation_method == options.Aggregation.DENSE:
-                dense_zeros = np.zeros(shape, dtype=np.float32)
-                target_matrix = dense_zeros.at[tgt[:, 0], tgt[:, 1]].add(ones)
-
-            else:
-                target_matrix = sparse_bcoo(ones, tgt, shape=shape)
-
-        return target_matrix
+        # Rows of `tgt` are sorted and unique: no need to coalesce.
+        return sparse.BCOO(
+            (ones, tgt),
+            shape=shape,
+            indices_sorted=True,
+            unique_indices=True,
+        )
 
     def _aggregate_matmul(self, values):
         """Aggregate values on output coordinates using `matmul`.
 
         Args:
-            values (np.ndarray): an array of shape (N, self.nnz),
+            values (jnp.ndarray): an array of shape (N, self.nnz),
                 e.g. the product of CG coefficients with input coordinates.
 
         Returns:
-            np.ndarray: array of shape `(N, target.dim)`.
+            jnp.ndarray: array of shape `(N, target.dim)`.
         """
         return values @ self.target_matrix
 
@@ -186,29 +235,29 @@ class SparseMixin:
         """Aggregate values on output coordinates using `scatter_add`.
 
         Args:
-            values (np.ndarray): an array of shape (N, self.nnz),
+            values (jnp.ndarray): an array of shape (N, self.nnz),
                 e.g. the product of CG coefficients with input coordinates.
 
         Returns:
-            np.ndarray: array of shape `(N, target.dim)`.
+            jnp.ndarray: array of shape `(N, target.dim)`.
         """
         dim_out = self.target.dim
         idx_out = self.indices[:, 0]
         layout = options.Layout.parse(layout)
 
         # jax.lax.scatter_add
-        # Accumulate in `values.dtype`: `np.zeros` defaults to float64 under
+        # Accumulate in `values.dtype`: `jnp.zeros` defaults to float64 under
         # `jax_enable_x64`, promoting the output of a float32 tensor product.
         if self.aggregation_method == options.Aggregation.SCATTER:
             if layout in (options.Layout.E3NN, options.Layout.LEADING_CHANNELS):
-                y_out = np.zeros((*values.shape[:-1], dim_out), dtype=values.dtype)
+                y_out = jnp.zeros((*values.shape[:-1], dim_out), dtype=values.dtype)
                 return y_out.at[..., idx_out].add(
                     values,
                     indices_are_sorted=False,
                     mode="promise_in_bounds",
                 )
             elif layout == options.Layout.TRAILING_CHANNELS:
-                y_out = np.zeros(
+                y_out = jnp.zeros(
                     (*values.shape[:-2], dim_out, values.shape[-1]),
                     dtype=values.dtype,
                 )
@@ -225,19 +274,19 @@ class SparseMixin:
                     "NYI: scatter-reduction kernel with trailing channels"
                 )
             assert values.ndim == 2, "values must be 2D"
-            y_out = np.zeros((values.shape[0], dim_out), dtype=values.dtype)
+            y_out = jnp.zeros((values.shape[0], dim_out), dtype=values.dtype)
             return scatter_add_1(idx_out, values, y_out)
 
     def aggregate(self, values, layout: options.Layout | str = "E3NN"):
         """Aggregate a values-like vector on output coordinates.
 
         Args:
-            values (np.ndarray): a vector of length `self.nnz`, e.g. the
+            values (jnp.ndarray): a vector of length `self.nnz`, e.g. the
                 product of CG coefficients with input coordinates.
             layout: array layout for scatter-based aggregation.
 
         Returns:
-            np.ndarray: a vector of shape `target.dim`.
+            jnp.ndarray: a vector of shape `target.dim`.
         """
         if self.aggregation_method in (
             options.Aggregation.DENSE,

@@ -14,7 +14,7 @@
 
 import jax
 import pytest
-from jax import numpy as np
+from jax import numpy as jnp
 
 from e3j.core.linear import Linear as LinearCore
 
@@ -25,8 +25,8 @@ class TestLinearCoreWeights:
     core = LinearCore("2x0e + 1o + 2e", "0e + 2x1o + 2e", "E3NN")
 
     @property
-    def weights(self) -> list[np.ndarray]:
-        return [np.ones(block.shape) for block in self.core.blocks]
+    def weights(self) -> list[jnp.ndarray]:
+        return [jnp.ones(block.shape) for block in self.core.blocks]
 
     @pytest.mark.parametrize("jit", [False, True])
     @pytest.mark.parametrize("drop", [-1, 0])
@@ -35,14 +35,14 @@ class TestLinearCoreWeights:
         del weights[drop]
         apply = jax.jit(self.core) if jit else self.core
         with pytest.raises(ValueError, match="Expected 3 weights"):
-            apply(np.ones((5, self.core.blocks[-1].end)), weights)
+            apply(jnp.ones((5, self.core.blocks[-1].end)), weights)
 
     def test_extra_weights(self):
         with pytest.raises(ValueError, match="Expected 3 weights"):
-            self.core(np.ones((5, 10)), self.weights + [np.ones((1, 1))])
+            self.core(jnp.ones((5, 10)), self.weights + [jnp.ones((1, 1))])
 
     def test_misshapen_weight(self):
         weights = self.weights
         weights[1] = weights[1].T
         with pytest.raises(ValueError, match=r"Weight 1 has shape \(1, 2\)"):
-            self.core(np.ones((5, 10)), weights)
+            self.core(jnp.ones((5, 10)), weights)

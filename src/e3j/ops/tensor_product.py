@@ -133,42 +133,41 @@ def tensor_product(
 
     # Balance coefficients across blockDim.y, in a single pass.
     # LEADING_CHANNELS takes an empty `coef_ranges`.
-    with jax.ensure_compile_time_eval():
-        if layout is Layout.TRAILING_CHANNELS:
-            c = Coef.unpack(coef, val_dtype=x.dtype)
-            num_coef = int(c.idx.shape[0])
-            out_idx = [np.asarray(c.idx[:, 0])]
-            channels_for_threads = (
-                channels_x * channels_y if mode.name == "OUTER" else channels_x
-            )
-            # Shared memory at blockDim.y = 1: [coef | x | y], with INNER scratch.
-            val_bytes = np.dtype(c.val_dtype).itemsize
-            threads_x, N = launch_threads_x(channels_for_threads)
-            extra = 0
-            if mode.name == "INNER":
-                extra = val_bytes * num_out * (1 + (channels_x - 1) // (32 * N))
-            smem = estimate_smem_bytes(
-                [
-                    min(threads_x * N, channels_x) * x.shape[1],
-                    min(threads_x * N, channels_y) * y.shape[1],
-                ],
-                num_coef,
-                c.dtype.itemsize,
-                val_bytes=val_bytes,
-                extra_bytes=extra,
-            )
-            block_y = choose_block_y(
-                out_idx,
-                num_coef,
-                channels_for_threads,
-                max_block_size=256,
-                smem_bytes=smem,
-            )
-            (perm,), ranges = balance_coef_ranges(out_idx, num_coef, block_y)
-            coef = coef[perm]
-            coef_ranges = jnp.asarray(ranges)
-        else:
-            coef_ranges = jnp.zeros((0,), jnp.int32)
+    if layout is Layout.TRAILING_CHANNELS:
+        c = Coef.unpack(coef, val_dtype=x.dtype)
+        num_coef = int(c.idx.shape[0])
+        out_idx = [c.idx[:, 0]]
+        channels_for_threads = (
+            channels_x * channels_y if mode.name == "OUTER" else channels_x
+        )
+        # Shared memory at blockDim.y = 1: [coef | x | y], with INNER scratch.
+        val_bytes = np.dtype(c.val_dtype).itemsize
+        threads_x, N = launch_threads_x(channels_for_threads)
+        extra = 0
+        if mode.name == "INNER":
+            extra = val_bytes * num_out * (1 + (channels_x - 1) // (32 * N))
+        smem = estimate_smem_bytes(
+            [
+                min(threads_x * N, channels_x) * x.shape[1],
+                min(threads_x * N, channels_y) * y.shape[1],
+            ],
+            num_coef,
+            c.dtype.itemsize,
+            val_bytes=val_bytes,
+            extra_bytes=extra,
+        )
+        block_y = choose_block_y(
+            out_idx,
+            num_coef,
+            channels_for_threads,
+            max_block_size=256,
+            smem_bytes=smem,
+        )
+        (perm,), ranges = balance_coef_ranges(out_idx, num_coef, block_y)
+        coef = np.asarray(coef)[perm]
+        coef_ranges = ranges
+    else:
+        coef_ranges = np.zeros((0,), np.int32)
 
     # We need to redefine a functions for vmap because
     # custom_vmap doesn't support static arguments.
@@ -277,7 +276,7 @@ def _zero_gap_rows(grad: Array, written: np.ndarray, layout: Layout) -> Array:
     gaps = sorted(set(range(n_coords)) - set(written.flat))
     if not gaps:
         return grad
-    g = jnp.asarray(gaps)
+    g = np.asarray(gaps)
     return (grad.at[..., g, :] if channels_trail else grad.at[..., g]).set(0.0)
 
 
@@ -331,60 +330,59 @@ def tensor_product_bwd(
     # Prepare transposed indices and concatenate two backward arrays.
     # coef_xzy / coef_yzx are the dx / dy passes; their column 0 (the output
     # index) is the set of coordinates each pass writes -- used to zero gaps.
-    with jax.ensure_compile_time_eval():
-        c = Coef.unpack(coef, val_dtype=x.dtype)
-        coef_xzy = c.transpose((1, 0, 2))
-        coef_yzx = c.transpose((2, 0, 1))
-        written_x = np.asarray(coef_xzy.idx[:, 0])
-        written_y = np.asarray(coef_yzx.idx[:, 0])
+    c = Coef.unpack(coef, val_dtype=x.dtype)
+    coef_xzy = c.transpose((1, 0, 2))
+    coef_yzx = c.transpose((2, 0, 1))
+    written_x = coef_xzy.idx[:, 0]
+    written_y = coef_yzx.idx[:, 0]
 
-        # Balance the dx, dy passes independently, as a barrier separates them.
-        num_coef = int(coef_xzy.idx.shape[0])
-        passes = [written_x, written_y]
-        channels_for_threads = (
-            channels_x * channels_y if mode == MixingMode.OUTER else channels_x
-        )
-        if mode == MixingMode.OUTER:
-            channels_out = channels_x * channels_y
-        elif mode == MixingMode.INNER:
-            channels_out = 1
-        else:
-            channels_out = channels_x
-        # Shared memory at blockDim.y = 1: [z | x | y].
-        val_bytes = np.dtype(coef_xzy.val_dtype).itemsize
-        threads_x, N = launch_threads_x(channels_for_threads)
-        # Cross-warp reduction scratch of the INNER backward pass.
-        extra = 0
-        if mode == MixingMode.OUTER and channels_x == 1:
-            extra = val_bytes * x.shape[1] * (1 + (channels_y - 1) // (32 * N))
-        elif mode == MixingMode.OUTER and channels_y == 1:
-            extra = val_bytes * y.shape[1] * (1 + (channels_x - 1) // (32 * N))
-        smem = estimate_smem_bytes(
-            [
-                min(threads_x * N, channels_out) * ct_z.shape[1],
-                min(threads_x * N, channels_x) * x.shape[1],
-                min(threads_x * N, channels_y) * y.shape[1],
-            ],
-            2 * num_coef,
-            coef_xzy.dtype.itemsize,
-            val_bytes=val_bytes,
-            extra_bytes=extra,
-        )
-        block_y = choose_block_y(
-            passes,
-            num_coef,
-            channels_for_threads,
-            max_block_size=256,
-            smem_bytes=smem,
-            barrier_between_passes=True,
-        )
-        perms, ranges = balance_coef_ranges(
-            passes, num_coef, block_y, barrier_between_passes=True
-        )
-        coef_bwd = jnp.stack(
-            [arr.pack_jax()[perm] for arr, perm in zip((coef_xzy, coef_yzx), perms)]
-        )
-        coef_ranges = jnp.asarray(ranges)
+    # Balance the dx, dy passes independently, as a barrier separates them.
+    num_coef = int(coef_xzy.idx.shape[0])
+    passes = [written_x, written_y]
+    channels_for_threads = (
+        channels_x * channels_y if mode == MixingMode.OUTER else channels_x
+    )
+    if mode == MixingMode.OUTER:
+        channels_out = channels_x * channels_y
+    elif mode == MixingMode.INNER:
+        channels_out = 1
+    else:
+        channels_out = channels_x
+    # Shared memory at blockDim.y = 1: [z | x | y].
+    val_bytes = np.dtype(coef_xzy.val_dtype).itemsize
+    threads_x, N = launch_threads_x(channels_for_threads)
+    # Cross-warp reduction scratch of the INNER backward pass.
+    extra = 0
+    if mode == MixingMode.OUTER and channels_x == 1:
+        extra = val_bytes * x.shape[1] * (1 + (channels_y - 1) // (32 * N))
+    elif mode == MixingMode.OUTER and channels_y == 1:
+        extra = val_bytes * y.shape[1] * (1 + (channels_x - 1) // (32 * N))
+    smem = estimate_smem_bytes(
+        [
+            min(threads_x * N, channels_out) * ct_z.shape[1],
+            min(threads_x * N, channels_x) * x.shape[1],
+            min(threads_x * N, channels_y) * y.shape[1],
+        ],
+        2 * num_coef,
+        coef_xzy.dtype.itemsize,
+        val_bytes=val_bytes,
+        extra_bytes=extra,
+    )
+    block_y = choose_block_y(
+        passes,
+        num_coef,
+        channels_for_threads,
+        max_block_size=256,
+        smem_bytes=smem,
+        barrier_between_passes=True,
+    )
+    perms, ranges = balance_coef_ranges(
+        passes, num_coef, block_y, barrier_between_passes=True
+    )
+    coef_bwd = np.stack(
+        [arr.pack()[perm] for arr, perm in zip((coef_xzy, coef_yzx), perms)]
+    )
+    coef_ranges = ranges
 
     @jax.custom_batching.custom_vmap
     def _tensor_product_bwd_impl(coef_bwd, x, y, ct_z, coef_ranges):
@@ -515,7 +513,6 @@ def _tensor_product_bwd_fallback(coef, params, res, ct_z):
     has_cx, has_cy = x.ndim > 2, y.ndim > 2
 
     mode = MixingMode.parse(params.mode)
-    # with jax.ensure_compile_time_eval():
     if mode.name == "OUTER" and has_cx and has_cy:
         raise NotImplementedError(
             "Cannot backpropagate through 'OUTER' tensor product "
@@ -549,11 +546,10 @@ def _tensor_product_bwd_fallback(coef, params, res, ct_z):
     #       have channels, i.e. mode "(u, 1) -> u", permutation of operands
     #       should both put the output cotangent first. Circular permutations
     #       yield less supported mode "(1, u) -> 1".
-    with jax.ensure_compile_time_eval():
-        # Unpack to permute indices for transposed tensor products
-        c = Coef.unpack(coef, val_dtype=x.dtype)
-        coef_x = c.transpose((1, 0, 2)).pack_jax()
-        coef_y = c.transpose((2, 0, 1)).pack_jax()
+    # Unpack to permute indices for transposed tensor products
+    c = Coef.unpack(coef, val_dtype=x.dtype)
+    coef_x = c.transpose((1, 0, 2)).pack()
+    coef_y = c.transpose((2, 0, 1)).pack()
 
     layout = Layout.parse(params.layout)
     if layout is Layout.LEADING_CHANNELS:
@@ -587,7 +583,7 @@ def _tensor_product_bwd_bwd(coef, params, res, ct_xy):
     Ddx, Ddy = ct_xy
     x, y, dz = res
     # Input cotangents on x, y
-    (Dx, Dy) = tensor_product_bwd(coef, Ddx, Ddy, dz, params)
+    Dx, Dy = tensor_product_bwd(coef, Ddx, Ddy, dz, params)
     # Second-order cotangents on z
     Ddz = tensor_product(coef, x, Ddy, params) + tensor_product(coef, Ddx, y, params)
     # Inputs of tensor_product_bwd() were (x, y, dz):

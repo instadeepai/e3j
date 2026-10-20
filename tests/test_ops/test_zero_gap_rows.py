@@ -26,7 +26,7 @@ contain uninitialized memory (NaN) and the gradient diverges from reference.
 """
 
 import jax
-import jax.numpy as np
+import jax.numpy as jnp
 import jax.random as random
 import numpy.testing as testing
 
@@ -60,24 +60,24 @@ def tensor_product_reference(
 ):
     """Reference tensor_product (pure scatter-add; naturally zeros gap rows)."""
     if layout == "TRAILING_CHANNELS":
-        x_t = x if x.ndim < 3 else np.matrix_transpose(x)
-        y_t = y if y.ndim < 3 else np.matrix_transpose(y)
+        x_t = x if x.ndim < 3 else jnp.matrix_transpose(x)
+        y_t = y if y.ndim < 3 else jnp.matrix_transpose(y)
         z_t = tensor_product_reference(idx, coef, x_t, y_t, num_out, mode)
-        return z_t if z_t.ndim < 3 else np.matrix_transpose(z_t)
+        return z_t if z_t.ndim < 3 else jnp.matrix_transpose(z_t)
 
     n_rows = x.shape[0]
     if mode == "MAP":
-        out = np.zeros((n_rows, x.shape[1], num_out), dtype=x.dtype)
+        out = jnp.zeros((n_rows, x.shape[1], num_out), dtype=x.dtype)
         return out.at[..., idx[0]].add(coef * x[..., idx[1]] * y[..., idx[2]])
     if mode == "OUTER":
         has_cx, has_cy = x.ndim > 2, y.ndim > 2
         if not (has_cx or has_cy):
-            out = np.zeros((n_rows, num_out), dtype=x.dtype)
+            out = jnp.zeros((n_rows, num_out), dtype=x.dtype)
         elif has_cx:
-            out = np.zeros((n_rows, x.shape[1], num_out), dtype=x.dtype)
+            out = jnp.zeros((n_rows, x.shape[1], num_out), dtype=x.dtype)
             y = y[:, None]
         else:
-            out = np.zeros((n_rows, y.shape[1], num_out), dtype=x.dtype)
+            out = jnp.zeros((n_rows, y.shape[1], num_out), dtype=x.dtype)
             x = x[:, None]
         return out.at[..., idx[0]].add(coef * x[..., idx[1]] * y[..., idx[2]])
 
@@ -104,7 +104,7 @@ class _TestGapRows:
         with e3j.config.use(tensor_product="FUSED_CUDA"):
             tp = CoreTP((IN1, IN2), "0e", sort=True, layout=self.layout, mode=self.mode)
         coef = tp.coef
-        idx = np.array(coef.indices).T  # (3, nnz)
+        idx = jnp.array(coef.indices).T  # (3, nnz)
         val = coef.data
         kwargs = {"num_out": tp.target.dim, "mode": self.mode, "layout": self.layout}
         return idx, val, kwargs
@@ -124,14 +124,14 @@ class _TestGapRows:
     @property
     def bwd_ref(self):
         return jax.grad(
-            lambda x, y: np.sum(self.fwd_ref(x, y)),
+            lambda x, y: jnp.sum(self.fwd_ref(x, y)),
             argnums=(0, 1),
         )
 
     @property
     def bwd_op(self):
         return jax.grad(
-            lambda x, y: np.sum(self.fwd_op(x, y)),
+            lambda x, y: jnp.sum(self.fwd_op(x, y)),
             argnums=(0, 1),
         )
 
