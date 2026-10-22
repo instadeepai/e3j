@@ -26,7 +26,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from e3j.pallas_ops.convolution.mosaic_tpu import padding
+from e3j.pallas_ops.convolution.mosaic_tpu import edges, padding
 from e3j.pallas_ops.convolution.mosaic_tpu.common import (
     FlushBuffers,
     WalkScratch,
@@ -69,7 +69,7 @@ class _FwdOperands(NamedTuple):
 
     x: jax.Array  # (n_nodes, x_dim, channels)
     y: jax.Array  # (y_dim, n_edge_blocks, edge_block_size)
-    edge_scalars: jax.Array  # (num_irrep_blocks, n_edges, channels)
+    edge_scalars: jax.Array  # (num_irrep_blocks, n_edges, channels), or edge-major
     senders: jax.Array  # (n_edge_blocks, edge_block_size)
     receivers: jax.Array  # (n_edge_blocks, edge_block_size)
     zeros_out: jax.Array  # (n_nodes, out_dim, channels): zero-init, shared by cores
@@ -99,6 +99,8 @@ class _FwdConstants(NamedTuple):
     tp_plan: tuple  # see _plan_scalings
     irrep_block_of_output: tuple  # zi -> edge-scalar block
     dynamic_edges: bool  # walk only the blocks holding a real edge
+    edge_major: bool  # edge scalars layout, see edges.edge_scalars_edge_major
+    n_edges: int  # edge scalars rows; the last block reads past them
 
 
 _MIN_EDGE_BLOCK_SIZE = 64  # measured: this kernel prefers fewer passes at equal area
@@ -234,10 +236,10 @@ class _MessagePassingFwdKernel:
     - `senders` / `receivers`: `(n_edges,)`.
     - `out`: `(n_nodes, out_dim, channels)`.
 
-    `channels` is padded up to `num_lanes` unless it already divides it, `y_dim` to a
-    `num_sublanes` multiple, and the edge axis to a whole number of
-    `edge_block_size * num_cores` tiles (padded edges repeat the last receiver so no
-    extra group is created); the padding is sliced off the result.
+    `channels` is padded up to `num_lanes` unless it already divides it and `y_dim` to a
+    `num_sublanes` multiple. `y` and the indices are padded to whole `edge_block_size`
+    tiles (padded edges repeat the last receiver so no extra group is created); the
+    edge scalars are not (see `edges`). The padding is sliced off the result.
 
     Algorithm
     ----------
@@ -293,9 +295,11 @@ class _MessagePassingFwdKernel:
         n_edges, y_dim = y.shape
         y = jnp.transpose(y, (1, 0))  # (y_dim, n_edges)
         _, num_irrep_blocks, _ = edge_scalars.shape
-        edge_scalars = jnp.transpose(
-            edge_scalars, (1, 0, 2)
-        )  # (num_irrep_blocks, n_edges, channels)
+        edge_major = edges.edge_scalars_edge_major(num_irrep_blocks, channels)
+        if not edge_major:
+            edge_scalars = jnp.transpose(
+                edge_scalars, (1, 0, 2)
+            )  # (num_irrep_blocks, n_edges, channels)
         out_dim = params.z_space.dim
 
         channels_padded = (
@@ -338,13 +342,15 @@ class _MessagePassingFwdKernel:
         edge_block_size = plan.edge_block_size
         assert edge_block_size % chunk == 0
 
-        # Pad the edge axis to a whole number of blocks;
-        # padded edges repeat the last receiver so no extra group is created.
-        n_edges_padded = round_up(n_edges, edge_block_size * num_cores)
+        edge_scalars = edges.pad_to_one_block(
+            edge_scalars, 0 if edge_major else 1, edge_block_size
+        )
+        # Pad y and the indices to whole blocks; the edge scalars stay ragged.
+        # Padded edges repeat the last receiver so no extra group is created.
+        n_edges_padded = round_up(n_edges, edge_block_size)
         pad_e = n_edges_padded - n_edges
         if pad_e > 0:
             y = jnp.pad(y, (no_pad, (0, pad_e)))
-            edge_scalars = jnp.pad(edge_scalars, (no_pad, (0, pad_e), no_pad))
             senders = jnp.pad(senders, (0, pad_e))
             last_r = receivers[-1]
             receivers = jnp.concatenate(
@@ -414,6 +420,8 @@ class _MessagePassingFwdKernel:
             tp_plan=tp_plan,
             irrep_block_of_output=irrep_block_of_output,
             dynamic_edges=dynamic_edges,
+            edge_major=edge_major,
+            n_edges=max(n_edges, edge_block_size),
         )
         return ops, constants
 
@@ -435,13 +443,13 @@ class _MessagePassingFwdKernel:
                     block_shape=(c.y_dim_padded, 1, c.plan.edge_block_size),
                     index_map=lambda i: (0, walked_block(i), 0),
                 ),
-                pl.BlockSpec(
-                    block_shape=(
-                        c.num_irrep_blocks,
-                        c.plan.edge_block_size,
-                        c.plan.channel_block,
-                    ),
-                    index_map=lambda i, s=stride: (0, walked_block(i), s),
+                edges.edge_scalars_spec(
+                    c.edge_major,
+                    c.plan.edge_block_size,
+                    c.num_irrep_blocks,
+                    c.plan.channel_block,
+                    walked_block,
+                    stride,
                 ),
                 pl.BlockSpec(
                     block_shape=(1, c.plan.edge_block_size),
@@ -536,6 +544,19 @@ class _MessagePassingFwdKernel:
                 ):
                     step = step_smem[0]
                     slot = step % 2
+                    edge_block = edges.walked_edge_block(
+                        core_id,
+                        step,
+                        n_walked_blocks_smem[0] if c.dynamic_edges else c.n_edge_blocks,
+                        c.num_cores,
+                        block_order_smem if c.dynamic_edges else None,
+                    )
+
+                    def edge_scalar_tile(block):
+                        tile = edges.load_edge_scalars(
+                            c.edge_major, edge_scalars_vmem, block
+                        )
+                        return edges.mask_ragged_rows(tile, edge_block, c.n_edges)
 
                     # ---- 0. Load the needed sender node features ----
                     # this block's were prefetched by the previous step
@@ -594,7 +615,7 @@ class _MessagePassingFwdKernel:
                                     partial = z_scale * partial
                                 tp_acc = partial if tp_acc is None else tp_acc + partial
                             block = c.irrep_block_of_output[zi]
-                            message_by_zi[zi] = tp_acc * edge_scalars_vmem[block, :, :]
+                            message_by_zi[zi] = tp_acc * edge_scalar_tile(block)
 
                     # ---- 2. Chunked scatter to receivers ----
                     row_idx = jax.lax.broadcasted_iota(

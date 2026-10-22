@@ -246,6 +246,27 @@ def test_backward_cotangents_match(x_ir, y_ir, o_ir, channels):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
 
 
+@pytest.mark.parametrize("n_nodes", [2, 3])  # 2 and 6 edges: less than one edge block
+@pytest.mark.parametrize(
+    "x_ir, y_ir, o_ir, channels",
+    [
+        _case("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e", 256),  # NequIP's first layer
+        _case("0e + 1o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128),
+    ],
+)
+def test_graph_smaller_than_an_edge_block(x_ir, y_ir, o_ir, channels, n_nodes):
+    k = _kernels(x_ir, y_ir, o_ir)
+    inputs = _contract_valid_inputs(k.conv, n_nodes=n_nodes, channels=channels)
+
+    out = k.unfused(*inputs)
+    assert _rel(k.fused(*inputs), out) < RTOL
+    ct = jnp.asarray(np.random.default_rng(1).standard_normal(out.shape), jnp.float32)
+    df = k.fused_vjp(*inputs, ct)
+    du = k.unfused_vjp(*inputs, ct)
+    for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), df, du):
+        assert _rel(a, b) < RTOL, f"{name} mismatch"
+
+
 @SLOW
 @pytest.mark.parametrize("x_ir, y_ir, o_ir, channels", BWD_CASES)
 def test_force_training_double_backward(x_ir, y_ir, o_ir, channels):
@@ -696,3 +717,79 @@ def test_backward_channel_strides_match_unfused(channel_block):
         assert (
             _rel(got, want) < RTOL
         ), f"{name} mismatch at channel_block={channel_block}"
+
+
+def _ragged_params(conv, fwd_edge_block_size, bwd_edge_block_size):
+    coef = conv._otimes.coef
+    return PallasMosaicTPUMessagePassingConvolutionParams(
+        indices=np.array(coef.indices),
+        values=np.array(coef.data),
+        layout=options.Layout.TRAILING_CHANNELS,
+        x_space=O3Space(str(conv._otimes.source[0])),
+        y_space=O3Space(str(conv._otimes.source[1])),
+        z_space=O3Space(str(conv._otimes.target)),
+        fwd_config=PallasMosaicTPUMessagePassingConvolutionFwdConfig(
+            edge_block_size=fwd_edge_block_size, assume_receiver_sorted=True
+        ),
+        bwd_config=PallasMosaicTPUMessagePassingConvolutionBwdConfig(
+            edge_block_size=bwd_edge_block_size, assume_sender_sorted=True
+        ),
+    )
+
+
+# 18 nodes: 306 edges, so every tile size leaves a partial last block, and the
+# 3 / 5 / 10 blocks split unevenly over a megacore's two cores.
+@pytest.mark.parametrize("n_pad", [0, 3, 8], ids=["static", "dynamic", "dynamic_tail"])
+@pytest.mark.parametrize("bwd_edge_block_size", [128, 64, 32])
+@pytest.mark.parametrize(
+    "x_ir, y_ir, o_ir, channels",
+    [
+        _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 128),  # 11 blocks
+        _case("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128),  # 4: edge-major
+        _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 32),  # packed
+    ],
+)
+def test_ragged_last_edge_block(x_ir, y_ir, o_ir, channels, bwd_edge_block_size, n_pad):
+    """Graphs of several edge blocks with a partial last one: the stale rows past
+    the last edge must not reach the output or the cotangents, with or without
+    dummy edges (`n_pad` padding nodes; 8 leave the last block all dummy)."""
+    n_real = 18
+    k = _kernels(x_ir, y_ir, o_ir)
+    node, sph, es, senders, receivers = _contract_valid_inputs(
+        k.conv, n_nodes=n_real, channels=channels
+    )
+    params = _ragged_params(k.conv, 64, bwd_edge_block_size)
+    rng = np.random.default_rng(1)
+
+    def junk(shape):
+        return jnp.asarray(rng.standard_normal(shape), jnp.float32)
+
+    dummy = [(i, j) for i in range(n_real, n_real + n_pad) for j in range(n_pad)]
+    padded = (
+        jnp.concatenate([node, junk((n_pad, *node.shape[1:]))]),
+        jnp.concatenate([sph, junk((len(dummy), sph.shape[1]))]),
+        jnp.concatenate([es, junk((len(dummy), *es.shape[1:]))]),
+    )
+    marked = GraphCSR.mask_edges(
+        jnp.concatenate([senders, jnp.asarray([s for s, _ in dummy], jnp.int32)]),
+        jnp.concatenate([receivers, jnp.asarray([r for _, r in dummy], jnp.int32)]),
+        jnp.arange(n_real + n_pad) < n_real,
+    )
+
+    def fused(n, s, e):
+        return convolution_mosaic_tpu(
+            n, s, e, *marked, params, has_dummy_edges=n_pad > 0
+        )
+
+    out = k.unfused(node, sph, es, senders, receivers)
+    got, vjp = jax.vjp(fused, *padded)
+    assert _rel(got[:n_real], out) < RTOL
+    ct = junk(got.shape)
+    df = vjp(ct)
+    du = k.unfused_vjp(node, sph, es, senders, receivers, ct[:n_real])
+    n_edges = sph.shape[0]
+    for name, a, b, n_kept in zip(
+        ("d_node_feats", "d_sph", "d_edge_scalars"), df, du, (n_real, n_edges, n_edges)
+    ):
+        assert _rel(a[:n_kept], b) < RTOL, f"{name} mismatch"
+        np.testing.assert_array_equal(np.asarray(a[n_kept:]), 0.0, err_msg=name)
