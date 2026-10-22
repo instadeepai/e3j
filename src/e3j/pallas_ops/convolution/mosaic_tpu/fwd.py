@@ -569,10 +569,6 @@ class _MessagePassingFwdKernel:
 
                         for copy in gathers(lambda k: senders_smem[0, k], slot):
                             copy.wait()
-                        for copy in gathers(
-                            lambda k: next_senders_smem[0, k], 1 - slot
-                        ):
-                            copy.start()
                         step_smem[0] = step + 1
 
                     # ---- 1. Tensor product + scalar mixing ----
@@ -616,6 +612,10 @@ class _MessagePassingFwdKernel:
                                 tp_acc = partial if tp_acc is None else tp_acc + partial
                             block = c.irrep_block_of_output[zi]
                             message_by_zi[zi] = tp_acc * edge_scalar_tile(block)
+
+                    # prefetch after the TP so the DMA descriptors co-issue with it
+                    for copy in gathers(lambda k: next_senders_smem[0, k], 1 - slot):
+                        copy.start()
 
                     # ---- 2. Chunked scatter to receivers ----
                     row_idx = jax.lax.broadcasted_iota(
