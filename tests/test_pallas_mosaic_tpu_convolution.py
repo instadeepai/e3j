@@ -68,6 +68,8 @@ CASES = [
     _case("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128, SLOW),
     _case("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 32, SLOW),
     _case("0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 256, SLOW),
+    # scalar sender features (the fwd's segment matmul)
+    _case("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128),
 ]
 
 # The per-edge gradient relationships are checked on fewer cases for speed.
@@ -265,6 +267,16 @@ def test_graph_smaller_than_an_edge_block(x_ir, y_ir, o_ir, channels, n_nodes):
     du = k.unfused_vjp(*inputs, ct)
     for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), df, du):
         assert _rel(a, b) < RTOL, f"{name} mismatch"
+
+
+def test_non_finite_edge_stays_on_its_receiver():
+    """An inf edge scalar leaves one node non-finite and none NaN, as the walk does."""
+    k = _kernels("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o")
+    node, sph, es, senders, receivers = _contract_valid_inputs(k.conv, 32, 128)
+    got = np.asarray(k.fused(node, sph, es.at[500].set(jnp.inf), senders, receivers))
+
+    assert not np.isnan(got).any()
+    assert (~np.isfinite(got).all(axis=(1, 2))).sum() == 1
 
 
 @SLOW

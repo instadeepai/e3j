@@ -199,7 +199,7 @@ def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
         flush_count_smem=pltpu.SMEM((1,), jnp.int32),
         gather_semaphore=pltpu.SemaphoreType.DMA,
         stage_semaphore=pltpu.SemaphoreType.DMA,
-        flush_semaphore=pltpu.SemaphoreType.DMA,
+        flush_semaphore=pltpu.SemaphoreType.DMA((1,)),
     )
 
 
@@ -671,7 +671,7 @@ class _MessagePassingBwdKernel:
                 flush_count_smem[0] = jnp.int32(0)
 
                 # per-sender-group dx reduce + async DMA out (double-buffered).
-                flush_one, drain_flush = make_group_flush(
+                flush_one, _, drain_flush = make_group_flush(
                     FlushBuffers(
                         dst_hbm=dx_hbm,
                         stage_vmem=flush_stage,

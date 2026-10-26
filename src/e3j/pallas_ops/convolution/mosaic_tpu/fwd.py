@@ -32,6 +32,7 @@ from e3j.pallas_ops.convolution.mosaic_tpu.common import (
     WalkScratch,
     make_group_flush,
     sorted_reduce_and_flush,
+    sum_rows,
 )
 from e3j.pallas_ops.convolution.mosaic_tpu.params import (
     PallasMosaicTPUMessagePassingConvolutionParams,
@@ -46,6 +47,24 @@ from e3j.pallas_ops.utils.mosaic_tpu import (
 from e3j.pallas_ops.utils.named_scope import named_scope
 
 
+def _split3(v: jax.Array) -> list[jax.Array]:
+    """`v` as hi + mid + lo f32 parts; hi and mid are exactly bf16 values."""
+    parts = []
+    for _ in range(2):
+        bits = jax.lax.bitcast_convert_type(v, jnp.uint32) & jnp.uint32(0xFFFF0000)
+        part = jax.lax.bitcast_convert_type(bits, jnp.float32)
+        parts.append(part)
+        v = v - part
+    return parts + [v]
+
+
+def _dot_exact(a: jax.Array, b: jax.Array) -> jax.Array:
+    """One bf16 MXU pass: exact when `a` and `b` hold bf16 values."""
+    return jnp.dot(
+        a, b, precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.float32
+    )
+
+
 class FwdScratch(NamedTuple):
     x_stage_vmem: (
         pl.MemoryRef
@@ -53,15 +72,19 @@ class FwdScratch(NamedTuple):
     accumulator_vmem: (
         pl.MemoryRef
     )  # (out_dim, chunk, channels): open-group sublane partials
-    stage_vmem: pl.MemoryRef  # (1, out_dim, channels): flush staging
+    stage_vmem: pl.MemoryRef  # (flush_slots, out_dim, channels): flush staging ring
+    segment_vmem: (
+        pl.MemoryRef
+    )  # (out_dim * chunk, channels): per-group sums, row zi*chunk+g
+    open_vmem: pl.MemoryRef  # (out_dim, channels): segment_matmul's open group
     current_receiver_smem: pl.MemoryRef  # (1,) i32: open receiver group
     mask_smem: pl.MemoryRef  # (1,) i32: remaining-transitions bitmask
     previous_position_smem: pl.MemoryRef  # (1,) i32: current segment start within chunk
-    flush_pending_smem: pl.MemoryRef  # (1,) i32: async flush in flight?
+    flush_pending_smem: pl.MemoryRef  # (flush_slots,) i32: async flush in flight?
     flush_count_smem: pl.MemoryRef  # (1,) i32: flushes done (first one is a partial)
     step_smem: pl.MemoryRef  # (1,) i32: pipeline steps run, selects the x_stage slot
     gather_semaphore: pltpu.SemaphoreType  # (2,) DMA semaphores, one per x_stage slot
-    flush_semaphore: pltpu.SemaphoreType  # DMA semaphore for the async flush
+    flush_semaphore: pltpu.SemaphoreType  # DMA semaphores for the async flush
 
 
 class _FwdOperands(NamedTuple):
@@ -101,6 +124,8 @@ class _FwdConstants(NamedTuple):
     dynamic_edges: bool  # walk only the blocks holding a real edge
     edge_major: bool  # edge scalars layout, see edges.edge_scalars_edge_major
     n_edges: int  # edge scalars rows; the last block reads past them
+    segment_matmul: bool  # x_dim == 1: TP + receiver reduce as one MXU dot per block
+    flush_slots: int  # staging rows in flight: segment_matmul flushes back to back
 
 
 _MIN_EDGE_BLOCK_SIZE = 64  # measured: this kernel prefers fewer passes at equal area
@@ -187,16 +212,21 @@ def _scratch_shapes(c: _FwdConstants) -> FwdScratch:
         c.plan.edge_block_size,
         c.plan.channel_block,
     )
+    scratch["stage_vmem"] = (c.flush_slots, *scratch["stage_vmem"][1:])
     return FwdScratch(
         **{name: pltpu.VMEM(shape, c.dtype) for name, shape in scratch.items()},
+        segment_vmem=pltpu.VMEM(
+            (c.out_dim_padded * c.chunk, c.plan.channel_block), c.dtype
+        ),
+        open_vmem=pltpu.VMEM((c.out_dim_padded, c.plan.channel_block), c.dtype),
         current_receiver_smem=pltpu.SMEM((1,), jnp.int32),
         mask_smem=pltpu.SMEM((1,), jnp.int32),
         previous_position_smem=pltpu.SMEM((1,), jnp.int32),
-        flush_pending_smem=pltpu.SMEM((1,), jnp.int32),
+        flush_pending_smem=pltpu.SMEM((c.flush_slots,), jnp.int32),
         flush_count_smem=pltpu.SMEM((1,), jnp.int32),
         step_smem=pltpu.SMEM((1,), jnp.int32),
         gather_semaphore=pltpu.SemaphoreType.DMA((2,)),
-        flush_semaphore=pltpu.SemaphoreType.DMA,
+        flush_semaphore=pltpu.SemaphoreType.DMA((c.flush_slots,)),
     )
 
 
@@ -392,6 +422,7 @@ class _MessagePassingFwdKernel:
             n_walked_blocks = np.int32(n_edge_blocks)
         n_walked_blocks = jnp.reshape(n_walked_blocks.astype(jnp.int32), (1,))
 
+        segment_matmul = x_dim == 1 and plan.channel_block == num_lanes
         ops = _FwdOperands(
             x,
             y,
@@ -422,6 +453,8 @@ class _MessagePassingFwdKernel:
             dynamic_edges=dynamic_edges,
             edge_major=edge_major,
             n_edges=max(n_edges, edge_block_size),
+            segment_matmul=segment_matmul,
+            flush_slots=chunk if segment_matmul else 1,
         )
         return ops, constants
 
@@ -431,7 +464,7 @@ class _MessagePassingFwdKernel:
         def _pipeline_in_specs(
             c: _FwdConstants, block_order_smem, n_walked_blocks_smem, stride: int
         ) -> list[pl.BlockSpec]:
-            """emit_pipeline in_specs for (y, edge_scalars, senders, receivers, next senders)."""
+            """emit_pipeline in_specs for (y, edge_scalars, senders, receivers, next senders[, receivers])."""
             walked_block = (
                 (lambda i: block_order_smem[i]) if c.dynamic_edges else (lambda i: i)
             )
@@ -469,7 +502,16 @@ class _MessagePassingFwdKernel:
                     ),
                     memory_space=pltpu.SMEM,
                 ),
-            ]
+            ] + (
+                [
+                    pl.BlockSpec(
+                        block_shape=(1, c.plan.edge_block_size),
+                        index_map=lambda i: (walked_block(i), 0),
+                    )
+                ]
+                if c.segment_matmul
+                else []
+            )
 
         def kernel(
             x_hbm,  # (n_nodes, x_dim, channels)
@@ -488,6 +530,8 @@ class _MessagePassingFwdKernel:
             x_stage_vmem,
             accumulator_vmem,
             stage_vmem,
+            segment_vmem,
+            open_vmem,
             current_receiver_smem,
             mask_smem,
             previous_position_smem,
@@ -504,14 +548,17 @@ class _MessagePassingFwdKernel:
 
                 # zero the accumulator so the first group's += starts clean
                 accumulator_vmem[:, :, :] = jnp.zeros_like(accumulator_vmem[:, :, :])
+                segment_vmem[:, :] = jnp.zeros_like(segment_vmem[:, :])
+                open_vmem[:, :] = jnp.zeros_like(open_vmem[:, :])
 
                 current_receiver_smem[0] = jnp.int32(-1)
                 step_smem[0] = jnp.int32(0)
-                flush_pending_smem[0] = jnp.int32(0)
+                for slot in range(c.flush_slots):
+                    flush_pending_smem[slot] = jnp.int32(0)
                 flush_count_smem[0] = jnp.int32(0)
 
                 # per-receiver-group reduce + async DMA out (double-buffered).
-                flush_one, drain_flush = make_group_flush(
+                flush_one, flush_row, drain_flush = make_group_flush(
                     FlushBuffers(
                         dst_hbm=out_hbm,
                         stage_vmem=stage_vmem,
@@ -535,12 +582,144 @@ class _MessagePassingFwdKernel:
                         for k in range(c.plan.edge_block_size)
                     ]
 
+                def segment_matmul_or_walk(
+                    prefetch,
+                    walk,
+                    x_plane,
+                    y_vmem,
+                    edge_scalar_tile,
+                    receivers_smem,
+                    receivers_vmem,
+                ):
+                    """Use the MXU matmul if the block has at most `chunk` receivers,
+                    otherwise fall back to the standard VPU TP and reduce scatter."""
+                    eb, groups, width = (
+                        c.plan.edge_block_size,
+                        c.chunk,
+                        c.plan.channel_block,
+                    )
+                    # sorted receivers: group g is node first + g (empty groups flush zeros)
+                    first = receivers_smem[0, 0]
+                    n_groups = receivers_smem[0, eb - 1] - first + 1
+
+                    def walk_block(prefetch):
+                        # the walk keeps the open group in the accumulator
+                        flat_accumulator = accumulator_vmem.reshape(
+                            c.out_dim_padded * groups, width
+                        )
+                        open_rows = pl.ds(0, c.out_dim_padded, stride=groups)
+                        flat_accumulator[open_rows, :] = open_vmem[:, :]
+                        prefetch()
+                        walk()
+                        open_vmem[:, :] = sum_rows(accumulator_vmem)
+                        accumulator_vmem[:, :, :] = jnp.zeros_like(
+                            accumulator_vmem[:, :, :]
+                        )
+
+                    @pl.when(n_groups > groups)
+                    def _many_groups():
+                        walk_block(prefetch)
+
+                    @pl.when(n_groups <= groups)
+                    def _few_groups():
+                        prefetch()
+                        probe = 0.0  # res * 0: NaN where res is not finite
+                        with named_scope("fwd_segment_matmul"):
+                            sublane = jax.lax.broadcasted_iota(
+                                jnp.int32, (groups, eb), 0
+                            )
+                            in_group = (receivers_vmem[:, :] - first) == sublane
+
+                            # y_zi masked to each group, as hi/mid/lo bf16-exact parts
+                            lhs_parts = defaultdict(lambda: ([], [], []))
+                            for zi, by_z_scale in c.tp_plan:
+                                row = None
+                                for z_scale, terms in by_z_scale:
+                                    for _xi, yi, y_scale, x_scale, sign in terms:
+                                        q = sign * y_scale * x_scale * z_scale
+                                        term = y_vmem[yi, :, :]
+                                        term = term if q == 1.0 else q * term
+                                        row = term if row is None else row + term
+                                block = c.irrep_block_of_output[zi]
+                                for k, part in enumerate(_split3(row)):
+                                    lhs_parts[block][k].append(
+                                        jnp.where(
+                                            in_group,
+                                            jnp.broadcast_to(part, (groups, eb)),
+                                            0.0,
+                                        )
+                                    )
+                            zis_of_block = defaultdict(list)
+                            for zi, _ in c.tp_plan:
+                                zis_of_block[c.irrep_block_of_output[zi]].append(zi)
+                            for block, zis in zis_of_block.items():
+                                lhs = [
+                                    jnp.concatenate(p, axis=0) for p in lhs_parts[block]
+                                ]
+                                rhs = _split3(
+                                    x_plane[0, :, :] * edge_scalar_tile(block)
+                                )
+                                # HIGHEST's six bf16 products, one rhs push per part
+                                res = None
+                                for k, rhs_part in enumerate(rhs):
+                                    n = 3 - k
+                                    product = _dot_exact(
+                                        jnp.concatenate(lhs[:n], axis=0), rhs_part
+                                    )
+                                    rows_n = lhs[0].shape[0]
+                                    for i in range(n):
+                                        piece = product[i * rows_n : (i + 1) * rows_n]
+                                        res = piece if res is None else res + piece
+                                for j, zi in enumerate(zis):
+                                    probe = (
+                                        probe + 0.0 * res[j * groups : (j + 1) * groups]
+                                    )
+                                    segment_vmem[zi * groups : (zi + 1) * groups, :] = (
+                                        res[j * groups : (j + 1) * groups].astype(
+                                            c.dtype
+                                        )
+                                    )
+
+                        finite = jnp.sum(probe) == 0.0
+
+                        # the dot's 0 * inf would spread a non-finite edge to every group
+                        @pl.when(jnp.logical_not(finite))
+                        def _non_finite():
+                            walk_block(lambda: None)
+
+                        @pl.when(finite)
+                        def _flush_groups():
+                            with named_scope("fwd_segment_flush"):
+                                group_sum = lambda g: segment_vmem[
+                                    pl.ds(g, c.out_dim_padded, stride=groups), :
+                                ]
+                                open_key = current_receiver_smem[0]
+
+                                @pl.when(first != open_key)
+                                def _close_carried_group():
+                                    @pl.when(open_key >= 0)
+                                    def _flush():
+                                        flush_row(open_key, open_vmem[:, :])
+
+                                    open_vmem[:, :] = jnp.zeros_like(open_vmem[:, :])
+
+                                open_vmem[:, :] = open_vmem[:, :] + group_sum(0)
+                                for g in range(1, groups):
+
+                                    @pl.when(g < n_groups)
+                                    def _next_group(g=g):
+                                        flush_row(first + g - 1, open_vmem[:, :])
+                                        open_vmem[:, :] = group_sum(g)
+
+                                current_receiver_smem[0] = first + n_groups - 1
+
                 def body(
                     y_vmem,
                     edge_scalars_vmem,
                     senders_smem,
                     receivers_smem,
                     next_senders_smem,
+                    *receivers_vmem,
                 ):
                     step = step_smem[0]
                     slot = step % 2
@@ -569,10 +748,42 @@ class _MessagePassingFwdKernel:
 
                         for copy in gathers(lambda k: senders_smem[0, k], slot):
                             copy.wait()
+
+                        def prefetch():
+                            for copy in gathers(
+                                lambda k: next_senders_smem[0, k], 1 - slot
+                            ):
+                                copy.start()
+
                         step_smem[0] = step + 1
 
                     # ---- 1. Tensor product + scalar mixing ----
                     x_plane = x_stage_vmem[slot]
+                    if c.segment_matmul:
+                        # issued inside each branch: its scalar work co-issues with the dot
+                        segment_matmul_or_walk(
+                            prefetch,
+                            lambda: tp_and_walk(
+                                x_plane,
+                                y_vmem,
+                                edge_scalar_tile,
+                                receivers_smem,
+                                prefetch=lambda: None,
+                            ),
+                            x_plane,
+                            y_vmem,
+                            edge_scalar_tile,
+                            receivers_smem,
+                            *receivers_vmem,
+                        )
+                    else:
+                        tp_and_walk(
+                            x_plane, y_vmem, edge_scalar_tile, receivers_smem, prefetch
+                        )
+
+                def tp_and_walk(
+                    x_plane, y_vmem, edge_scalar_tile, receivers_smem, prefetch
+                ):
                     message_by_zi = {}
                     with named_scope("fwd_tp_compute"):
                         tile_shape = (c.plan.edge_block_size, c.plan.channel_block)
@@ -614,8 +825,7 @@ class _MessagePassingFwdKernel:
                             message_by_zi[zi] = tp_acc * edge_scalar_tile(block)
 
                     # prefetch after the TP so the DMA descriptors co-issue with it
-                    for copy in gathers(lambda k: next_senders_smem[0, k], 1 - slot):
-                        copy.start()
+                    prefetch()
 
                     # ---- 2. Chunked scatter to receivers ----
                     row_idx = jax.lax.broadcasted_iota(
@@ -655,7 +865,14 @@ class _MessagePassingFwdKernel:
                     out_specs=[],
                     core_axis=0,
                     dimension_semantics=(pltpu.GridDimensionSemantics.PARALLEL,),
-                )(y_hbm, edge_scalars_hbm, senders_hbm, receivers_hbm, senders_hbm)
+                )(
+                    y_hbm,
+                    edge_scalars_hbm,
+                    senders_hbm,
+                    receivers_hbm,
+                    senders_hbm,
+                    *([receivers_hbm] if c.segment_matmul else []),
+                )
 
                 # the last step prefetched a block it never reads
                 @pl.when(step_smem[0] > 0)
@@ -668,7 +885,10 @@ class _MessagePassingFwdKernel:
 
                 @pl.when(final_receiver >= jnp.int32(0))
                 def _final_flush():
-                    flush_one(final_receiver, final=True)
+                    if c.segment_matmul:
+                        flush_row(final_receiver, open_vmem[:, :], final=True)
+                    else:
+                        flush_one(final_receiver, final=True)
 
                 drain_flush()
 

@@ -37,18 +37,18 @@ class WalkScratch(NamedTuple):
 
 class FlushBuffers(NamedTuple):
     dst_hbm: pl.MemoryRef  # (n_rows, planes, width): shared across cores
-    stage_vmem: pl.MemoryRef  # (1, planes, width): flush staging row
+    stage_vmem: pl.MemoryRef  # (slots, planes, width): flush staging rows, a ring
     accumulator_vmem: (
         pl.MemoryRef
     )  # (planes, rows_per_chunk, width): open-group partials
-    flush_pending: pl.MemoryRef  # (1,) i32: async flush in flight?
-    semaphore: pltpu.SemaphoreType  # DMA semaphore for the async flush
+    flush_pending: pl.MemoryRef  # (slots,) i32: async flush in flight?
+    semaphore: pltpu.SemaphoreType  # (slots,) DMA semaphores for the async flush
     boundary_hbm: pl.MemoryRef  # (num_cores, 2, planes, width): straddling groups
     flush_count: pl.MemoryRef  # (1,) i32: flushes done by this core
     channel_slice: Any = slice(None)  # channel range this pass owns, full by default
 
 
-def _sum_rows(accumulator: pl.MemoryRef) -> jax.Array:
+def sum_rows(accumulator: pl.MemoryRef) -> jax.Array:
     """`accumulator.sum(axis=1)` as strided sublane loads instead of sublane rotates."""
     planes, rows, width = accumulator.shape
     if width != 128:  # Mosaic only lowers the strided load on 128-lane rows
@@ -61,23 +61,7 @@ def _sum_rows(accumulator: pl.MemoryRef) -> jax.Array:
 
 
 def make_group_flush(bufs: FlushBuffers, core_id):
-    """Double-buffered per-group reduce + async DMA out, shared by fwd/bwd.
-
-    Returns `(flush_one, drain)`. `flush_one(row)` waits any in-flight copy,
-    reduces the accumulator's chunk sublanes to one row, async-DMAs it out, and
-    re-zeros the accumulator. `drain()` waits the last copy (call once after the
-    pipeline).
-
-    Rows go straight to the shared `dst_hbm[row]`: `emit_pipeline(core_axis=...)`
-    hands each core a *contiguous* block range, so at most one group straddles a
-    core boundary. A core's first-closed and final groups are the only ones that
-    can be shared with a neighbour, and those two go to `boundary_hbm[core_id,
-    {0,1}]` for the caller to add back.
-
-    Every destination is narrowed to `channel_slice`, so a caller that walks the
-    edge list once per channel stride writes each pass into its own slice of the
-    same full-width buffers.
-    """
+    """Double-buffered per-group reduce + async DMA out, shared by fwd/bwd."""
 
     def _dst(row):
         return bufs.dst_hbm.at[pl.ds(row, 1), :, bufs.channel_slice]
@@ -85,20 +69,26 @@ def make_group_flush(bufs: FlushBuffers, core_id):
     def _boundary(slot):
         return bufs.boundary_hbm.at[core_id].at[pl.ds(slot, 1), :, bufs.channel_slice]
 
-    def _wait_inflight():
+    slots = bufs.stage_vmem.shape[0]
+
+    def _stage(slot):
+        return bufs.stage_vmem.at[pl.ds(slot, 1)]
+
+    def _wait_inflight(slot):
         # any destination of the same shape settles the same byte count
-        pltpu.make_async_copy(bufs.stage_vmem, _dst(0), bufs.semaphore).wait()
+        pltpu.make_async_copy(_stage(slot), _dst(0), bufs.semaphore.at[slot]).wait()
 
-    def _start(dst):
-        pltpu.make_async_copy(bufs.stage_vmem, dst, bufs.semaphore).start()
+    def flush_row(row, value: jax.Array, final: bool = False):
+        slot = bufs.flush_count[0] % slots
 
-    def flush_one(row, final: bool = False):
-        @pl.when(bufs.flush_pending[0] == jnp.int32(1))
+        def _start(dst):
+            pltpu.make_async_copy(_stage(slot), dst, bufs.semaphore.at[slot]).start()
+
+        @pl.when(bufs.flush_pending[slot] == jnp.int32(1))
         def _wait_previous_flush():
-            _wait_inflight()
+            _wait_inflight(slot)
 
-        bufs.stage_vmem[0, :, :] = _sum_rows(bufs.accumulator_vmem)
-        bufs.accumulator_vmem[:, :, :] = jnp.zeros_like(bufs.accumulator_vmem[:, :, :])
+        bufs.stage_vmem[slot, :, :] = value
 
         if final:
             # the still-open group at the core's last edge: may continue into the
@@ -118,14 +108,21 @@ def make_group_flush(bufs: FlushBuffers, core_id):
             def _interior_group_owns_its_row():
                 _start(_dst(row))
 
-        bufs.flush_pending[0] = jnp.int32(1)
+        bufs.flush_pending[slot] = jnp.int32(1)
+
+    def flush_one(row, final: bool = False):
+        value = sum_rows(bufs.accumulator_vmem)
+        bufs.accumulator_vmem[:, :, :] = jnp.zeros_like(bufs.accumulator_vmem[:, :, :])
+        flush_row(row, value, final)
 
     def drain():
-        @pl.when(bufs.flush_pending[0] == jnp.int32(1))
-        def _drain_pending_flush():
-            _wait_inflight()
+        for slot in range(slots):
 
-    return flush_one, drain
+            @pl.when(bufs.flush_pending[slot] == jnp.int32(1))
+            def _drain_pending_flush():
+                _wait_inflight(slot)
+
+    return flush_one, flush_row, drain
 
 
 def sorted_reduce_and_flush(
