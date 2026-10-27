@@ -33,6 +33,26 @@ def round_up(n: int, multiple: int) -> int:
     return pl.cdiv(n, multiple) * multiple
 
 
+def split_bf16x3(
+    value: jax.Array, carry_non_finite: bool = False
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """f32 -> three bf16-exact f32 parts that sum back to `value` exactly."""
+
+    def truncate(v):  # unlike a bf16 cast, never overflows a finite value to inf
+        bits = jax.lax.bitcast_convert_type(v, jnp.uint32) & jnp.uint32(0xFFFF0000)
+        return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+    hi = truncate(value)
+    if carry_non_finite:  # non-finite rides whole in hi: inf - inf is NaN
+        finite = jnp.abs(value) < jnp.inf
+        hi = jnp.where(finite, hi, value)
+        rest = jnp.where(finite, value - hi, 0.0)
+    else:
+        rest = value - hi
+    mid = truncate(rest)
+    return hi, mid, rest - mid
+
+
 def tiled_bytes(
     shapes: Iterable[Sequence[int]], num_lanes: int, num_sublanes: int, itemsize: int
 ) -> int:

@@ -76,6 +76,9 @@ CASES = [
 BWD_CASES = [
     _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 128),
     _case("0e + 1o + 2e", "0e + 1o + 2e", "0e + 1o + 2e", 32),
+    # scalar x: the factorised bwd sweep
+    _case("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 128),
+    _case("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o", 32),
 ]
 
 
@@ -277,6 +280,35 @@ def test_non_finite_edge_stays_on_its_receiver():
 
     assert not np.isnan(got).any()
     assert (~np.isfinite(got).all(axis=(1, 2))).sum() == 1
+
+
+def test_backward_long_sender_runs():
+    """Degree 79: every sender's run covers a whole 32-edge span of the dx walk."""
+    k = _kernels("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o")
+    inputs = _contract_valid_inputs(k.conv, n_nodes=80, channels=128)
+
+    out = k.unfused(*inputs)
+    ct = jnp.asarray(np.random.default_rng(1).standard_normal(out.shape), jnp.float32)
+    df = k.fused_vjp(*inputs, ct)
+    du = k.unfused_vjp(*inputs, ct)
+    for name, a, b in zip(("d_node_feats", "d_sph", "d_edge_scalars"), df, du):
+        assert _rel(a, b) < RTOL, f"{name} mismatch"
+
+
+def test_backward_non_finite_sph_stays_on_its_edge():
+    """An inf sph leaves one sender's dx and one edge's d_es non-finite, none NaN."""
+    k = _kernels("0e", "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o")
+    node, sph, es, senders, receivers = _contract_valid_inputs(k.conv, 8, 128)
+    out = k.unfused(node, sph, es, senders, receivers)
+    ct = jnp.asarray(np.random.default_rng(1).standard_normal(out.shape), jnp.float32)
+    d_node, d_sph, d_es = k.fused_vjp(
+        node, sph.at[20, 0].set(jnp.inf), es, senders, receivers, ct
+    )
+
+    for grad in (d_node, d_sph, d_es):
+        assert not np.isnan(np.asarray(grad)).any()
+    assert (~np.isfinite(np.asarray(d_node)).all(axis=(1, 2))).sum() == 1
+    assert (~np.isfinite(np.asarray(d_es)).all(axis=(1, 2))).sum() == 1
 
 
 @SLOW

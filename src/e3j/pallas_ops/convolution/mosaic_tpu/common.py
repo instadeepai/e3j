@@ -136,6 +136,7 @@ def sorted_reduce_and_flush(
     open_key: pl.MemoryRef,  # (1,) i32 SHARED carry: open group id (caller inits -1, reads after)
     scratch: WalkScratch,  # the two private loop-carry cells
     edges_per_row: int = 1,  # keys packed per row: 1 = dense, LANES//channels = packed
+    fast_span: int = 1,  # chunks per single-group fast path (1 = off)
 ) -> None:
 
     # rows_per_chunk: source/accumulator sublane rows per chunk (the scatter target's height).
@@ -159,7 +160,7 @@ def sorted_reduce_and_flush(
                 in_segment, source[idx, base : base + rows_per_chunk, :], 0.0
             )
 
-    for chunk in range(n_chunks):
+    def walk_chunk(chunk):
         with named_scope("checking_transitions"):
             base = chunk * keys_per_chunk
             chunk_keys = [read_key(base + j) for j in range(keys_per_chunk)]
@@ -237,3 +238,31 @@ def sorted_reduce_and_flush(
         with named_scope("no_boundary_accummulation"):
             tail = cell_position >= scratch.open_segment_start[0]
             accumulate(chunk, tail)
+
+    assert n_chunks % fast_span == 0, "fast_span must divide the chunk count"
+    if fast_span == 1:
+        for chunk in range(n_chunks):
+            walk_chunk(chunk)
+        return
+    # sorted keys: a span whose first and last keys are the open group lies wholly in it
+    for first_chunk in range(0, n_chunks, fast_span):
+        with named_scope("checking_span"):
+            carried_key = open_key[0]
+            single_group = jnp.logical_and(
+                read_key(first_chunk * keys_per_chunk) == carried_key,
+                read_key((first_chunk + fast_span) * keys_per_chunk - 1) == carried_key,
+            )
+
+        @pl.when(single_group)
+        def _span_in_open_group():
+            for idx in present_planes:
+                total = accumulator[idx, :, :]
+                for chunk in range(first_chunk, first_chunk + fast_span):
+                    base = chunk * rows_per_chunk
+                    total = total + source[idx, base : base + rows_per_chunk, :]
+                accumulator[idx, :, :] = total
+
+        @pl.when(jnp.logical_not(single_group))
+        def _walk_span():
+            for chunk in range(first_chunk, first_chunk + fast_span):
+                walk_chunk(chunk)

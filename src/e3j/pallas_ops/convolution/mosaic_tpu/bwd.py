@@ -43,6 +43,7 @@ from e3j.pallas_ops.utils.mosaic_tpu import (
     BlockPlan,
     plan_blocks,
     round_up,
+    split_bf16x3,
     vmem_step_bytes,
 )
 from e3j.pallas_ops.utils.named_scope import named_scope
@@ -73,6 +74,8 @@ class BwdScratch(NamedTuple):
     flush_semaphore: pltpu.SemaphoreType  # DMA semaphore: async dx flush
 
 
+_SCALAR_X_SUB_TILE = 16  # edges per sub-tile of `_scalar_x_sweep`
+_SCALAR_X_WALK_FAST_SPAN = 4  # walk chunks per single-sender fast path
 _MIN_EDGE_BLOCK_SIZE = 32  # a 32-edge tile is worth a single pass ...
 _MIN_STRIDED_EDGE_BLOCK_SIZE = 64  # ... but a strided pass wants the wider tile
 _EDGE_BLOCK_SIZES = (128, 64, 32, 16, 8)  # 16/8 only reachable via the fallback
@@ -124,6 +127,8 @@ class _BwdConstants(NamedTuple):
     edge_major: bool  # edge scalars layout, see edges.edge_scalars_edge_major
     y_edge_minor: bool  # y / dy as (y_dim, n_edges): XLA's layout of the narrow y
     mask_tail_before_dy: bool  # faster on v6e; on v4 it spills past VMEM at l_max=3
+    scalar_x: bool  # x_dim == 1, one path and a distinct yi per zi: `_scalar_x_sweep`
+    walk_fast_span: int  # chunks per single-sender fast path of the dx walk (1 = off)
 
 
 def _piece_width(channel_block: int, num_lanes: int) -> int:
@@ -296,6 +301,91 @@ def _edge_scalars_spec(c: _BwdConstants, walked_block, stride: int) -> pl.BlockS
         walked_block,
         stride,
     )
+
+
+def _scalar_x_sweep(
+    c: _BwdConstants,
+    x_plane,
+    dz_plane,
+    y_vmem,
+    edge_scalars_vmem,
+    d_edge_scalars_vmem,
+    dy_vmem,
+    dx_plane,
+):
+    """CG sweep for a scalar x: zi's single path is (0, yi, v), factorised per block.
+
+        h_b = sum_{zi in b} v*y[yi]*dz[zi];  dx = sum_b es_b*h_b;  d_es_b = x*h_b
+        dy[yi] = v * lanesum(x*es_b*dz[zi])
+
+    The lane broadcasts of y run on the idle MXU instead of the XLU (which the dy
+    lane sums keep busy): masked bf16x3 parts of `v*y` times a ones matrix,
+    exact since every output sums three bf16-exact terms. The edge-minor y is
+    masked to the sub-tile's diagonal, so the same dot also moves edges to sublanes.
+    """
+    eb = c.plan.edge_block_size
+    sub_tile = min(_SCALAR_X_SUB_TILE, eb)
+    width = c.plan.channel_block
+    paths = [(zi, yi, v) for _, group in c.cg_by_block for zi, ((_, yi, v),) in group]
+    # (sub_tile, eb) parts of v*y[yi] per path, edges along lanes
+    y_rows = {
+        zi: [
+            jnp.broadcast_to(part, (sub_tile, eb))
+            for part in split_bf16x3(v * y_vmem[yi : yi + 1, :], carry_non_finite=True)
+        ]
+        for zi, yi, v in paths
+    }
+    lane = jax.lax.broadcasted_iota(jnp.int32, (sub_tile, eb), 1)
+    sublane = jax.lax.broadcasted_iota(jnp.int32, (sub_tile, eb), 0)
+    ones = jnp.ones((3 * eb, width), jnp.bfloat16)
+    dy_lane = jax.lax.broadcasted_iota(jnp.int32, (sub_tile, c.num_lanes), 1)
+    dy_tiles = []
+
+    for start in range(0, eb, sub_tile):
+        rows = pl.ds(start, sub_tile)
+        diagonal = lane == sublane + start
+        masked = [
+            jnp.concatenate([jnp.where(diagonal, part, 0.0) for part in y_rows[zi]], 1)
+            for zi, _, _ in paths
+        ]
+        y_broadcast = jnp.dot(
+            jnp.concatenate(masked, 0).astype(jnp.bfloat16),
+            ones,
+            precision=jax.lax.Precision.DEFAULT,  # one bf16 pass, whatever the config
+            preferred_element_type=jnp.float32,
+        )  # (len(paths)*sub_tile, width): v*y[yi] in every lane
+        y_of = {
+            zi: y_broadcast[k * sub_tile : (k + 1) * sub_tile]
+            for k, (zi, _, _) in enumerate(paths)
+        }
+
+        x = x_plane[0, rows, :]
+        dx = None
+        dy_tile = jnp.zeros((sub_tile, c.num_lanes), c.dtype)
+        for block, zi_group in c.cg_by_block:
+            edge_scalars_block = (
+                edge_scalars_vmem[rows, block, :]
+                if c.edge_major
+                else edge_scalars_vmem[block, rows, :]
+            )
+            x_es = x * edge_scalars_block
+            h = None
+            for zi, ((_, yi, v),) in zi_group:
+                dz_zi = dz_plane[zi, rows, :]
+                term = y_of[zi] * dz_zi
+                h = term if h is None else h + term
+                dy_col = jnp.sum(x_es * dz_zi, axis=-1, keepdims=True)
+                dy_col = dy_col if v == 1.0 else v * dy_col
+                dy_tile = jnp.where(dy_lane == yi, dy_col, dy_tile)
+            if c.edge_major:
+                d_edge_scalars_vmem[rows, block, :] = x * h
+            else:
+                d_edge_scalars_vmem[block, rows, :] = x * h
+            dx_term = edge_scalars_block * h
+            dx = dx_term if dx is None else dx + dx_term
+        dx_plane[0, rows, :] = dx
+        dy_tiles.append(dy_tile)
+    dy_vmem[0, :, :] = jnp.transpose(jnp.concatenate(dy_tiles, 0))[: c.y_dim, :]
 
 
 def _call_in_specs(ops: _BwdOperands) -> list[pl.BlockSpec]:
@@ -504,6 +594,18 @@ class _MessagePassingBwdKernel:
             (block, tuple(group)) for block, group in sorted(_cg_by_block.items())
         )
 
+        scalar_x = (
+            x_dim == 1
+            and x.dtype == jnp.float32
+            and n_channel_strides == 1
+            and all(len(paths) == 1 for paths in cg_by_zi.values())
+            and len({paths[0].yi for paths in cg_by_zi.values()}) == len(cg_by_zi)
+            and y_edge_minor
+        )
+        fast_span = _SCALAR_X_WALK_FAST_SPAN if scalar_x else 1
+        if edge_block_size % (fast_span * chunk_rows):
+            fast_span = 1
+
         n_edge_blocks = n_edges_padded // edge_block_size
         senders = senders.reshape(n_edge_blocks, edge_block_size)
         receivers = receivers.reshape(n_edge_blocks, edge_block_size)
@@ -557,6 +659,8 @@ class _MessagePassingBwdKernel:
             edge_major=edge_major,
             y_edge_minor=y_edge_minor,
             mask_tail_before_dy=tpu_info.generation >= 6,
+            scalar_x=scalar_x,
+            walk_fast_span=fast_span,
         )
         return ops, constants
 
@@ -746,10 +850,6 @@ class _MessagePassingBwdKernel:
                     for copy in gather_copies(senders_read, receivers_read):
                         copy.wait()
 
-                    zero = jnp.zeros(
-                        (c.plan.edge_block_size, c.plan.channel_block), c.dtype
-                    )
-
                     # ---- 2. stride the gathered rows into per-component planes ----
                     def plane(stage, component, rows_per_edge):
                         parts = [
@@ -795,92 +895,114 @@ class _MessagePassingBwdKernel:
                                         dx_plane[xi, :, :], edge_block, c.edge_rows
                                     )
 
-                    if c.y_edge_minor:
-                        y_broadcast = {
-                            yi: jnp.broadcast_to(y_vmem[yi, :][:, None], tile_shape)
-                            for yi in c.yi_used
-                        }
-                    else:
-                        y_tile = y_vmem[...]
-                        y_broadcast = {
-                            yi: jnp.broadcast_to(y_tile[:, yi][:, None], tile_shape)
-                            for yi in c.yi_used
-                        }
-                    y_of = lambda yi: y_broadcast[yi]  # noqa: E731
-
-                    # ---- 3. CG sweep: all three gradients in one CG pass ----
-                    with named_scope("cg_sweep"):
-                        dx_acc = {xi: zero for xi in c.xi_used}
-                        dy_acc = {yi: zero for yi in c.yi_used}
-                        for block, zi_group in c.cg_by_block:
-                            cg_dz = {}
-                            for zi, paths in zi_group:
-                                dz_zi = dz_plane[zi, :, :]
-                                for xi, yi, v in paths:
-                                    term = v * dz_zi
-                                    cg_dz[xi, yi] = (
-                                        term
-                                        if (xi, yi) not in cg_dz
-                                        else cg_dz[xi, yi] + term
-                                    )
-                            dx_ungated = {}
-                            dy_ungated = {}
-                            for (xi, yi), cg_dz_term in cg_dz.items():
-                                dx_term = y_of(yi) * cg_dz_term
-                                dx_ungated[xi] = (
-                                    dx_term
-                                    if xi not in dx_ungated
-                                    else dx_ungated[xi] + dx_term
-                                )
-                                dy_term = x_plane[xi, :, :] * cg_dz_term
-                                dy_ungated[yi] = (
-                                    dy_term
-                                    if yi not in dy_ungated
-                                    else dy_ungated[yi] + dy_term
-                                )
-                            edge_scalars_block = edges.load_edge_scalars(
-                                c.edge_major, edge_scalars_vmem, block
-                            )
-                            d_edge_scalars_acc = zero
-                            for xi, dx_term in dx_ungated.items():
-                                dx_acc[xi] = dx_acc[xi] + edge_scalars_block * dx_term
-                                d_edge_scalars_acc = (
-                                    d_edge_scalars_acc + x_plane[xi, :, :] * dx_term
-                                )
-                            for yi, dy_term in dy_ungated.items():
-                                dy_acc[yi] = dy_acc[yi] + edge_scalars_block * dy_term
-                            edges.store_edge_scalars(
-                                c.edge_major,
-                                d_edge_scalars_vmem,
-                                block,
-                                d_edge_scalars_acc,
-                            )
-                        for xi in c.xi_used:
-                            dx_plane[xi, :, :] = dx_acc[xi]
-                        if c.mask_tail_before_dy:
-                            mask_ragged_dx()
-                        # dy: reduce the channel axis.
+                    def cg_sweep():
+                        zero = jnp.zeros(tile_shape, c.dtype)
                         if c.y_edge_minor:
-                            lane = jax.lax.broadcasted_iota(
-                                jnp.int32, (c.plan.edge_block_size, c.num_lanes), 1
-                            )
-                            dy_tile = jnp.zeros(lane.shape, c.dtype)
-                            for yi in c.yi_used:
-                                dy_tile = jnp.where(
-                                    lane == yi,
-                                    jnp.sum(dy_acc[yi], axis=-1, keepdims=True),
-                                    dy_tile,
-                                )
-                            dy_vmem[0, :, :] = jnp.transpose(dy_tile)[: c.y_dim, :]
+                            y_broadcast = {
+                                yi: jnp.broadcast_to(y_vmem[yi, :][:, None], tile_shape)
+                                for yi in c.yi_used
+                            }
                         else:
-                            dy_vmem[0, :, :] = jnp.zeros(
-                                (c.plan.edge_block_size, c.y_dim), c.dtype
-                            )
-                            for yi in c.yi_used:
-                                dy_vmem[0, :, yi] = jnp.sum(dy_acc[yi], axis=-1)
+                            y_tile = y_vmem[...]
+                            y_broadcast = {
+                                yi: jnp.broadcast_to(y_tile[:, yi][:, None], tile_shape)
+                                for yi in c.yi_used
+                            }
+                        y_of = lambda yi: y_broadcast[yi]  # noqa: E731
 
-                        if not c.mask_tail_before_dy:
+                        # ---- 3. CG sweep: all three gradients in one CG pass ----
+                        with named_scope("cg_sweep"):
+                            dx_acc = {xi: zero for xi in c.xi_used}
+                            dy_acc = {yi: zero for yi in c.yi_used}
+                            for block, zi_group in c.cg_by_block:
+                                cg_dz = {}
+                                for zi, paths in zi_group:
+                                    dz_zi = dz_plane[zi, :, :]
+                                    for xi, yi, v in paths:
+                                        term = v * dz_zi
+                                        cg_dz[xi, yi] = (
+                                            term
+                                            if (xi, yi) not in cg_dz
+                                            else cg_dz[xi, yi] + term
+                                        )
+                                dx_ungated = {}
+                                dy_ungated = {}
+                                for (xi, yi), cg_dz_term in cg_dz.items():
+                                    dx_term = y_of(yi) * cg_dz_term
+                                    dx_ungated[xi] = (
+                                        dx_term
+                                        if xi not in dx_ungated
+                                        else dx_ungated[xi] + dx_term
+                                    )
+                                    dy_term = x_plane[xi, :, :] * cg_dz_term
+                                    dy_ungated[yi] = (
+                                        dy_term
+                                        if yi not in dy_ungated
+                                        else dy_ungated[yi] + dy_term
+                                    )
+                                edge_scalars_block = edges.load_edge_scalars(
+                                    c.edge_major, edge_scalars_vmem, block
+                                )
+                                d_edge_scalars_acc = zero
+                                for xi, dx_term in dx_ungated.items():
+                                    dx_acc[xi] = (
+                                        dx_acc[xi] + edge_scalars_block * dx_term
+                                    )
+                                    d_edge_scalars_acc = (
+                                        d_edge_scalars_acc + x_plane[xi, :, :] * dx_term
+                                    )
+                                for yi, dy_term in dy_ungated.items():
+                                    dy_acc[yi] = (
+                                        dy_acc[yi] + edge_scalars_block * dy_term
+                                    )
+                                edges.store_edge_scalars(
+                                    c.edge_major,
+                                    d_edge_scalars_vmem,
+                                    block,
+                                    d_edge_scalars_acc,
+                                )
+                            for xi in c.xi_used:
+                                dx_plane[xi, :, :] = dx_acc[xi]
+                            if c.mask_tail_before_dy:
+                                mask_ragged_dx()
+                            # dy: reduce the channel axis.
+                            if c.y_edge_minor:
+                                lane = jax.lax.broadcasted_iota(
+                                    jnp.int32, (c.plan.edge_block_size, c.num_lanes), 1
+                                )
+                                dy_tile = jnp.zeros(lane.shape, c.dtype)
+                                for yi in c.yi_used:
+                                    dy_tile = jnp.where(
+                                        lane == yi,
+                                        jnp.sum(dy_acc[yi], axis=-1, keepdims=True),
+                                        dy_tile,
+                                    )
+                                dy_vmem[0, :, :] = jnp.transpose(dy_tile)[: c.y_dim, :]
+                            else:
+                                dy_vmem[0, :, :] = jnp.zeros(
+                                    (c.plan.edge_block_size, c.y_dim), c.dtype
+                                )
+                                for yi in c.yi_used:
+                                    dy_vmem[0, :, yi] = jnp.sum(dy_acc[yi], axis=-1)
+
+                            if not c.mask_tail_before_dy:
+                                mask_ragged_dx()
+
+                    if c.scalar_x:
+                        with named_scope("cg_sweep"):
+                            _scalar_x_sweep(
+                                c,
+                                x_plane,
+                                dz_plane,
+                                y_vmem,
+                                edge_scalars_vmem,
+                                d_edge_scalars_vmem,
+                                dy_vmem,
+                                dx_plane,
+                            )
                             mask_ragged_dx()
+                    else:
+                        cg_sweep()
 
                     dx_indices = list(c.xi_used)
 
@@ -902,6 +1024,7 @@ class _MessagePassingBwdKernel:
                                 transition_mask=mask_smem,
                                 open_segment_start=previous_position_smem,
                             ),
+                            fast_span=c.walk_fast_span,
                         )
 
                 walked_block = (

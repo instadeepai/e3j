@@ -42,20 +42,10 @@ from e3j.pallas_ops.utils.mosaic_tpu import (
     BlockPlan,
     plan_blocks,
     round_up,
+    split_bf16x3,
     vmem_step_bytes,
 )
 from e3j.pallas_ops.utils.named_scope import named_scope
-
-
-def _split3(v: jax.Array) -> list[jax.Array]:
-    """`v` as hi + mid + lo f32 parts; hi and mid are exactly bf16 values."""
-    parts = []
-    for _ in range(2):
-        bits = jax.lax.bitcast_convert_type(v, jnp.uint32) & jnp.uint32(0xFFFF0000)
-        part = jax.lax.bitcast_convert_type(bits, jnp.float32)
-        parts.append(part)
-        v = v - part
-    return parts + [v]
 
 
 def _dot_exact(a: jax.Array, b: jax.Array) -> jax.Array:
@@ -641,7 +631,7 @@ class _MessagePassingFwdKernel:
                                         term = term if q == 1.0 else q * term
                                         row = term if row is None else row + term
                                 block = c.irrep_block_of_output[zi]
-                                for k, part in enumerate(_split3(row)):
+                                for k, part in enumerate(split_bf16x3(row)):
                                     lhs_parts[block][k].append(
                                         jnp.where(
                                             in_group,
@@ -656,7 +646,7 @@ class _MessagePassingFwdKernel:
                                 lhs = [
                                     jnp.concatenate(p, axis=0) for p in lhs_parts[block]
                                 ]
-                                rhs = _split3(
+                                rhs = split_bf16x3(
                                     x_plane[0, :, :] * edge_scalar_tile(block)
                                 )
                                 # HIGHEST's six bf16 products, one rhs push per part
