@@ -51,15 +51,15 @@ from e3j.pallas_ops.utils.named_scope import named_scope
 
 class BwdScratch(NamedTuple):
     x_stage: (
-        pl.MemoryRef
+        pl.MemoryRef | None
     )  # (edge_block_size*x_dim*pieces, piece_width): x[senders], x_dim*pieces rows per edge
     dz_stage: (
-        pl.MemoryRef
+        pl.MemoryRef | None
     )  # (edge_block_size*out_dim*pieces, piece_width): dz[receivers], same row grouping
-    dz_plane: pl.MemoryRef  # (out_dim, edge_block_size, channels): dz[receiver]
+    dz_plane: pl.MemoryRef  # ([2,] out_dim, edge_block_size, channels): dz[receiver]
     x_plane: (
         pl.MemoryRef
-    )  # (x_dim, edge_block_size, channels): sender-feature plane x[senders]
+    )  # ([2,] x_dim, edge_block_size, channels): sender-feature plane x[senders]
     dx_plane: pl.MemoryRef  # (x_dim, edge_block_size, channels): per-edge dx
     accumulator: pl.MemoryRef  # (x_dim, chunk_rows, channels): open-group dx partials
     flush_stage: pl.MemoryRef  # (1, x_dim, channels): dx flush staging
@@ -76,6 +76,7 @@ class BwdScratch(NamedTuple):
 
 _SCALAR_X_SUB_TILE = 16  # edges per sub-tile of `_scalar_x_sweep`
 _SCALAR_X_WALK_FAST_SPAN = 4  # walk chunks per single-sender fast path
+_MAX_DIRECT_PLANE_ROWS = 64  # x+dz rows per edge past which a contiguous stage wins
 _MIN_EDGE_BLOCK_SIZE = 32  # a 32-edge tile is worth a single pass ...
 _MIN_STRIDED_EDGE_BLOCK_SIZE = 64  # ... but a strided pass wants the wider tile
 _EDGE_BLOCK_SIZES = (128, 64, 32, 16, 8)  # 16/8 only reachable via the fallback
@@ -141,6 +142,14 @@ def _pieces(channel_block: int, num_lanes: int) -> int:
     return channel_block // _piece_width(channel_block, num_lanes)
 
 
+def _direct_planes(channel_block: int, num_lanes: int, rows_per_edge: int) -> bool:
+    """One gathered row per component: DMA straight into double-buffered planes."""
+    return (
+        _pieces(channel_block, num_lanes) == 1
+        and rows_per_edge <= _MAX_DIRECT_PLANE_ROWS
+    )
+
+
 def _vmem_shapes(
     out_dim: int,
     x_dim: int,
@@ -153,17 +162,26 @@ def _vmem_shapes(
     channel_block: int,
 ) -> tuple[dict[str, tuple[int, ...]], ...]:
     """Shapes of the VMEM scratch, the pipelined operands and the live values."""
+    if _direct_planes(channel_block, num_lanes, x_dim + out_dim):
+        gather = {
+            "dz_plane": (2, out_dim, edge_block_size, channel_block),
+            "x_plane": (2, x_dim, edge_block_size, channel_block),
+        }
+    else:
+        gather = {
+            "x_stage": (
+                edge_block_size * x_dim * _pieces(channel_block, num_lanes),
+                _piece_width(channel_block, num_lanes),
+            ),
+            "dz_stage": (
+                edge_block_size * out_dim * _pieces(channel_block, num_lanes),
+                _piece_width(channel_block, num_lanes),
+            ),
+            "dz_plane": (out_dim, edge_block_size, channel_block),
+            "x_plane": (x_dim, edge_block_size, channel_block),
+        }
     scratch = {
-        "x_stage": (
-            edge_block_size * x_dim * _pieces(channel_block, num_lanes),
-            _piece_width(channel_block, num_lanes),
-        ),
-        "dz_stage": (
-            edge_block_size * out_dim * _pieces(channel_block, num_lanes),
-            _piece_width(channel_block, num_lanes),
-        ),
-        "dz_plane": (out_dim, edge_block_size, channel_block),
-        "x_plane": (x_dim, edge_block_size, channel_block),
+        **gather,
         "dx_plane": (x_dim, edge_block_size, channel_block),
         "accumulator": (x_dim_padded, chunk_rows, channel_block),
         "flush_stage": (1, x_dim_padded, channel_block),
@@ -196,6 +214,7 @@ def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
     )
     return BwdScratch(
         **{name: pltpu.VMEM(shape, c.dtype) for name, shape in scratch.items()},
+        **dict.fromkeys(("x_stage", "dz_stage") - scratch.keys()),
         current_sender_smem=pltpu.SMEM((1,), jnp.int32),
         mask_smem=pltpu.SMEM((1,), jnp.int32),
         previous_position_smem=pltpu.SMEM((1,), jnp.int32),
@@ -206,6 +225,12 @@ def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
         stage_semaphore=pltpu.SemaphoreType.DMA,
         flush_semaphore=pltpu.SemaphoreType.DMA((1,)),
     )
+
+
+def _with_absent(present: list[bool], refs) -> list:
+    """Scratch refs in BwdScratch order, None where a buffer is not allocated."""
+    refs = iter(refs)
+    return [next(refs) if p else None for p in present]
 
 
 def _zero_unwalked_blocks(
@@ -734,23 +759,26 @@ class _MessagePassingBwdKernel:
             dx_hbm,
             boundary_hbm,
             # scratch, see BwdScratch for shapes:
-            x_stage,
-            dz_stage,
-            dz_plane,
-            x_plane,
-            dx_plane,
-            accumulator,
-            flush_stage,
-            current_sender_smem,
-            mask_smem,
-            previous_position_smem,
-            count_smem,
-            flush_pending_smem,
-            flush_count_smem,
-            gather_semaphore,
-            stage_semaphore,
-            flush_semaphore,
+            *scratch_refs,
         ):
+            (
+                x_stage,
+                dz_stage,
+                dz_plane,
+                x_plane,
+                dx_plane,
+                accumulator,
+                flush_stage,
+                current_sender_smem,
+                mask_smem,
+                previous_position_smem,
+                count_smem,
+                flush_pending_smem,
+                flush_count_smem,
+                gather_semaphore,
+                stage_semaphore,
+                flush_semaphore,
+            ) = _with_absent(scratch_present, scratch_refs)
             core_id = pl.program_id(0)
 
             n_edge_blocks = (
@@ -762,6 +790,9 @@ class _MessagePassingBwdKernel:
             )
 
             pieces = _pieces(c.plan.channel_block, c.num_lanes)
+            direct = _direct_planes(
+                c.plan.channel_block, c.num_lanes, c.x_dim + c.out_dim
+            )
             x_rows = c.x_dim * pieces  # gathered rows per edge
             dz_rows = c.out_dim * pieces
 
@@ -815,9 +846,17 @@ class _MessagePassingBwdKernel:
                     ]  # noqa: E731
 
                     # ---- 1. gather x[sender] and dz[receiver], one edge per row ----
-                    def gather_copies(read_sender, read_receiver):
+                    def gather_copies(read_sender, read_receiver, slot):
                         x_copies, dz_copies = [], []
                         for k in range(c.plan.edge_block_size):
+                            x_dst, dz_dst = (
+                                (x_plane.at[slot, :, k, :], dz_plane.at[slot, :, k, :])
+                                if direct
+                                else (
+                                    x_stage.at[pl.ds(k * x_rows, x_rows), :],
+                                    dz_stage.at[pl.ds(k * dz_rows, dz_rows), :],
+                                )
+                            )
                             x_copies.append(
                                 pltpu.make_async_copy(
                                     x_hbm.at[
@@ -825,7 +864,7 @@ class _MessagePassingBwdKernel:
                                         pl.ds(read_sender(k) * x_rows, x_rows),
                                         :,
                                     ],
-                                    x_stage.at[pl.ds(k * x_rows, x_rows), :],
+                                    x_dst,
                                     gather_semaphore,
                                 )
                             )
@@ -836,18 +875,20 @@ class _MessagePassingBwdKernel:
                                         pl.ds(read_receiver(k) * dz_rows, dz_rows),
                                         :,
                                     ],
-                                    dz_stage.at[pl.ds(k * dz_rows, dz_rows), :],
+                                    dz_dst,
                                     stage_semaphore,
                                 )
                             )
                         return [*x_copies, *dz_copies]
 
+                    slot = block_idx % 2 if direct else 0
+
                     @pl.when(block_idx == jnp.int32(0))
                     def _cold_start():
-                        for copy in gather_copies(senders_read, receivers_read):
+                        for copy in gather_copies(senders_read, receivers_read, 0):
                             copy.start()
 
-                    for copy in gather_copies(senders_read, receivers_read):
+                    for copy in gather_copies(senders_read, receivers_read, slot):
                         copy.wait()
 
                     # ---- 2. stride the gathered rows into per-component planes ----
@@ -865,11 +906,15 @@ class _MessagePassingBwdKernel:
                         ]
                         return parts[0] if pieces == 1 else jnp.concatenate(parts, 1)
 
-                    with named_scope("extract"):
-                        for xi in range(c.x_dim):
-                            x_plane[xi, :, :] = plane(x_stage, xi, x_rows)
-                        for zi in range(c.out_dim):
-                            dz_plane[zi, :, :] = plane(dz_stage, zi, dz_rows)
+                    if direct:
+                        x_planes, dz_planes = x_plane.at[slot], dz_plane.at[slot]
+                    else:
+                        x_planes, dz_planes = x_plane, dz_plane
+                        with named_scope("extract"):
+                            for xi in range(c.x_dim):
+                                x_plane[xi, :, :] = plane(x_stage, xi, x_rows)
+                            for zi in range(c.out_dim):
+                                dz_plane[zi, :, :] = plane(dz_stage, zi, dz_rows)
 
                     count_smem[0] = block_idx + 1
 
@@ -877,7 +922,7 @@ class _MessagePassingBwdKernel:
                     @pl.when(block_idx < blocks_this_core - 1)
                     def _prefetch():
                         for copy in gather_copies(
-                            senders_next_read, receivers_next_read
+                            senders_next_read, receivers_next_read, 1 - slot
                         ):
                             copy.start()
 
@@ -917,7 +962,7 @@ class _MessagePassingBwdKernel:
                             for block, zi_group in c.cg_by_block:
                                 cg_dz = {}
                                 for zi, paths in zi_group:
-                                    dz_zi = dz_plane[zi, :, :]
+                                    dz_zi = dz_planes[zi, :, :]
                                     for xi, yi, v in paths:
                                         term = v * dz_zi
                                         cg_dz[xi, yi] = (
@@ -934,7 +979,7 @@ class _MessagePassingBwdKernel:
                                         if xi not in dx_ungated
                                         else dx_ungated[xi] + dx_term
                                     )
-                                    dy_term = x_plane[xi, :, :] * cg_dz_term
+                                    dy_term = x_planes[xi, :, :] * cg_dz_term
                                     dy_ungated[yi] = (
                                         dy_term
                                         if yi not in dy_ungated
@@ -949,7 +994,8 @@ class _MessagePassingBwdKernel:
                                         dx_acc[xi] + edge_scalars_block * dx_term
                                     )
                                     d_edge_scalars_acc = (
-                                        d_edge_scalars_acc + x_plane[xi, :, :] * dx_term
+                                        d_edge_scalars_acc
+                                        + x_planes[xi, :, :] * dx_term
                                     )
                                 for yi, dy_term in dy_ungated.items():
                                     dy_acc[yi] = (
@@ -992,8 +1038,8 @@ class _MessagePassingBwdKernel:
                         with named_scope("cg_sweep"):
                             _scalar_x_sweep(
                                 c,
-                                x_plane,
-                                dz_plane,
+                                x_planes,
+                                dz_planes,
                                 y_vmem,
                                 edge_scalars_vmem,
                                 d_edge_scalars_vmem,
@@ -1066,6 +1112,7 @@ class _MessagePassingBwdKernel:
             for stride in range(c.plan.n_channel_strides):
                 run_stride(stride)
 
+        scratch_present = [s is not None for s in _scratch_shapes(c)]
         return kernel
 
     def __call__(
@@ -1113,7 +1160,7 @@ class _MessagePassingBwdKernel:
                     (c.num_cores, 2, c.x_dim_padded, c.channels_padded), c.dtype
                 ),
             ],
-            scratch_shapes=_scratch_shapes(c),
+            scratch_shapes=[s for s in _scratch_shapes(c) if s is not None],
             in_specs=_call_in_specs(ops),
             out_specs=[
                 pl.BlockSpec(d_edge_scalars_shape, memory_space=pltpu.HBM),
