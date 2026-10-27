@@ -40,6 +40,7 @@ from e3j.pallas_ops.convolution.mosaic_tpu.params import (
 )
 from e3j.pallas_ops.utils.coef import group_coef_by_xi, group_coef_by_zi
 from e3j.pallas_ops.utils.mosaic_tpu import (
+    MAX_PLANNED_VMEM_BYTES,
     BlockPlan,
     plan_blocks,
     round_up,
@@ -52,10 +53,10 @@ from e3j.pallas_ops.utils.named_scope import named_scope
 class BwdScratch(NamedTuple):
     x_stage: (
         pl.MemoryRef | None
-    )  # (edge_block_size*x_dim*pieces, piece_width): x[senders], x_dim*pieces rows per edge
+    )  # ([2,] edge_block_size*x_dim*pieces, piece_width): x[senders], x_dim*pieces rows per edge
     dz_stage: (
         pl.MemoryRef | None
-    )  # (edge_block_size*out_dim*pieces, piece_width): dz[receivers], same row grouping
+    )  # ([2,] edge_block_size*out_dim*pieces, piece_width): dz[receivers], same row grouping
     dz_plane: pl.MemoryRef  # ([2,] out_dim, edge_block_size, channels): dz[receiver]
     x_plane: (
         pl.MemoryRef
@@ -130,6 +131,7 @@ class _BwdConstants(NamedTuple):
     mask_tail_before_dy: bool  # faster on v6e; on v4 it spills past VMEM at l_max=3
     scalar_x: bool  # x_dim == 1, one path and a distinct yi per zi: `_scalar_x_sweep`
     walk_fast_span: int  # chunks per single-sender fast path of the dx walk (1 = off)
+    double_stage: bool  # x/dz stages + semaphores per slot, prefetch unpredicated
 
 
 def _piece_width(channel_block: int, num_lanes: int) -> int:
@@ -160,6 +162,7 @@ def _vmem_shapes(
     num_lanes: int,
     edge_block_size: int,
     channel_block: int,
+    double_stage: bool,
 ) -> tuple[dict[str, tuple[int, ...]], ...]:
     """Shapes of the VMEM scratch, the pipelined operands and the live values."""
     if _direct_planes(channel_block, num_lanes, x_dim + out_dim):
@@ -168,12 +171,15 @@ def _vmem_shapes(
             "x_plane": (2, x_dim, edge_block_size, channel_block),
         }
     else:
+        slots = (2,) if double_stage else ()
         gather = {
             "x_stage": (
+                *slots,
                 edge_block_size * x_dim * _pieces(channel_block, num_lanes),
                 _piece_width(channel_block, num_lanes),
             ),
             "dz_stage": (
+                *slots,
                 edge_block_size * out_dim * _pieces(channel_block, num_lanes),
                 _piece_width(channel_block, num_lanes),
             ),
@@ -211,7 +217,9 @@ def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
         c.plan.num_lanes,
         c.plan.edge_block_size,
         c.plan.channel_block,
+        c.double_stage,
     )
+    slots = (2,) if c.double_stage else ()
     return BwdScratch(
         **{name: pltpu.VMEM(shape, c.dtype) for name, shape in scratch.items()},
         **dict.fromkeys(("x_stage", "dz_stage") - scratch.keys()),
@@ -221,8 +229,8 @@ def _scratch_shapes(c: _BwdConstants) -> BwdScratch:
         count_smem=pltpu.SMEM((1,), jnp.int32),
         flush_pending_smem=pltpu.SMEM((1,), jnp.int32),
         flush_count_smem=pltpu.SMEM((1,), jnp.int32),
-        gather_semaphore=pltpu.SemaphoreType.DMA,
-        stage_semaphore=pltpu.SemaphoreType.DMA,
+        gather_semaphore=pltpu.SemaphoreType.DMA(slots),
+        stage_semaphore=pltpu.SemaphoreType.DMA(slots),
         flush_semaphore=pltpu.SemaphoreType.DMA((1,)),
     )
 
@@ -520,7 +528,9 @@ class _MessagePassingBwdKernel:
         lane_tile = min(channels_padded, num_lanes)
         x_dim_padded = round_up(x_dim, num_sublanes)
 
-        def vmem_bytes(edge_block_size: int, channel_block: int) -> int:
+        def vmem_bytes(
+            edge_block_size: int, channel_block: int, double_stage: bool = False
+        ) -> int:
             scratch, operands, values = _vmem_shapes(
                 out_dim,
                 x_dim,
@@ -531,6 +541,7 @@ class _MessagePassingBwdKernel:
                 num_lanes,
                 edge_block_size,
                 channel_block,
+                double_stage,
             )
             return vmem_step_bytes(
                 scratch.values(),
@@ -552,6 +563,11 @@ class _MessagePassingBwdKernel:
             vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
             edge_block_size=bwd_config.edge_block_size,
             channel_block=bwd_config.channel_block,
+        )
+        # double-buffer the stages only when that fits the planned tile as is
+        double_stage = plan.edge_block_size >= _MIN_STRIDED_EDGE_BLOCK_SIZE and (
+            vmem_bytes(plan.edge_block_size, plan.channel_block, double_stage=True)
+            <= min(tpu_info.vmem_capacity_bytes, MAX_PLANNED_VMEM_BYTES)
         )
         channel_block = plan.channel_block
         n_channel_strides = plan.n_channel_strides
@@ -686,6 +702,7 @@ class _MessagePassingBwdKernel:
             mask_tail_before_dy=tpu_info.generation >= 6,
             scalar_x=scalar_x,
             walk_fast_span=fast_span,
+            double_stage=double_stage,
         )
         return ops, constants
 
@@ -820,6 +837,47 @@ class _MessagePassingBwdKernel:
                     core_id,
                 )
 
+                def gather_copies(read_sender, read_receiver, slot):
+                    x_sem, dz_sem = gather_semaphore, stage_semaphore
+                    x_dst, dz_dst = x_stage, dz_stage
+                    if c.double_stage:
+                        x_sem, dz_sem = x_sem.at[slot], dz_sem.at[slot]
+                        if not direct:
+                            x_dst, dz_dst = x_stage.at[slot], dz_stage.at[slot]
+                    x_copies, dz_copies = [], []
+                    for k in range(c.plan.edge_block_size):
+                        x_copies.append(
+                            pltpu.make_async_copy(
+                                x_hbm.at[
+                                    stride,
+                                    pl.ds(read_sender(k) * x_rows, x_rows),
+                                    :,
+                                ],
+                                (
+                                    x_plane.at[slot, :, k, :]
+                                    if direct
+                                    else x_dst.at[pl.ds(k * x_rows, x_rows), :]
+                                ),
+                                x_sem,
+                            )
+                        )
+                        dz_copies.append(
+                            pltpu.make_async_copy(
+                                dz_hbm.at[
+                                    stride,
+                                    pl.ds(read_receiver(k) * dz_rows, dz_rows),
+                                    :,
+                                ],
+                                (
+                                    dz_plane.at[slot, :, k, :]
+                                    if direct
+                                    else dz_dst.at[pl.ds(k * dz_rows, dz_rows), :]
+                                ),
+                                dz_sem,
+                            )
+                        )
+                    return [*x_copies, *dz_copies]
+
                 def body(
                     y_vmem,
                     edge_scalars_vmem,
@@ -846,46 +904,18 @@ class _MessagePassingBwdKernel:
                     ]  # noqa: E731
 
                     # ---- 1. gather x[sender] and dz[receiver], one edge per row ----
-                    def gather_copies(read_sender, read_receiver, slot):
-                        x_copies, dz_copies = [], []
-                        for k in range(c.plan.edge_block_size):
-                            x_dst, dz_dst = (
-                                (x_plane.at[slot, :, k, :], dz_plane.at[slot, :, k, :])
-                                if direct
-                                else (
-                                    x_stage.at[pl.ds(k * x_rows, x_rows), :],
-                                    dz_stage.at[pl.ds(k * dz_rows, dz_rows), :],
-                                )
-                            )
-                            x_copies.append(
-                                pltpu.make_async_copy(
-                                    x_hbm.at[
-                                        stride,
-                                        pl.ds(read_sender(k) * x_rows, x_rows),
-                                        :,
-                                    ],
-                                    x_dst,
-                                    gather_semaphore,
-                                )
-                            )
-                            dz_copies.append(
-                                pltpu.make_async_copy(
-                                    dz_hbm.at[
-                                        stride,
-                                        pl.ds(read_receiver(k) * dz_rows, dz_rows),
-                                        :,
-                                    ],
-                                    dz_dst,
-                                    stage_semaphore,
-                                )
-                            )
-                        return [*x_copies, *dz_copies]
-
-                    slot = block_idx % 2 if direct else 0
+                    slot = block_idx % 2 if direct or c.double_stage else 0
 
                     @pl.when(block_idx == jnp.int32(0))
                     def _cold_start():
-                        for copy in gather_copies(senders_read, receivers_read, 0):
+                        for copy in gather_copies(senders_read, receivers_read, slot):
+                            copy.start()
+
+                    if c.double_stage:
+                        # prefetch the next block into the other slot, unpredicated
+                        for copy in gather_copies(
+                            senders_next_read, receivers_next_read, 1 - slot
+                        ):
                             copy.start()
 
                     for copy in gather_copies(senders_read, receivers_read, slot):
@@ -910,21 +940,25 @@ class _MessagePassingBwdKernel:
                         x_planes, dz_planes = x_plane.at[slot], dz_plane.at[slot]
                     else:
                         x_planes, dz_planes = x_plane, dz_plane
+                        x_src, dz_src = x_stage, dz_stage
+                        if c.double_stage:
+                            x_src, dz_src = x_stage.at[slot], dz_stage.at[slot]
                         with named_scope("extract"):
                             for xi in range(c.x_dim):
-                                x_plane[xi, :, :] = plane(x_stage, xi, x_rows)
+                                x_plane[xi, :, :] = plane(x_src, xi, x_rows)
                             for zi in range(c.out_dim):
-                                dz_plane[zi, :, :] = plane(dz_stage, zi, dz_rows)
+                                dz_plane[zi, :, :] = plane(dz_src, zi, dz_rows)
 
                     count_smem[0] = block_idx + 1
 
-                    # prefetch the next block's gathers now
-                    @pl.when(block_idx < blocks_this_core - 1)
-                    def _prefetch():
-                        for copy in gather_copies(
-                            senders_next_read, receivers_next_read, 1 - slot
-                        ):
-                            copy.start()
+                    if not c.double_stage:
+                        # prefetch the next block's gathers now
+                        @pl.when(block_idx < blocks_this_core - 1)
+                        def _prefetch():
+                            for copy in gather_copies(
+                                senders_next_read, receivers_next_read, 1 - slot
+                            ):
+                                copy.start()
 
                     tile_shape = (c.plan.edge_block_size, c.plan.channel_block)
 
@@ -1099,6 +1133,14 @@ class _MessagePassingBwdKernel:
                     d_edge_scalars_hbm,
                     dy_hbm,
                 )
+
+                if c.double_stage:
+                    # drain the last step's redundant prefetch
+                    @pl.when(count_smem[0] > 0)
+                    def _drain_prefetch():
+                        no_edge = lambda k: jnp.int32(0)  # noqa: E731
+                        for copy in gather_copies(no_edge, no_edge, count_smem[0] % 2):
+                            copy.wait()
 
                 # Flush the last still-open group
                 final_sender = current_sender_smem[0]
