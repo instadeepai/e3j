@@ -14,14 +14,54 @@
 
 """Edge-sized operands of the fused MP-conv fwd/bwd kernels."""
 
+from enum import Enum
+
 import jax.numpy as jnp
 from jax import Array, lax
 from jax.experimental import pallas as pl
 
 
-def edge_scalars_edge_major(num_blocks: int, channels: int) -> bool:
-    """Whether XLA's TPU layout keeps `(n_edges, num_blocks, channels)` edge-major."""
-    return channels % 128 == 0 and (num_blocks in (1, 2, 4) or num_blocks % 8 == 0)
+class EdgeScalarsLayout(Enum):
+    """How the kernels lay out the `(n_edges, num_blocks, channels)` edge scalars."""
+
+    FLAT = "flat"  # (n_edges, num_blocks * channels): the radial MLP's own output
+    EDGE_MAJOR = "edge_major"  # (n_edges, num_blocks, channels)
+    BLOCK_MAJOR = "block_major"  # (num_blocks, n_edges, channels)
+
+    def apply(self, edge_scalars: Array) -> Array:
+        """`(n_edges, num_blocks, channels)` edge scalars in this layout."""
+        if self is EdgeScalarsLayout.FLAT:
+            return edge_scalars.reshape(edge_scalars.shape[0], -1)
+        if self is EdgeScalarsLayout.BLOCK_MAJOR:
+            return jnp.transpose(edge_scalars, (1, 0, 2))
+        return edge_scalars
+
+    def revert(self, edge_scalars: Array, num_blocks: int) -> Array:
+        """Inverse of `apply`."""
+        if self is EdgeScalarsLayout.FLAT:
+            return edge_scalars.reshape(edge_scalars.shape[0], num_blocks, -1)
+        if self is EdgeScalarsLayout.BLOCK_MAJOR:
+            return jnp.transpose(edge_scalars, (1, 0, 2))
+        return edge_scalars
+
+    @property
+    def edge_axis(self) -> int:
+        return 1 if self is EdgeScalarsLayout.BLOCK_MAJOR else 0
+
+
+def edge_scalars_layout(
+    num_blocks: int, channels: int, channel_block: int, num_lanes: int
+) -> EdgeScalarsLayout:
+    """How the kernels read the `(n_edges, num_blocks, channels)` edge scalars.
+
+    Lane-tiled channels read one pass wide go flat, a free view of the row-major
+    array; otherwise edge-major only where XLA's TPU layout keeps it so.
+    """
+    if channels % num_lanes == 0 and channel_block == channels:
+        return EdgeScalarsLayout.FLAT
+    if channels % num_lanes == 0 and (num_blocks in (1, 2, 4) or num_blocks % 8 == 0):
+        return EdgeScalarsLayout.EDGE_MAJOR
+    return EdgeScalarsLayout.BLOCK_MAJOR
 
 
 def pad_to_one_block(array: Array, axis: int, edge_block_size: int) -> Array:
@@ -38,7 +78,7 @@ def pad_to_one_block(array: Array, axis: int, edge_block_size: int) -> Array:
 
 
 def edge_scalars_spec(
-    edge_major: bool,
+    layout: EdgeScalarsLayout,
     edge_block_size: int,
     num_blocks: int,
     channel_block: int,
@@ -46,7 +86,12 @@ def edge_scalars_spec(
     stride,
 ) -> pl.BlockSpec:
     """Pipeline block of the edge scalars (and of their cotangent)."""
-    if edge_major:
+    if layout is EdgeScalarsLayout.FLAT:
+        return pl.BlockSpec(
+            (edge_block_size, num_blocks * channel_block),
+            lambda i: (walked_block(i), 0),
+        )
+    if layout is EdgeScalarsLayout.EDGE_MAJOR:
         return pl.BlockSpec(
             (edge_block_size, num_blocks, channel_block),
             lambda i, s=stride: (walked_block(i), 0, s),
@@ -57,16 +102,30 @@ def edge_scalars_spec(
     )
 
 
-def load_edge_scalars(edge_major: bool, ref, block: int) -> Array:
-    """The `(edges, channels)` tile of irrep block `block`."""
-    return ref[:, block, :] if edge_major else ref[block, :, :]
+ALL_ROWS = slice(None)  # every edge row of a tile
 
 
-def store_edge_scalars(edge_major: bool, ref, block: int, tile: Array) -> None:
-    if edge_major:
-        ref[:, block, :] = tile
+def load_edge_scalars(
+    layout: EdgeScalarsLayout, ref, block: int, width: int, rows=ALL_ROWS
+) -> Array:
+    """The `(edges, width)` tile of irrep block `block`, edge `rows` of it."""
+    if layout is EdgeScalarsLayout.FLAT:
+        return ref[rows, block * width : (block + 1) * width]
+    if layout is EdgeScalarsLayout.EDGE_MAJOR:
+        return ref[rows, block, :]
+    return ref[block, rows, :]
+
+
+def store_edge_scalars(
+    layout: EdgeScalarsLayout, ref, block: int, tile: Array, rows=ALL_ROWS
+) -> None:
+    if layout is EdgeScalarsLayout.FLAT:
+        width = tile.shape[-1]
+        ref[rows, block * width : (block + 1) * width] = tile
+    elif layout is EdgeScalarsLayout.EDGE_MAJOR:
+        ref[rows, block, :] = tile
     else:
-        ref[block, :, :] = tile
+        ref[block, rows, :] = tile
 
 
 def walked_edge_block(

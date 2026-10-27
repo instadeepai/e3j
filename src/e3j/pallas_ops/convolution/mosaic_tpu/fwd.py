@@ -82,7 +82,7 @@ class _FwdOperands(NamedTuple):
 
     x: jax.Array  # (n_nodes, x_dim, channels)
     y: jax.Array  # (y_dim, n_edge_blocks, edge_block_size)
-    edge_scalars: jax.Array  # (num_irrep_blocks, n_edges, channels), or edge-major
+    edge_scalars: jax.Array  # in `edges_layout`, see edges.edge_scalars_layout
     senders: jax.Array  # (n_edge_blocks, edge_block_size)
     receivers: jax.Array  # (n_edge_blocks, edge_block_size)
     zeros_out: jax.Array  # (n_nodes, out_dim, channels): zero-init, shared by cores
@@ -112,7 +112,7 @@ class _FwdConstants(NamedTuple):
     tp_plan: tuple  # see _plan_scalings
     irrep_block_of_output: tuple  # zi -> edge-scalar block
     dynamic_edges: bool  # walk only the blocks holding a real edge
-    edge_major: bool  # edge scalars layout, see edges.edge_scalars_edge_major
+    edges_layout: edges.EdgeScalarsLayout  # see edges.edge_scalars_layout
     n_edges: int  # edge scalars rows; the last block reads past them
     segment_matmul: bool  # x_dim == 1: TP + receiver reduce as one MXU dot per block
     flush_slots: int  # staging rows in flight: segment_matmul flushes back to back
@@ -315,11 +315,6 @@ class _MessagePassingFwdKernel:
         n_edges, y_dim = y.shape
         y = jnp.transpose(y, (1, 0))  # (y_dim, n_edges)
         _, num_irrep_blocks, _ = edge_scalars.shape
-        edge_major = edges.edge_scalars_edge_major(num_irrep_blocks, channels)
-        if not edge_major:
-            edge_scalars = jnp.transpose(
-                edge_scalars, (1, 0, 2)
-            )  # (num_irrep_blocks, n_edges, channels)
         out_dim = params.z_space.dim
 
         channels_padded = (
@@ -362,8 +357,12 @@ class _MessagePassingFwdKernel:
         edge_block_size = plan.edge_block_size
         assert edge_block_size % chunk == 0
 
+        edges_layout = edges.edge_scalars_layout(
+            num_irrep_blocks, channels, plan.channel_block, num_lanes
+        )
+        edge_scalars = edges_layout.apply(edge_scalars)
         edge_scalars = edges.pad_to_one_block(
-            edge_scalars, 0 if edge_major else 1, edge_block_size
+            edge_scalars, edges_layout.edge_axis, edge_block_size
         )
         # Pad y and the indices to whole blocks; the edge scalars stay ragged.
         # Padded edges repeat the last receiver so no extra group is created.
@@ -441,7 +440,7 @@ class _MessagePassingFwdKernel:
             tp_plan=tp_plan,
             irrep_block_of_output=irrep_block_of_output,
             dynamic_edges=dynamic_edges,
-            edge_major=edge_major,
+            edges_layout=edges_layout,
             n_edges=max(n_edges, edge_block_size),
             segment_matmul=segment_matmul,
             flush_slots=chunk if segment_matmul else 1,
@@ -467,7 +466,7 @@ class _MessagePassingFwdKernel:
                     index_map=lambda i: (0, walked_block(i), 0),
                 ),
                 edges.edge_scalars_spec(
-                    c.edge_major,
+                    c.edges_layout,
                     c.plan.edge_block_size,
                     c.num_irrep_blocks,
                     c.plan.channel_block,
@@ -506,7 +505,7 @@ class _MessagePassingFwdKernel:
         def kernel(
             x_hbm,  # (n_nodes, x_dim, channels)
             y_hbm,  # (y_dim, n_edge_blocks, edge_block_size)
-            edge_scalars_hbm,  # (num_irrep_blocks, n_edges, channels)
+            edge_scalars_hbm,  # see _FwdOperands.edge_scalars
             senders_hbm,  # (n_edges,)
             receivers_hbm,  # (n_edges,)
             _zeros_hbm,  # (n_nodes, out_dim, channels)
@@ -723,7 +722,10 @@ class _MessagePassingFwdKernel:
 
                     def edge_scalar_tile(block):
                         tile = edges.load_edge_scalars(
-                            c.edge_major, edge_scalars_vmem, block
+                            c.edges_layout,
+                            edge_scalars_vmem,
+                            block,
+                            c.plan.channel_block,
                         )
                         return edges.mask_ragged_rows(tile, edge_block, c.n_edges)
 

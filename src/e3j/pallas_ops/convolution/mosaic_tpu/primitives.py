@@ -221,10 +221,15 @@ def convolution_mosaic_tpu(
     if has_dummy_edges:
         x, senders, receivers, edge_is_real = route_dummy_edges(x, senders, receivers)
 
+    # The edge scalars cross the VJP flat, as the radial MLP emits them, so their
+    # residual and cotangent keep the layout the kernels read and write.
+    num_blocks = s.shape[1]
+    unflatten = lambda s: s.reshape(s.shape[0], num_blocks, -1)  # noqa: E731
+
     @jax.custom_vjp
     def _fwd_differentiable(x, y, s):
         return _fwd_vmappable(
-            x, y, s, receivers, senders, params.swapped(), edge_is_real
+            x, y, unflatten(s), receivers, senders, params.swapped(), edge_is_real
         )
 
     def _fwd(x, y, s):
@@ -233,10 +238,13 @@ def convolution_mosaic_tpu(
 
     def _bwd(residuals, dm):
         x, y, s, senders, receivers = residuals
-        return _convolution_bwd(x, y, s, senders, receivers, params, dm, edge_is_real)
+        dx, dy, ds = _convolution_bwd(
+            x, y, unflatten(s), senders, receivers, params, dm, edge_is_real
+        )
+        return dx, dy, ds.reshape(s.shape)
 
     _fwd_differentiable.defvjp(_fwd, _bwd)
-    z = _fwd_differentiable(x, y, s)
+    z = _fwd_differentiable(x, y, s.reshape(s.shape[0], -1))
     return z[:n_nodes] if has_dummy_edges else z
 
 

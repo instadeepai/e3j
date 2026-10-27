@@ -89,7 +89,7 @@ class _BwdOperands(NamedTuple):
     x: jax.Array  # (n_nodes, x_dim*channels_padded): folded node feats
     dz: jax.Array  # (n_nodes, out_dim*channels_padded): folded output cotangent
     y: jax.Array  # (n_edges, y_dim), or (y_dim, n_edges) when y_edge_minor
-    edge_scalars: jax.Array  # (num_irrep_blocks, n_edges, channels), or edge-major
+    edge_scalars: jax.Array  # in `edges_layout`, see edges.edge_scalars_layout
     senders: jax.Array  # (n_edge_blocks, edge_block_size)
     receivers: jax.Array  # (n_edge_blocks, edge_block_size)
     zeros_dx: (
@@ -126,7 +126,7 @@ class _BwdConstants(NamedTuple):
     yi_used: tuple  # spherical-harmonic indices with CG contributions
     irrep_block_of_output: tuple  # zi -> edge-scalar block
     dynamic_edges: bool  # walk only the blocks holding a real edge
-    edge_major: bool  # edge scalars layout, see edges.edge_scalars_edge_major
+    edges_layout: edges.EdgeScalarsLayout  # see edges.edge_scalars_layout
     y_edge_minor: bool  # y / dy as (y_dim, n_edges): XLA's layout of the narrow y
     mask_tail_before_dy: bool  # faster on v6e; on v4 it spills past VMEM at l_max=3
     scalar_x: bool  # x_dim == 1, one path and a distinct yi per zi: `_scalar_x_sweep`
@@ -271,7 +271,7 @@ def _zero_unwalked_blocks(
             in_specs=[],
             out_specs=[
                 edges.edge_scalars_spec(
-                    c.edge_major,
+                    c.edges_layout,
                     c.plan.edge_block_size,
                     c.num_irrep_blocks,
                     c.channels_padded,
@@ -327,7 +327,7 @@ def _dy_spec(
 def _edge_scalars_spec(c: _BwdConstants, walked_block, stride: int) -> pl.BlockSpec:
     """Pipeline block of the edge scalars (and of their cotangent)."""
     return edges.edge_scalars_spec(
-        c.edge_major,
+        c.edges_layout,
         c.plan.edge_block_size,
         c.num_irrep_blocks,
         c.plan.channel_block,
@@ -396,10 +396,8 @@ def _scalar_x_sweep(
         dx = None
         dy_tile = jnp.zeros((sub_tile, c.num_lanes), c.dtype)
         for block, zi_group in c.cg_by_block:
-            edge_scalars_block = (
-                edge_scalars_vmem[rows, block, :]
-                if c.edge_major
-                else edge_scalars_vmem[block, rows, :]
+            edge_scalars_block = edges.load_edge_scalars(
+                c.edges_layout, edge_scalars_vmem, block, width, rows
             )
             x_es = x * edge_scalars_block
             h = None
@@ -410,10 +408,9 @@ def _scalar_x_sweep(
                 dy_col = jnp.sum(x_es * dz_zi, axis=-1, keepdims=True)
                 dy_col = dy_col if v == 1.0 else v * dy_col
                 dy_tile = jnp.where(dy_lane == yi, dy_col, dy_tile)
-            if c.edge_major:
-                d_edge_scalars_vmem[rows, block, :] = x * h
-            else:
-                d_edge_scalars_vmem[block, rows, :] = x * h
+            edges.store_edge_scalars(
+                c.edges_layout, d_edge_scalars_vmem, block, x * h, rows
+            )
             dx_term = edge_scalars_block * h
             dx = dx_term if dx is None else dx + dx_term
         dx_plane[0, rows, :] = dx
@@ -516,11 +513,6 @@ class _MessagePassingBwdKernel:
             y_dim <= num_lanes
         ), f"bwd requires y_dim <= {num_lanes} (single lane tile); got {y_dim}."
         _, num_irrep_blocks, _ = edge_scalars.shape
-        edge_major = edges.edge_scalars_edge_major(num_irrep_blocks, channels)
-        if not edge_major:
-            edge_scalars = jnp.transpose(
-                edge_scalars, (1, 0, 2)
-            )  # (num_irrep_blocks, n_edges, channels)
         out_dim = params.z_space.dim
 
         channels_padded = round_up(channels, num_lanes)
@@ -594,9 +586,13 @@ class _MessagePassingBwdKernel:
             edge_scalars = jnp.pad(
                 edge_scalars, (no_pad, no_pad, (0, channels_padded - channels))
             )
+        edges_layout = edges.edge_scalars_layout(
+            num_irrep_blocks, channels, channel_block, num_lanes
+        )
+        edge_scalars = edges_layout.apply(edge_scalars)
         y = edges.pad_to_one_block(y, 0, edge_block_size)
         edge_scalars = edges.pad_to_one_block(
-            edge_scalars, 0 if edge_major else 1, edge_block_size
+            edge_scalars, edges_layout.edge_axis, edge_block_size
         )
         edge_rows = y.shape[0]
         # Pad the indices to whole blocks; y and the edge scalars stay ragged.
@@ -697,7 +693,7 @@ class _MessagePassingBwdKernel:
             yi_used=yi_used,
             irrep_block_of_output=irrep_block_of_output,
             dynamic_edges=dynamic_edges,
-            edge_major=edge_major,
+            edges_layout=edges_layout,
             y_edge_minor=y_edge_minor,
             mask_tail_before_dy=tpu_info.generation >= 6,
             scalar_x=scalar_x,
@@ -1020,7 +1016,10 @@ class _MessagePassingBwdKernel:
                                         else dy_ungated[yi] + dy_term
                                     )
                                 edge_scalars_block = edges.load_edge_scalars(
-                                    c.edge_major, edge_scalars_vmem, block
+                                    c.edges_layout,
+                                    edge_scalars_vmem,
+                                    block,
+                                    c.plan.channel_block,
                                 )
                                 d_edge_scalars_acc = zero
                                 for xi, dx_term in dx_ungated.items():
@@ -1036,7 +1035,7 @@ class _MessagePassingBwdKernel:
                                         dy_acc[yi] + edge_scalars_block * dy_term
                                     )
                                 edges.store_edge_scalars(
-                                    c.edge_major,
+                                    c.edges_layout,
                                     d_edge_scalars_vmem,
                                     block,
                                     d_edge_scalars_acc,
@@ -1180,11 +1179,7 @@ class _MessagePassingBwdKernel:
                     x=pltpu.with_memory_space_constraint(ops.x, pltpu.VMEM)
                 )
 
-        d_edge_scalars_shape = (
-            (c.edge_rows, c.num_irrep_blocks, c.channels_padded)
-            if c.edge_major
-            else (c.num_irrep_blocks, c.edge_rows, c.channels_padded)
-        )
+        d_edge_scalars_shape = ops.edge_scalars.shape
         dy_shape = (
             (c.plan.n_channel_strides, c.y_dim, c.edge_rows)
             if c.y_edge_minor
@@ -1264,8 +1259,9 @@ class _MessagePassingBwdKernel:
         if c.y_edge_minor:
             dy = jnp.transpose(dy)
         dy = dy[: c.n_edges]
-        if not c.edge_major:
-            d_edge_scalars_packed = jnp.transpose(d_edge_scalars_packed, (1, 0, 2))
+        d_edge_scalars_packed = c.edges_layout.revert(
+            d_edge_scalars_packed, c.num_irrep_blocks
+        )
         d_edge_scalars = d_edge_scalars_packed[: c.n_edges, :, : c.channels]
         return dx, dy, d_edge_scalars
 

@@ -22,6 +22,7 @@ backward runs the natural edges directly. The inputs below satisfy that contract
 """
 
 import functools
+import re
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -837,3 +838,35 @@ def test_ragged_last_edge_block(x_ir, y_ir, o_ir, channels, bwd_edge_block_size,
     ):
         assert _rel(a[:n_kept], b) < RTOL, f"{name} mismatch"
         np.testing.assert_array_equal(np.asarray(a[n_kept:]), 0.0, err_msg=name)
+
+
+@pytest.mark.parametrize("x_ir", ["0e", "0e + 1o", "0e + 1o + 2e"])  # 4, 10, 17 blocks
+def test_radial_edge_scalars_reach_the_kernels_without_a_copy(x_ir):
+    """Edge scalars made by a radial MLP, as in MACE, go in and out of the fwd and
+    bwd kernels with no relayout of an edge-scalar-sized buffer."""
+    channels, n_hidden = 128, 8
+    k = _kernels(x_ir, "0e + 1o + 2e + 3o", "0e + 1o + 2e + 3o")
+    node, sph, _, senders, receivers = _contract_valid_inputs(
+        k.conv, n_nodes=12, channels=channels
+    )
+    n_edges, num_blocks = sph.shape[0], k.conv._mix.num_irreps
+    rng = np.random.default_rng(0)
+    hidden = jnp.asarray(rng.standard_normal((n_edges, n_hidden)), jnp.float32)
+    w = jnp.asarray(rng.standard_normal((n_hidden, num_blocks * channels)), jnp.float32)
+
+    def loss(w, hidden, node, sph, senders, receivers):
+        es = (hidden @ w).reshape(n_edges, num_blocks, channels)
+        conv = k.conv._fused_mosaic_tpu_eval
+        return jnp.sum(conv(node, sph, es, senders, receivers) ** 2)
+
+    args = (w, hidden, node, sph, senders, receivers)
+    hlo = jax.jit(jax.grad(loss, (0, 1))).lower(*args).compile().as_text()
+    edge_scalars_size = n_edges * num_blocks * channels
+    relayouts = []
+    for shape, op in re.findall(
+        r"= (\w+\[[\d,]*\])\S* (copy|transpose|reshape)\(", hlo
+    ):
+        dims = [int(d) for d in re.findall(r"\d+", shape.split("[")[1])]
+        if int(np.prod(dims)) == edge_scalars_size:
+            relayouts.append(f"{op} {shape}")
+    assert not relayouts, relayouts
