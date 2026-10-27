@@ -1178,6 +1178,9 @@ class _MessagePassingBwdKernel:
                 ops = ops._replace(
                     x=pltpu.with_memory_space_constraint(ops.x, pltpu.VMEM)
                 )
+        else:
+            # pin y: it's read once, and XLA would otherwise give it the v4 CMEM slot x/dz need
+            ops = ops._replace(y=pltpu.with_memory_space_constraint(ops.y, pltpu.HBM))
 
         d_edge_scalars_shape = ops.edge_scalars.shape
         dy_shape = (
