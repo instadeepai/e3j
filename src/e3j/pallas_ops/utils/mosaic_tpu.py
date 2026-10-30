@@ -28,6 +28,13 @@ from jax.experimental.pallas import tpu as pltpu
 DEFAULT_BATCH_BLOCK_SIZE_CANDIDATES = [1, 2, 4, 8, 16, 32]
 
 
+def validate_batch_block_size(v: int, candidates: list[int]) -> int:
+    """`v`, or a ValueError if it is not one of `candidates`."""
+    if v not in candidates:
+        raise ValueError(f"batch_block_size must be one of {candidates}, got {v}")
+    return v
+
+
 def round_up(n: int, multiple: int) -> int:
     """Smallest multiple of `multiple` that is >= `n`."""
     return pl.cdiv(n, multiple) * multiple

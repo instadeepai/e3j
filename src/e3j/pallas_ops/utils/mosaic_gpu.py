@@ -41,8 +41,8 @@ def shared_memory_budget() -> int:
     return getattr(jax.local_devices()[0], "shared_memory_per_block_optin", 227 * 1024)
 
 
-def add_term(total: jax.Array | None, term: jax.Array) -> jax.Array:
-    """`total + term`, with `None` standing for an empty sum.
+def add_term(total: jax.Array | None, term: jax.Array | None) -> jax.Array | None:
+    """`total + term`, with `None` standing for an empty sum (or a zero term).
 
     The unrolled Clebsch-Gordan sums are built term by term at trace time, and
     most of them are short. Seeding them with `None` rather than a zero row keeps
@@ -50,7 +50,9 @@ def add_term(total: jax.Array | None, term: jax.Array) -> jax.Array:
     have to fold away -- and avoids needing a laid-out zero row wherever a sum
     starts.
     """
-    return term if total is None else total + term
+    if total is None:
+        return term
+    return total if term is None else total + term
 
 
 def sum_terms(terms: Iterable[jax.Array]) -> jax.Array | None:
