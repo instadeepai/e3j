@@ -43,9 +43,13 @@ class SymmetricContraction(Enum):
     Values:
         UNFUSED: power expansion, permutation and index-wise linear as
             separate ops, each following its own config option.
+        FUSED_MOSAIC_TPU: Single fused Pallas Mosaic-TPU kernel (powers +
+            permutation + index-wise linear), ``TRAILING_CHANNELS`` layout.
+            Requires a TPU backend.
     """
 
     UNFUSED = "UNFUSED"
+    FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
 
 
 class Aggregation(Enum):

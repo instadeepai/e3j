@@ -15,12 +15,19 @@
 import functools
 
 import jax.numpy as jnp
+import numpy as np
 
 from e3j import utils
+from e3j.core.filter import Filter
 from e3j.core.linear import check_weights
 from e3j.core.linear_indexwise import LinearBlock, LinearIndexwise
 from e3j.core.permutation import Permutation
 from e3j.core.power_expansion import PowerExpansion
+from e3j.pallas_ops.symmetric_contraction import (
+    PallasMosaicTPUSymmetricContractionParams,
+    symmetric_contraction_pallas_mosaic_tpu,
+)
+from e3j.pallas_ops.symmetric_contraction.common.params import BlockPlan
 from e3j.spaces import O3Space
 from e3j.utils import options
 from e3j.utils.options import Layout
@@ -120,6 +127,113 @@ class SymmetricContraction:
         """Per-(l, p) blocks of the index-wise linear, in weight order."""
         return self.linear.blocks
 
+    @functools.cached_property
+    def mosaic_tpu_params(self) -> PallasMosaicTPUSymmetricContractionParams:
+        """Static metadata of the fused Mosaic TPU kernel."""
+        return self._kernel_params(PallasMosaicTPUSymmetricContractionParams)
+
+    def _block_plans(self) -> list[BlockPlan]:
+        """Static assembly plan for every non-degenerate final linear block.
+
+        Resolves, once at trace time, exactly the block-copy
+        :class:`~e3j.core.Permutation` performs: for each input coordinate of
+        each final `(l, p)` block of the index-wise linear, which power
+        computed it, and at which of that power's own (unfiltered)
+        coordinates. `Permutation.sigma` is followed one coordinate at a time,
+        so nothing is assumed about how its spans line up with the powers:
+        same-`(l, p)` blocks of consecutive powers may sit side by side (with
+        `keep_irrep_out="0e"`, every power's do).
+        """
+        filters: list[Filter] = self.expansion.filter_layers
+        sigma = self.permutation.sigma
+        # Where each power's filtered coordinates start in the concatenation
+        # `sigma` indexes into.
+        offsets = np.cumsum([0] + [int(f.target.dim) for f in filters])
+
+        plans = []
+        out_offset = 0
+        for block in self.linear_blocks:
+            m_out, m_in = block.shape
+            # Where the block lands in the output, degenerate blocks included.
+            block_offset = out_offset
+            out_offset += m_out * (2 * block.l + 1)
+            if m_in == 0 or m_out == 0:
+                continue
+            raw = sigma[block.begin : block.end]
+            # `side="right"` steps over empty powers, which start and end at
+            # the same offset.
+            stages = np.searchsorted(offsets, raw, side="right") - 1
+            # `Filter.indices` maps a filtered position back to its raw
+            # (unfiltered) coordinate in that power's hidden space.
+            input_map = tuple(
+                (int(s), int(filters[s].indices[r - offsets[s]]))
+                for s, r in zip(stages, raw)
+            )
+            plans.append(
+                BlockPlan(
+                    l=block.l,
+                    p=block.p,
+                    m_out=m_out,
+                    input_map=input_map,
+                    offset=block_offset,
+                )
+            )
+        return plans
+
+    def _kernel_params(self, cls):
+        """Build fused kernel parameters from this contraction: `cls`, a
+        :class:`~e3j.pallas_ops.symmetric_contraction.common.params.PallasSymmetricContractionStructure`
+        with its kernel's default config.
+
+        The Clebsch-Gordan structure of every power transition, and the final
+        block assembly plan, are unrolled at trace time from their NumPy
+        data -- mirroring :meth:`e3j.core.TensorProduct._mgpu_params`.
+        """
+        layers = self.expansion.otimes_layers
+        stage_irreps = tuple(
+            tuple((int(mul), int(ir.l), int(ir.p)) for mul, ir in space)
+            for space in (self.source, *(layer.target for layer in layers))
+        )
+        stage_indices = tuple(layer.coef.indices for layer in layers)
+        stage_values = tuple(layer.coef.data for layer in layers)
+        return cls(
+            stage_irreps=stage_irreps,
+            stage_indices=stage_indices,
+            stage_values=stage_values,
+            blocks=tuple(self._block_plans()),
+            num_species=self.num_species,
+            out_dim=self.target.dim,
+        )
+
+    def _kernel_weights(self, weight: list[jnp.ndarray]) -> list[jnp.ndarray]:
+        """Weights of the non-degenerate blocks, the fused kernels' (`_block_plans`)."""
+        return [w for w, b in zip(weight, self.linear_blocks) if all(b.shape)]
+
+    def _unfused_eval(
+        self,
+        features: jnp.ndarray,
+        indices: jnp.ndarray,
+        weight: list[jnp.ndarray],
+    ) -> jnp.ndarray:
+        """Plain JAX implementation: the powers, permuted, then the linear."""
+        powers = self.expansion(features)
+        x_powers = jnp.concat(powers, axis=self.layout.axis_lm)
+        return self.linear(self.permutation(x_powers), indices, weight)
+
+    def _fused_mosaic_tpu_eval(
+        self,
+        features: jnp.ndarray,
+        indices: jnp.ndarray,
+        weight: list[jnp.ndarray],
+    ) -> jnp.ndarray:
+        """Mosaic TPU implementation, on flattened `(N, dim, C)` features."""
+        return symmetric_contraction_pallas_mosaic_tpu(
+            features,
+            jnp.asarray(indices),
+            self._kernel_weights(weight),
+            self.mosaic_tpu_params,
+        )
+
     def __call__(
         self,
         features: jnp.ndarray,
@@ -149,11 +263,20 @@ class SymmetricContraction:
             )
         features = features.reshape(-1, *features.shape[-2:])
         indices = indices.reshape(-1)
+        fused = (options.SymmetricContraction.FUSED_MOSAIC_TPU,)
+        if (
+            self.config.symmetric_contraction in fused
+            and self.layout != Layout.TRAILING_CHANNELS
+        ):
+            raise NotImplementedError(
+                f"{self.config.symmetric_contraction.name} SymmetricContraction "
+                "only supports TRAILING_CHANNELS layout."
+            )
         match self.config.symmetric_contraction:
             case options.SymmetricContraction.UNFUSED:
-                powers = self.expansion(features)
-                x_powers = jnp.concat(powers, axis=self.layout.axis_lm)
-                y = self.linear(self.permutation(x_powers), indices, weight)
+                y = self._unfused_eval(features, indices, weight)
+            case options.SymmetricContraction.FUSED_MOSAIC_TPU:
+                y = self._fused_mosaic_tpu_eval(features, indices, weight)
             case _:
                 raise RuntimeError(
                     f"Unknown implementation {self.config.symmetric_contraction}"
