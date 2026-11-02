@@ -17,6 +17,7 @@ import functools
 
 import flax.linen as nn
 import jax.numpy as jnp
+from jax.nn.initializers import Initializer
 
 from e3j.core.symmetric_contraction import (
     SymmetricContraction as _CoreSymmetricContraction,
@@ -25,7 +26,7 @@ from e3j.linen.linear_indexwise import LinearIndexwise
 from e3j.spaces import O3Space
 from e3j.utils import Config
 from e3j.utils.config import config
-from e3j.utils.options import Layout
+from e3j.utils.options import Layout, LinearIndexwiseInitialization
 
 
 class SymmetricContraction(nn.Module):
@@ -44,6 +45,8 @@ class SymmetricContraction(nn.Module):
     num_channels: int
     layout: Layout | str
     l_max: int | None = None
+    kernel_init: Initializer | LinearIndexwiseInitialization | str = "FAN_IN"
+    rescale_gradients: bool = True
     # frozen copy, so the module hashes and unpickling leaves the global alone
     config: Config = dataclasses.field(default_factory=config.state)
 
@@ -80,5 +83,7 @@ class SymmetricContraction(nn.Module):
             num_indices=self.num_species,
             num_channels=self.num_channels,
             layout=core.layout,
+            kernel_init=self.kernel_init,
+            rescale_gradients=self.rescale_gradients,
         ).weights
         return core(features, indices, weights)

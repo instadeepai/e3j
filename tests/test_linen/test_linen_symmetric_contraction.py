@@ -25,6 +25,7 @@ import e3j
 from e3j.core.symmetric_contraction import (
     SymmetricContraction as CoreSymmetricContraction,
 )
+from e3j.linen.linear_indexwise import LinearIndexwise
 from e3j.linen.symmetric_contraction import SymmetricContraction
 from e3j.spaces import O3Space
 from e3j.utils.config import Config
@@ -461,3 +462,106 @@ class TestSymmetricContractionBatchAxes:
         feats = jnp.ones((2, 5, *self.feat_shape(layout)))
         with pytest.raises(ValueError, match="do not match the batch axes"):
             apply(feats, jnp.zeros(10, dtype=int))
+
+
+class TestSymmetricContractionWeightOptions:
+    """`kernel_init` and `rescale_gradients` reach the `LinearIndexwise` weights."""
+
+    num_species = 3
+    num_channels = 4
+    batch_size = 6
+
+    @pytest.fixture(params=["LEADING_CHANNELS", "TRAILING_CHANNELS"])
+    def layout(self, request) -> str:
+        return request.param
+
+    @pytest.fixture(
+        params=[("0e + 1o + 2e", 2, "0e + 1o + 2e"), ("0e + 1o", 3, "0e + 1o")]
+    )
+    def args(self, request, layout):
+        source, correlation, out = request.param
+        return (source, correlation, out, self.num_species, self.num_channels, layout)
+
+    @pytest.fixture
+    def inputs(self, args):
+        source, *_, layout = args
+        key = random.key(3)
+        feats = random.normal(
+            key, (self.batch_size, self.num_channels, O3Space(source).dim)
+        )
+        index = random.choice(key, self.num_species, (self.batch_size,))
+        return _TestSymmetricContraction._to_layout(feats, layout), index
+
+    @staticmethod
+    def raw_weights(module, params, **kwargs) -> list[jnp.ndarray]:
+        """Weights of a standalone `LinearIndexwise` on the module's params."""
+        core = module.core
+        linear = LinearIndexwise(
+            core.linear.source_irreps,
+            core.linear.target_irreps,
+            num_indices=module.num_species,
+            num_channels=module.num_channels,
+            layout=core.layout,
+            **kwargs,
+        )
+        sub = {"params": params["params"]["LinearIndexwise_0"]}
+        return linear.apply(sub, method=lambda m: m.weights)
+
+    @pytest.mark.parametrize("rescale_gradients", [False, True])
+    def test_matches_core(self, args, inputs, rescale_gradients):
+        """The output is the core's on the matching `LinearIndexwise` weights."""
+        module = SymmetricContraction(*args, rescale_gradients=rescale_gradients)
+        params = module.init(random.key(0), *inputs)
+        weights = self.raw_weights(module, params, rescale_gradients=rescale_gradients)
+        assert_allclose(module.apply(params, *inputs), module.core(*inputs, weights))
+
+    def test_defaults_unchanged(self, args, inputs):
+        """Defaults are `FAN_IN` with rescaling: same params and outputs as before."""
+        module = SymmetricContraction(*args)
+        explicit = SymmetricContraction(
+            *args, kernel_init="FAN_IN", rescale_gradients=True
+        )
+        assert module.kernel_init == "FAN_IN" and module.rescale_gradients
+        assert hash(module) == hash(explicit)
+        params = module.init(random.key(0), *inputs)
+        jax.tree.map(assert_allclose, params, explicit.init(random.key(0), *inputs))
+        weights = self.raw_weights(module, params)
+        assert_allclose(module.apply(params, *inputs), module.core(*inputs, weights))
+
+    def test_param_trees_interchangeable(self, args, inputs):
+        """Both settings give the same tree, so checkpoints load either way."""
+        rescaled = SymmetricContraction(*args, rescale_gradients=True)
+        raw = SymmetricContraction(*args, rescale_gradients=False)
+        p_rescaled = rescaled.init(random.key(0), *inputs)
+        p_raw = raw.init(random.key(0), *inputs)
+        shapes = lambda p: jax.tree.map(jnp.shape, p)  # noqa: E731
+        assert shapes(p_rescaled) == shapes(p_raw)
+        # the same params are interpreted differently
+        assert not jnp.allclose(
+            rescaled.apply(p_rescaled, *inputs), raw.apply(p_rescaled, *inputs)
+        )
+
+    def test_initializer_requires_no_rescaling(self, args, inputs):
+        """An initializer with rescaling fails as in `LinearIndexwise`."""
+        init = jax.nn.initializers.normal(0.1)
+        module = SymmetricContraction(*args, kernel_init=init, rescale_gradients=True)
+        with pytest.raises(AssertionError, match="rescale_gradients"):
+            module.init(random.key(0), *inputs)
+        module = SymmetricContraction(*args, kernel_init=init, rescale_gradients=False)
+        params = module.init(random.key(0), *inputs)
+        stored = params["params"]["LinearIndexwise_0"]
+        weights = [
+            stored[f"weight{i}_{b.l}_{b.p}"]
+            for i, b in enumerate(module.core.linear_blocks)
+        ]
+        assert_allclose(module.apply(params, *inputs), module.core(*inputs, weights))
+
+
+def test_module_hashes_and_pickles_with_options():
+    module = SymmetricContraction(
+        "0e + 1o", 2, "0e + 1o", 2, 4, "LEADING_CHANNELS", rescale_gradients=False
+    )
+    assert hash(module) == hash(pickle.loads(pickle.dumps(module)))
+    assert hash(module) != hash(
+        SymmetricContraction("0e + 1o", 2, "0e + 1o", 2, 4, "LEADING_CHANNELS")
+    )
