@@ -12,9 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Second derivatives of a fused backward, through a plain JAX reference."""
+"""Derivatives of the fused kernels, through a plain JAX reference."""
 
 import jax
+
+
+def reference_vjp(reference, x1, index, weights, dy, with_dw: bool):
+    """`(dx1, dweights)`, the VJP of `reference(x1, index, weights) -> y`
+    with `dy` (`dweights` is `None` without `with_dw`). Plain JAX, so
+    differentiable in turn."""
+    _, pullback = jax.vjp(
+        lambda x1, weights: reference(x1, index, weights), x1, weights
+    )
+    dx1, dweights = pullback(dy)
+    return dx1, dweights if with_dw else None
 
 
 def reference_backward_fn(first_order, reference, with_dw: bool, kind: str):
@@ -45,11 +56,7 @@ def reference_backward_fn(first_order, reference, with_dw: bool, kind: str):
         x1, weights, dy, index = residuals
 
         def first_order_reference(x1, weights, dy):
-            _, pullback = jax.vjp(
-                lambda x1, weights: reference(x1, index, weights), x1, weights
-            )
-            dx1, dweights = pullback(dy)
-            return dx1, dweights if with_dw else None
+            return reference_vjp(reference, x1, index, weights, dy, with_dw)
 
         _, pullback = jax.vjp(first_order_reference, x1, weights, dy)
         return (*pullback(cotangents), None)

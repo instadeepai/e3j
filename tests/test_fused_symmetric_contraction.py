@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy.testing as testing
 import pytest
-from conftest import skip_unless_tpu
+from conftest import skip_unless_hopper, skip_unless_tpu
 
 from e3j.core.symmetric_contraction import SymmetricContraction
 from e3j.linen.symmetric_contraction import SymmetricContraction as LinenModule
@@ -27,9 +27,10 @@ from e3j.utils.config import Config
 from e3j.utils.options import SymmetricContraction as Algorithm
 
 TPU = Algorithm.FUSED_MOSAIC_TPU
-MARKS = {TPU: pytest.mark.mosaic_tpu}
-REQUIRE = {TPU: skip_unless_tpu}
-TOLERANCE = {TPU: 2e-3}
+GPU = Algorithm.FUSED_MOSAIC_GPU
+MARKS = {TPU: pytest.mark.mosaic_tpu, GPU: pytest.mark.mosaic_gpu}
+REQUIRE = {TPU: skip_unless_tpu, GPU: skip_unless_hopper}
+TOLERANCE = {TPU: 2e-3, GPU: 1e-3}
 
 # (source, correlation, target)
 CASES = [
@@ -40,6 +41,18 @@ CASES = [
 ]
 # (batch, mul, num_species): unaligned batches and sub-128 mul exercise padding
 TPU_SHAPES = [(256, 128, 4), (16, 64, 2), (37, 256, 8)]
+# (source, correlation, target, num_species, mul, batch)
+GPU_CASES = [
+    ("0e+1o+2e", 1, "0e+1o", 4, 128, 37),
+    ("0e+1o+2e", 2, "0e+1o", 4, 128, 300),
+    ("0e+1o+2e", 3, "0e+1o", 4, 128, 64),
+    ("0e+1o+2e+3o", 3, "0e+1o+2e", 5, 256, 40),
+    # every power is pure `0e`: its blocks sit side by side in `sigma`
+    ("0e+1o+2e+3o", 3, "0e", 3, 128, 64),
+    ("1x0e+2x1o+1x2e", 2, "0e+1o", 3, 128, 96),
+    ("0e+1o", 4, "0e+1o", 2, 128, 17),
+    ("0e+1o+2e+3o", 3, "0e+1o", 3, 128, 50),
+]
 
 
 def _param(algorithm, *values, marks=True):
@@ -57,10 +70,12 @@ DISPATCH_CASES = [
     _param(TPU, *case, num_species, mul, batch)
     for case in CASES
     for batch, mul, num_species in TPU_SHAPES
-]
+] + [_param(GPU, *case) for case in GPU_CASES]
 
-# (algorithm, source, correlation, target, mul)
-SECOND_ORDER_CASES = [_param(TPU, *case, 64) for case in CASES]
+# (algorithm, source, correlation, target, mul): GPU channels are multiples of 128
+SECOND_ORDER_CASES = [_param(TPU, *case, 64) for case in CASES] + [
+    _param(GPU, *case, 128) for case in CASES
+]
 
 
 @pytest.fixture
@@ -143,7 +158,7 @@ def test_core_second_order_matches_unfused(algorithm, source, correlation, targe
 
 
 @pytest.mark.usefixtures("require_backend")
-@pytest.mark.parametrize(("algorithm", "mul"), [_param(TPU, 32)])
+@pytest.mark.parametrize(("algorithm", "mul"), [_param(TPU, 32), _param(GPU, 128)])
 def test_core_batch_axes(algorithm, mul):
     structure = ("0e + 1o", 2, "0e + 1o", 2, mul)
     features, indices, weight = _inputs(_core(*structure, Algorithm.UNFUSED), 24)
@@ -157,7 +172,7 @@ def test_core_batch_axes(algorithm, mul):
 
 
 @pytest.mark.usefixtures("require_backend")
-@pytest.mark.parametrize(("algorithm", "mul"), [_param(TPU, 64)])
+@pytest.mark.parametrize(("algorithm", "mul"), [_param(TPU, 64), _param(GPU, 128)])
 def test_linen_module_config(algorithm, mul):
     """The linen module carries the option through its config."""
     source, target = "0e + 1o + 2e", "0e + 1o"

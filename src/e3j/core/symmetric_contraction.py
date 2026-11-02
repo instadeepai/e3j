@@ -24,7 +24,9 @@ from e3j.core.linear_indexwise import LinearBlock, LinearIndexwise
 from e3j.core.permutation import Permutation
 from e3j.core.power_expansion import PowerExpansion
 from e3j.pallas_ops.symmetric_contraction import (
+    PallasMosaicGPUSymmetricContractionParams,
     PallasMosaicTPUSymmetricContractionParams,
+    symmetric_contraction_pallas_mosaic_gpu,
     symmetric_contraction_pallas_mosaic_tpu,
 )
 from e3j.pallas_ops.symmetric_contraction.common.params import BlockPlan
@@ -45,6 +47,9 @@ class SymmetricContraction:
     * `i : (N,)` is the vector of species indices `0 <= i < S`,
     * `W` stores one `(S, C, m_out, m_in)` weight per block of
       :attr:`linear_blocks`, passed explicitly to :meth:`__call__`.
+
+    Species indices outside `[0, S)` are undefined behaviour: they are not
+    checked, and the result may differ between implementations.
 
     References
     ----------
@@ -131,6 +136,11 @@ class SymmetricContraction:
     def mosaic_tpu_params(self) -> PallasMosaicTPUSymmetricContractionParams:
         """Static metadata of the fused Mosaic TPU kernel."""
         return self._kernel_params(PallasMosaicTPUSymmetricContractionParams)
+
+    @functools.cached_property
+    def mosaic_gpu_params(self) -> PallasMosaicGPUSymmetricContractionParams:
+        """Static metadata of the fused Mosaic GPU kernel."""
+        return self._kernel_params(PallasMosaicGPUSymmetricContractionParams)
 
     def _block_plans(self) -> list[BlockPlan]:
         """Static assembly plan for every non-degenerate final linear block.
@@ -220,6 +230,41 @@ class SymmetricContraction:
         x_powers = jnp.concat(powers, axis=self.layout.axis_lm)
         return self.linear(self.permutation(x_powers), indices, weight)
 
+    def _fused_mosaic_gpu_eval(
+        self,
+        features: jnp.ndarray,
+        indices: jnp.ndarray,
+        weight: list[jnp.ndarray],
+    ) -> jnp.ndarray:
+        """Pallas Mosaic GPU implementation: one kernel per pass.
+
+        Evaluates every power's Clebsch-Gordan contraction and the final
+        index-wise linear mix in a single kernel launch -- no power, and no
+        permuted concatenation of them, ever reaches GMEM. Differentiable in
+        `features` and `weight`, through fused backward kernels (see
+        `pallas_ops.symmetric_contraction.mosaic_gpu.primitives`), twice
+        too (e.g. to train on forces): where no fused kernel takes the
+        second derivative, through :meth:`_unfused_eval`.
+        """
+        indices = jnp.asarray(indices)
+
+        def reference(features, indices, kept_weights):
+            # zeros, not the empty original: that may be an outer tracer
+            given = iter(kept_weights)
+            full = [
+                next(given) if all(b.shape) else jnp.zeros(w.shape, w.dtype)
+                for w, b in zip(weight, self.linear_blocks)
+            ]
+            return self._unfused_eval(features, indices, full)
+
+        return symmetric_contraction_pallas_mosaic_gpu(
+            features,
+            indices,
+            self._kernel_weights(weight),
+            self.mosaic_gpu_params,
+            reference=reference,
+        )
+
     def _fused_mosaic_tpu_eval(
         self,
         features: jnp.ndarray,
@@ -245,7 +290,8 @@ class SymmetricContraction:
         Args:
             features (jnp.ndarray): `(..., C, dim)` or `(..., dim, C)` features
                 depending on :attr:`layout`.
-            indices (jnp.ndarray): `(...)`-array of species indices.
+            indices (jnp.ndarray): `(...)`-array of species indices in
+                `[0, S)`; out-of-range indices are undefined behaviour.
             weight (list[jnp.ndarray]): one `(S, C, m_out, m_in)` array per
                 block of :attr:`linear_blocks`.
 
@@ -263,7 +309,10 @@ class SymmetricContraction:
             )
         features = features.reshape(-1, *features.shape[-2:])
         indices = indices.reshape(-1)
-        fused = (options.SymmetricContraction.FUSED_MOSAIC_TPU,)
+        fused = (
+            options.SymmetricContraction.FUSED_MOSAIC_TPU,
+            options.SymmetricContraction.FUSED_MOSAIC_GPU,
+        )
         if (
             self.config.symmetric_contraction in fused
             and self.layout != Layout.TRAILING_CHANNELS
@@ -277,6 +326,8 @@ class SymmetricContraction:
                 y = self._unfused_eval(features, indices, weight)
             case options.SymmetricContraction.FUSED_MOSAIC_TPU:
                 y = self._fused_mosaic_tpu_eval(features, indices, weight)
+            case options.SymmetricContraction.FUSED_MOSAIC_GPU:
+                y = self._fused_mosaic_gpu_eval(features, indices, weight)
             case _:
                 raise RuntimeError(
                     f"Unknown implementation {self.config.symmetric_contraction}"

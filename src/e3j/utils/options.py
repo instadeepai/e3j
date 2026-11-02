@@ -46,10 +46,15 @@ class SymmetricContraction(Enum):
         FUSED_MOSAIC_TPU: Single fused Pallas Mosaic-TPU kernel (powers +
             permutation + index-wise linear), ``TRAILING_CHANNELS`` layout.
             Requires a TPU backend.
+        FUSED_MOSAIC_GPU: single fused Pallas Mosaic-GPU kernel for every
+            power's Clebsch-Gordan contraction and the final index-wise linear
+            mix, ``TRAILING_CHANNELS`` layout, with a fused backward. Targets
+            Hopper (sm_90) and newer.
     """
 
     UNFUSED = "UNFUSED"
     FUSED_MOSAIC_TPU = "FUSED_MOSAIC_TPU"
+    FUSED_MOSAIC_GPU = "FUSED_MOSAIC_GPU"
 
 
 class Aggregation(Enum):

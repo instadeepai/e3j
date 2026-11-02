@@ -50,3 +50,10 @@ def test_reduced_plan_matches_unfused(case):
     )
     # the tolerance is the float32 reference
     np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_reduced_plan_size():
+    """At `l_max = 3 -> 0e + 1o`, correlation 3, the 28 + 58 features of the
+    two blocks span 13 + 16 dimensions: the folded weight table's rows."""
+    core = unfused_symmetric_contraction("0e+1o+2e+3o", 3, "0e+1o", 1, 1)
+    assert build_plan(core.mosaic_gpu_params).weight_rows == 13 + 16

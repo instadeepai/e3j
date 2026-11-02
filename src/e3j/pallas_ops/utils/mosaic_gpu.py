@@ -41,6 +41,11 @@ def shared_memory_budget() -> int:
     return getattr(jax.local_devices()[0], "shared_memory_per_block_optin", 227 * 1024)
 
 
+def sm_count() -> int:
+    """Streaming multiprocessors of the local device."""
+    return getattr(jax.local_devices()[0], "core_count", 132)
+
+
 def add_term(total: jax.Array | None, term: jax.Array | None) -> jax.Array | None:
     """`total + term`, with `None` standing for an empty sum (or a zero term).
 

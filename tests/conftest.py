@@ -62,6 +62,15 @@ def skip_unless_tpu():
         pytest.skip("pallas_mosaic_tpu tests require a TPU backend")
 
 
+def skip_unless_hopper():
+    """Skip (rather than fail) when there is no Hopper-or-newer CUDA device."""
+    if jax.default_backend() != "gpu":
+        pytest.skip("mosaic_gpu tests require a CUDA backend")
+    capability = getattr(jax.devices()[0], "compute_capability", None)
+    if capability is None or tuple(int(p) for p in capability.split(".")) < (9, 0):
+        pytest.skip(f"kernel targets sm_90+, device is sm_{capability}")
+
+
 # (source_irreps, correlation, keep_irrep_out): every block non-degenerate
 SYMMETRIC_CONTRACTION_CONFIGS = [
     ("0e+1o+2e", 1, "0e+1o"),
