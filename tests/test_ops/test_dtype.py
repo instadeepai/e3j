@@ -40,8 +40,12 @@ DTYPES = ["float16", "float32", "float64"]
 NUM_OUT, NUM_X, NUM_Y, NNZ, NUM_ROWS = 40, 16, 25, 120, 32
 
 # Default channel count for the dtype grid. Channel-count coverage lives in
-# test_tensor_product_op.py.
+# test_tensor_product_op.py and test_convolution_op.py.
 CHANNELS = 32
+
+# The convolution backward picks its copy width from the channel count, and
+# whether a row stays aligned depends on the dtype: 4 is the narrowest 4-wide case.
+CONV_CHANNELS = [1, 2, 4, CHANNELS]
 
 
 def x64_if(dtype):
@@ -236,11 +240,11 @@ def conv_reference(idx, val, x, y, s, s_index, sender, receiver):
     return z.at[receiver].add(z_e * s[:, s_index, :])
 
 
-def conv_inputs(dtype):
+def conv_inputs(dtype, channels=CHANNELS):
     keys = iter(random.split(random.key(123), 3))
-    x = random.normal(next(keys), (CONV_NODES, CONV_X, CHANNELS)).astype(dtype)
+    x = random.normal(next(keys), (CONV_NODES, CONV_X, channels)).astype(dtype)
     y = random.normal(next(keys), (CONV_EDGES, CONV_Y)).astype(dtype)
-    s = random.normal(next(keys), (CONV_EDGES, CONV_SCALARS, CHANNELS)).astype(dtype)
+    s = random.normal(next(keys), (CONV_EDGES, CONV_SCALARS, channels)).astype(dtype)
     return x, y, s
 
 
@@ -265,10 +269,11 @@ class TestConvolutionDtype:
 
         return op, ref
 
-    def test_forward(self, dtype):
+    @pytest.mark.parametrize("channels", CONV_CHANNELS)
+    def test_forward(self, dtype, channels):
         with x64_if(dtype):
             op, ref = self._closure(dtype)
-            x, y, s = conv_inputs(dtype)
+            x, y, s = conv_inputs(dtype, channels)
 
             result, expect = op(x, y, s), ref(x, y, s)
 
@@ -276,10 +281,11 @@ class TestConvolutionDtype:
             assert result.shape == expect.shape
             assert_close(expect, result, dtype, nnz=CONV_NNZ)
 
-    def test_backward(self, dtype):
+    @pytest.mark.parametrize("channels", CONV_CHANNELS)
+    def test_backward(self, dtype, channels):
         with x64_if(dtype):
             op, ref = self._closure(dtype)
-            x, y, s = conv_inputs(dtype)
+            x, y, s = conv_inputs(dtype, channels)
 
             grads = jax.grad(lambda *a: jnp.sum(op(*a)), argnums=(0, 1, 2))(x, y, s)
             refs = jax.grad(lambda *a: jnp.sum(ref(*a)), argnums=(0, 1, 2))(x, y, s)

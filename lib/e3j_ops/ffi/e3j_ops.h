@@ -400,7 +400,7 @@ xla::Error ConvolutionHandler(
     int32_t num_out = out->dimensions()[1];
     int32_t num_scalars = s.dimensions()[1];
 
-    // Assert LHS channels are 32-multiple
+    // Assert LHS channels are a power of 2
     bool supported = (is_pow_2(channels_x));
     if (not supported) {
         std::string msg =
@@ -505,11 +505,11 @@ xla::Error ConvolutionBwdHandler(
     int32_t num_out = dm.dimensions()[1];
     int32_t num_scalars = s.dimensions()[1];
 
-    // Assert LHS channels are 32-multiple
-    bool supported = (channels_x % 32 == 0);
+    // Assert LHS channels are a power of 2, like the forward
+    bool supported = (is_pow_2(channels_x));
     if (not supported) {
         std::string msg =
-            "Convolution backward requires 32 multiple as LHS channels. Got "
+            "Convolution backward requires power of 2 as LHS channels for now. Got "
             + std::to_string(channels_x) + ".\n";
         return e3j::Error::Unimplemented(msg).to_xla();
     }

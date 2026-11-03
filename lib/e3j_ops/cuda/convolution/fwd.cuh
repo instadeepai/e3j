@@ -199,10 +199,20 @@ __device__ void bigotimes(
     // Apply threadwise channel offsets:
     //  - OUTER:        middle operand only is broadcast
     //  - INNER | MAP:  all operands have same number of channels
-    x1.data += threadIdx.x * N;
-    x3.data += threadIdx.x * N;
-    if constexpr (kMode == Mode::INNER || kMode == Mode::MAP)
-        x2.data += threadIdx.x * N;
+    // Every INNER lane dereferences these, so a spare lane (below 32 channels,
+    // when the warp is wider than the channel axis) would read past its SMEM
+    // row; the modulo wraps it back onto a real row. OUTER/MAP deref only
+    // inside the out.shape[1] guard below.
+    if constexpr (kMode == Mode::INNER) {
+        x1.data += threadIdx.x * N % x1.shape[1];
+        x2.data += threadIdx.x * N % x2.shape[1];
+        x3.data += threadIdx.x * N % x3.shape[1];
+    } else {
+        x1.data += threadIdx.x * N;
+        x3.data += threadIdx.x * N;
+        if constexpr (kMode == Mode::MAP)
+            x2.data += threadIdx.x * N;
+    }
 
     if constexpr (kMode == Mode::OUTER || kMode == Mode::MAP) {
         // Prevent OOB threads from writing out.
@@ -248,9 +258,11 @@ __device__ void bigotimes(
                 x1.data, x2.data, x3.data,
                 x1.shape[1], x2.shape[1], x3.shape[1]
             );
-            // Horizontally sum N channels within each lane,
-            // then reduce the 32-lane scalar across the warp.
-            Val zi_scalar = tp::sum_warp(hsum<N,Val>(zi.val), 32);
+            // Horizontally sum N channels per lane, then reduce across the warp.
+            // A spare lane must contribute zero, not the wrapped row it read,
+            // since sum_warp shuffles all 32 lanes.
+            Val zi_scalar = tp::sum_warp(
+                (threadIdx.x * N < x1.shape[1]) ? hsum<N,Val>(zi.val) : Val(0), 32);
             // STS for leading threads
             if (lane == 0) {
                 // column-major to prevent bank conflicts

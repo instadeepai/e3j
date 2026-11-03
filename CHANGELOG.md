@@ -50,6 +50,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 - `e3j.utils.sparse.sparse_coo` builds a coalesced `SparseCOO`, and raises on
   out-of-bounds indices.
 - `Coef.pack()` returns the packed coefficients as a numpy array.
+- CUDA convolution: the backward supports 1, 2, 4, 8 and 16 channels; it used to
+  raise `Unimplemented` below 32.
 
 ### Removed
 

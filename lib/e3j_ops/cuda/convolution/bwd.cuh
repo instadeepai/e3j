@@ -138,6 +138,11 @@ __global__ void kernel_bwd (
     int num_y    = y.shape[0];
     int num_warps = blockDim.x / 32;
 
+    // load<4> / fill<4> move 4 values per access, so every GMEM row of x, dm, s
+    // and dx must start on a multiple of 4 values. Below 4 channels, a row size
+    // that is not a multiple of 4 breaks that: fall back to scalar accesses.
+    bool vec4 = x.shape[1] % 4 == 0;
+
     // --- Shared memory prolog ----------------------------------------
 
     extern __shared__ __align__(16) char smem__[];
@@ -196,7 +201,10 @@ __global__ void kernel_bwd (
 
         // Zero this sender's dx row before accumulating edges in place.
         // Covers coef-less ("jumped") output rows that dx never writes.
-        fill<4>(gmem_dx + (size_t)sender * size_x, Val(0), size_x);
+        if (vec4)
+            fill<4>(gmem_dx + (size_t)sender * size_x, Val(0), size_x);
+        else
+            fill<1>(gmem_dx + (size_t)sender * size_x, Val(0), size_x);
         __syncthreads();
 
         for (int edge = first_edge; edge < last_edge; edge++) {
@@ -232,10 +240,16 @@ __global__ void kernel_bwd (
                 CuArray2D<const Val> dm_ = { dm.data + offset_z, dm.shape[0], dm.shape[1] };
                 CuArray2D<const Val> s_  = { s.data  + offset_z, s.shape[0],  s.shape[1]  };
 
-                smem.x.load<4>(x_, sender);
-                smem.dm.load<4>(dm_, receiver);
+                if (vec4) {
+                    smem.x.load<4>(x_, sender);
+                    smem.dm.load<4>(dm_, receiver);
+                    smem.mix.load<4>(s_, edge_t);
+                } else {
+                    smem.x.load<1>(x_, sender);
+                    smem.dm.load<1>(dm_, receiver);
+                    smem.mix.load<1>(s_, edge_t);
+                }
                 smem.y.load<1>(y, edge_t);
-                smem.mix.load<4>(s_, edge_t);
                 __pipeline_commit();
                 wait_pipe<0>();
 

@@ -206,6 +206,27 @@ class _TestConvolutionOp:
             assert_allclose(expect, result, atol=5e-5, rtol=5e-5)
 
 
+@pytest.fixture(scope="class", params=[1, 2, 4, 8, 16])
+def narrow_channels(request):
+    request.cls.channels_x = request.param
+
+
+@pytest.mark.usefixtures("narrow_channels")
+class TestConvolutionNarrow(_TestConvolutionOp):
+    """Channel axis narrower than a warp.
+
+    Covers the backward paths that only run below 32 channels: lanes owning
+    no channel must add zero to the `dy` reduction, and below 4 channels the
+    copies fall back to 1-wide, as rows (`num_x = 9`) are not a multiple of 4.
+    """
+
+    num_idx = 200
+    num_x = 9
+    num_y = 16
+    num_out = 9
+    num_scalars = 3
+
+
 class TestConvolution32(_TestConvolutionOp):
     """N=1, basic."""
 
