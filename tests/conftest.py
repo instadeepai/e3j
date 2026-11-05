@@ -90,7 +90,7 @@ SYMMETRIC_CONTRACTION_CONFIG_IDS = [
 
 
 def unfused_symmetric_contraction(
-    source_irreps, correlation, keep_irrep_out, num_species, num_channels
+    source_irreps, correlation, keep_irrep_out, num_species, num_channels, l_max=None
 ):
     with config.use(
         symmetric_contraction=options.SymmetricContraction.UNFUSED,
@@ -103,16 +103,23 @@ def unfused_symmetric_contraction(
             num_species=num_species,
             num_channels=num_channels,
             layout="TRAILING_CHANNELS",
+            l_max=l_max,
         )
 
 
 def symmetric_contraction_case(
-    source_irreps, correlation, keep_irrep_out, num_species=3, num_channels=2, batch=40
+    source_irreps,
+    correlation,
+    keep_irrep_out,
+    num_species=3,
+    num_channels=2,
+    batch=40,
+    l_max=None,
 ):
     """`(core, weights, x, index, expected)`: NumPy float64 operands and the
     float32 `UNFUSED` output."""
     core = unfused_symmetric_contraction(
-        source_irreps, correlation, keep_irrep_out, num_species, num_channels
+        source_irreps, correlation, keep_irrep_out, num_species, num_channels, l_max
     )
     rng = np.random.default_rng(0)
     weights = [

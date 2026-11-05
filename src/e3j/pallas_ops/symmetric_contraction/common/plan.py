@@ -23,21 +23,35 @@ y[mo] = sum_i W[mo, i] * F_i(x)
 ```
 
 where the features `F_i` are irrep copies of the powers `x, x(x)x, ...`
-(:class:`BlockPlan`). Most features are linearly dependent: `x (x) x` is
-symmetric, so `(v, u) -> L` is `+-(u, v) -> L` and `(u, u) -> L` vanishes
-for odd `L`, and so on. At `l_max=3`, correlation 3 -> `0e+1o`, the 28 + 58
-features span only 13 + 16 dimensions.
+(:class:`BlockPlan`). Most features are linearly dependent, by the rules
+below: at `l_max=3`, correlation 3 -> `0e+1o`, the 28 + 58 features span
+only 13 + 16 dimensions.
 
-So for each `(block, degree)` the plan keeps a cheap spanning subset of the
-features, and folds the rest into the weights:
+So for each `(block, leaf multiset)` the plan keeps a cheap spanning subset
+of the features, and folds the rest into the weights:
 
 ```
 y = sum_i W[i] F_i = sum_j (sum_i W[i] A[i, j]) F_sel_j = sum_j W_eff[j] F_sel_j
 ```
 
-`A` is solved once at trace time, in float64, from random samples of the
-features. The caller applies `W_eff = W @ A` (:func:`fold_weights`), and the
-kernel only computes the selected features.
+`A` is solved once at trace time, in float64, without evaluating anything:
+each feature is a polynomial in `x` whose coefficients follow from the CG
+tables alone (:func:`_polynomials`), and the dependencies are those of the
+coefficients. They obey three rules:
+
+* A feature's monomials are products of its own leaves, the source copies
+  its CG path multiplies: features with different leaf multisets never mix,
+  so `A` is block-diagonal by multiset, in blocks of a few features.
+* A multiset `{a^n_a, b^n_b, ...}` holds as many independent `(L, p)`
+  features as `L` appears in `Sym^n_a(V_la) (x) Sym^n_b(V_lb) (x) ...` (a
+  plethysm), fewer if `l_max` pruned their paths.
+* Reordering the leaves of a path only recouples it, e.g. `(b, a) -> L` is
+  `(-1)^(la + lb + L) (a, b) -> L` and `(a, a) -> L` vanishes for odd `L`.
+  Symmetrizing the path's coefficients over its equal leaves applies all of
+  these at once.
+
+The caller applies `W_eff = W @ A` (:func:`fold_weights`), and the kernel
+only computes the selected features.
 
 Last-power features sharing a CG block are then factorized:
 
@@ -48,12 +62,12 @@ sum_j W_eff[j] CG(P_prev[b_j], x_a) = CG(sum_j W_eff[j] P_prev[b_j], x_a)
 so each group needs one CG contraction instead of one per feature.
 
 The CG coefficients are float32, so dependencies only hold to ~1e-7; the
-thresholds below sit well above that. The finished plan is checked against
-the unreduced contraction in float64 before use.
+thresholds below sit well above that. The finished plan is checked against the
+unreduced contraction in float64, at random samples, before use.
 """
 
 import functools
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import NamedTuple
 
 import jax
@@ -64,26 +78,16 @@ from e3j.pallas_ops.symmetric_contraction.common.params import (
     PallasSymmetricContractionStructure,
 )
 
-#: A feature is selected if the part of it outside the span of those already
-#: selected exceeds this fraction of its norm. Dependent features sit near
-#: 1e-7 (float32 rounding), independent ones at 1e-1 or above.
+#: A feature is selected if the part of its coefficients outside the span of
+#: those already selected exceeds this fraction of their norm. It is
+#: identically zero, e.g. `(u, u) -> L` for odd `L`, if symmetrizing over
+#: its equal leaves keeps less than this fraction of their norm
+#: (:class:`Polynomial`). Dependent and zero features sit near 1e-7 (float32
+#: rounding), independent and real ones at 1e-1 or above.
 _INDEPENDENCE_THRESHOLD = 1e-4
 
 #: Largest relative float64 error the finished plan may have.
 _VERIFY_TOLERANCE = 1e-5
-
-#: After symmetrizing a self-pair, coefficients below this fraction of the
-#: copy's largest are float32 residue and dropped.
-_CANCELLATION_THRESHOLD = 1e-6
-
-#: A feature whose norm is below this fraction of its norm without
-#: cancellation (all terms taken positive) is identically zero, e.g.
-#: `(u, u) -> L` for odd `L`. Exact zeros sit near 1e-16, real features at
-#: 1e-2 and above.
-_ZERO_THRESHOLD = 1e-6
-
-#: Sample rows evaluated at once, to bound memory.
-_EVAL_CHUNK = 256
 
 #: Fold coefficients this close to 0 or +-1 are snapped to it.
 _SNAP_TOLERANCE = 1e-6
@@ -217,12 +221,6 @@ def build_plan(params: PallasSymmetricContractionStructure) -> ReducedPlan:
     """The reduced plan of `params`, cached on its static content."""
     triples = _triples(params)
     copies, blocks_coef = _structure(params, triples)
-    rng = np.random.default_rng(0)
-    # Each sample gives `dim_l` values per feature: take enough samples for
-    # twice the largest feature count.
-    n_samples = max([64] + [-(-2 * b.m_in // b.dim_l) + 16 for b in params.blocks])
-    x = rng.standard_normal((n_samples, params.stage_dims[0]))
-    evals = _evaluate(params, triples, x)
     last = params.correlation - 1
     copy_at = [{c.start: c for c in stage} for stage in copies]
 
@@ -241,13 +239,14 @@ def build_plan(params: PallasSymmetricContractionStructure) -> ReducedPlan:
             by_stage[stage].append((mi, copy))
         features.append(dict(by_stage))
 
-    selected = _select(params, triples, copies, blocks_coef, evals, features, last)
+    poly = _polynomials(copies, blocks_coef)
+    selected = _select(params, copies, blocks_coef, poly, features, last)
 
     reduced = []
     weight_rows = 0
     for bi, block in enumerate(params.blocks):
         fold, direct, groups = _fold_and_factorize(
-            block, features[bi], selected[bi], evals, copies, blocks_coef, last
+            block, features[bi], selected[bi], poly, copies, blocks_coef, last
         )
         if fold.shape[1]:
             reduced.append(
@@ -332,27 +331,91 @@ def _structure(params, triples):
     return copies, coef
 
 
-def _evaluate(params, triples, x: np.ndarray, absolute: bool = False) -> list:
-    """Every power at the samples `x`, each `(n, stage_dims[s])` float64.
+class Polynomial(NamedTuple):
+    """A copy as a polynomial in the source.
 
-    With `absolute`, inputs and coefficients are made positive, so nothing
-    cancels.
+    `leaves` are the source copies its CG path multiplies, sorted: its
+    monomials are products of their coordinates. `coef` is the flattened
+    `(dim, *leaf_dims)` coefficient tensor in that leaf order, symmetrized
+    over equal leaves (as their product commutes), and `scale` is the
+    tensor's norm before symmetrizing.
     """
-    if absolute:
-        x = np.abs(x)
+
+    leaves: tuple[int, ...]
+    coef: np.ndarray
+    scale: float
+
+
+def _polynomials(copies, coef):
+    """`poly(stage, index)`: the :class:`Polynomial` of a copy, from the CG
+    blocks `coef` alone."""
+    # (stage, index) -> (leaves in path order, `(dim, *leaf_dims)` tensor).
+    # A plain dict, not a recursive cached function: that would be a
+    # reference cycle keeping every tensor alive until a full GC.
+    paths = {}
+
+    def path(stage, index):
+        start = (stage, index)
+        chain = []
+        while stage > 0 and (stage, index) not in paths:
+            chain.append((stage, index))
+            stage, index = stage - 1, copies[stage][index].prev
+        if stage == 0:
+            paths.setdefault((0, index), ((index,), np.eye(copies[0][index].dim)))
+        for key in reversed(chain):
+            copy = copies[key[0]][key[1]]
+            leaves, tensor = paths[(key[0] - 1, copy.prev)]
+            # out[m, ..., b] = sum_a CG[m, a, b] prev[a, ...]
+            tensor = np.einsum("mab,a...->m...b", coef[key[0]][key[1]], tensor)
+            paths[key] = ((*leaves, copy.src), tensor)
+        return paths[start]
+
+    @functools.cache
+    def poly(stage, index):
+        leaves, tensor = path(stage, index)
+        order = np.argsort(leaves, kind="stable")
+        tensor = np.transpose(tensor, (0, *(1 + order)))
+        leaves = tuple(leaves[i] for i in order)
+        return Polynomial(
+            leaves=leaves,
+            coef=_symmetrize(tensor, leaves).ravel(),
+            scale=float(np.linalg.norm(tensor)),
+        )
+
+    return poly
+
+
+def _symmetrize(tensor: np.ndarray, leaves: tuple[int, ...]) -> np.ndarray:
+    """Average `tensor` over the permutations of the axes of equal (sorted)
+    `leaves`, axis `k + 1` holding leaf `k`.
+
+    One leaf at a time, `Sym_k = (1 + sum_{i < k} (i k)) / k * Sym_{k-1}`:
+    `O(n^2)` transposes for `n` equal leaves instead of `n!`.
+    """
+    lo = 0
+    for n in Counter(leaves).values():  # in sorted order
+        for k in range(1, n):
+            total = tensor
+            for i in range(k):
+                axes = list(range(tensor.ndim))
+                axes[1 + lo + i], axes[1 + lo + k] = axes[1 + lo + k], axes[1 + lo + i]
+                total = total + np.transpose(tensor, axes)
+            tensor = total / (k + 1)
+        lo += n
+    return tensor
+
+
+def _evaluate(params, triples, x: np.ndarray) -> list:
+    """Every power at the samples `x`, each `(n, stage_dims[s])` float64."""
     out = [x]
     for s in range(1, params.correlation):
         zi, xi, yi, val = triples[s]
-        if absolute:
-            val = np.abs(val)
         # `reduceat` over the sorted terms: ~10x faster than a scatter-add.
         starts = np.flatnonzero(np.r_[True, zi[1:] != zi[:-1]])
         prev = out[-1]
         cur = np.zeros((x.shape[0], params.stage_dims[s]))
-        for lo in range(0, x.shape[0], _EVAL_CHUNK):
-            rows = slice(lo, lo + _EVAL_CHUNK)
-            prod = val * prev[rows, xi] * x[rows, yi]
-            cur[rows, zi[starts]] = np.add.reduceat(prod, starts, axis=1)
+        prod = val * prev[:, xi] * x[:, yi]
+        cur[:, zi[starts]] = np.add.reduceat(prod, starts, axis=1)
         out.append(cur)
     return out
 
@@ -376,13 +439,15 @@ def _group_cost(coef_block: np.ndarray, m_out: int) -> int:
     return min(len(nz) + m_out * by_mi, m_out * (len(nz) + by_mk))
 
 
-def _select(params, triples, copies, coef, evals, features, last):
-    """Greedily pick a spanning subset of each `(block, degree)`'s features.
+def _select(params, copies, coef, poly, features, last):
+    """Greedily pick a spanning subset of each `(block, leaf multiset)`'s
+    features.
 
-    Repeatedly take the remaining feature with the lowest marginal cost
-    (its mix, any group it opens, and copies not yet materialized). Keep it
-    if it is independent of the features already kept, else drop it for
-    good. Returns `selected[block][stage] = [mi, ...]`.
+    Identically-zero features are dropped first. Then repeatedly take the
+    remaining feature with the lowest marginal cost (its mix, any group it
+    opens, and copies not yet materialized). Keep it if its coefficients are
+    independent of the features already kept, else drop it for good.
+    Returns `selected[block][stage] = [mi, ...]`.
     """
     materialized = {(0, c.index) for c in copies[0]}
     open_groups = set()
@@ -424,36 +489,35 @@ def _select(params, triples, copies, coef, evals, features, last):
             )
         return m_out * copy.dim + mat_cost(copy.stage, copy.index)
 
-    abs_evals = _evaluate(params, triples, evals[0], absolute=True)
+    def is_zero(stage, copy):
+        """Whether symmetrizing cancels the feature (`_INDEPENDENCE_THRESHOLD`
+        of its norm before), e.g. `(u, u) -> L` for odd `L`."""
+        p = poly(stage, copy.index)
+        return np.linalg.norm(p.coef) <= _INDEPENDENCE_THRESHOLD * p.scale
 
-    def is_zero(c):
-        """Whether the copy is identically zero (`_ZERO_THRESHOLD`)."""
-        span = slice(c.start, c.start + c.dim)
-        scale = np.linalg.norm(abs_evals[c.stage][:, span])
-        return np.linalg.norm(evals[c.stage][:, span]) <= _ZERO_THRESHOLD * scale
-
-    bases = {}  # (block, stage) -> list of orthonormal rows
+    bases = {}  # (block, leaves) -> list of orthonormal rows
     selected = [defaultdict(list) for _ in params.blocks]
     remaining = [
         (bi, stage, mi, copy)
         for bi, by_stage in enumerate(features)
         for stage, feats in by_stage.items()
         for mi, copy in feats
-        if not is_zero(copy)
+        if not is_zero(stage, copy)
     ]
     while remaining:
         remaining.sort(key=lambda f: (cost(f[0], f[3]), f[0], f[1], f[2]))
         for i, (bi, stage, mi, copy) in enumerate(remaining):
-            vec = evals[stage][:, copy.start : copy.start + copy.dim].ravel()
-            r = vec / np.linalg.norm(vec)
-            for q in bases.get((bi, stage), ()):
+            p = poly(stage, copy.index)
+            basis = bases.setdefault((bi, p.leaves), [])
+            r = p.coef / np.linalg.norm(p.coef)
+            for q in basis:
                 r = r - (q @ r) * q
             # Second Gram-Schmidt pass, for numerical stability.
-            for q in bases.get((bi, stage), ()):
+            for q in basis:
                 r = r - (q @ r) * q
             res = np.linalg.norm(r)
             if res > _INDEPENDENCE_THRESHOLD:
-                bases.setdefault((bi, stage), []).append(r / res)
+                basis.append(r / res)
                 selected[bi][stage].append(mi)
                 if stage == last and last > 0:
                     open_groups.add(group_key(bi, copy))
@@ -469,7 +533,7 @@ def _select(params, triples, copies, coef, evals, features, last):
     return selected
 
 
-def _fold_and_factorize(block, by_stage, selected, evals, copies, coef, last):
+def _fold_and_factorize(block, by_stage, selected, poly, copies, coef, last):
     """`(fold, direct, groups)` of one block, from its selected features."""
     columns = []  # (stage, mi, copy)
     for stage in sorted(by_stage):
@@ -478,20 +542,23 @@ def _fold_and_factorize(block, by_stage, selected, evals, copies, coef, last):
             if mi in chosen:
                 columns.append((stage, mi, copy))
     fold = np.zeros((block.m_in, len(columns)))
+    column_of = {mi: j for j, (_, mi, _) in enumerate(columns)}
+    # Features of different leaf multisets share no monomial: express each
+    # in terms of the selected features of its own multiset (none if they
+    # are all identically zero).
+    by_leaves = defaultdict(list)  # leaves -> [(mi, polynomial)]
     for stage, feats in by_stage.items():
-        cols = [j for j, (s, _, _) in enumerate(columns) if s == stage]
-        if not cols:
-            continue
-
-        def flat(copy, stage=stage):
-            return evals[stage][:, copy.start : copy.start + copy.dim].ravel()
-
-        basis = np.stack([flat(columns[j][2]) for j in cols])
-        vecs = np.stack([flat(copy) for _, copy in feats])
-        # Express every feature in terms of the selected ones.
+        for mi, copy in feats:
+            p = poly(stage, copy.index)
+            by_leaves[p.leaves].append((mi, p))
+    for feats in by_leaves.values():
+        vecs = np.stack([p.coef for _, p in feats])
+        chosen = [(column_of[mi], p.coef) for mi, p in feats if mi in column_of]
+        cols = [j for j, _ in chosen]
+        basis = np.array([v for _, v in chosen]).reshape(len(chosen), vecs.shape[1])
         coeff, *_ = np.linalg.lstsq(basis.T, vecs.T, rcond=None)
         resid = np.linalg.norm(basis.T @ coeff - vecs.T, axis=0)
-        limit = _VERIFY_TOLERANCE * np.maximum(np.linalg.norm(vecs, axis=1), 1.0)
+        limit = _VERIFY_TOLERANCE * np.array([p.scale for _, p in feats])
         for (mi, _), bad in zip(feats, resid > limit):
             if bad:
                 raise RuntimeError(
@@ -505,11 +572,16 @@ def _fold_and_factorize(block, by_stage, selected, evals, copies, coef, last):
             fold[mi, cols] = row
 
     def group_key(stage, copy):
-        """The copy's group, or `None` if it is not a last-power feature."""
+        """The copy's group, or `None` if it is not a last-power feature.
+
+        Members share their source copy, previous `(l, p)` and CG block. In
+        e3j's tables the block only depends on the `l`s, so it never splits
+        a group; it keeps hand-built tables correct.
+        """
         if stage != last or last == 0:
             return None
         prev = copies[stage - 1][copy.prev]
-        return (copy.src, prev.l, prev.p)
+        return (copy.src, prev.l, prev.p, coef[stage][copy.index].tobytes())
 
     # A group of one gains nothing and has a costlier backward: mix it
     # directly instead.
@@ -522,17 +594,7 @@ def _fold_and_factorize(block, by_stage, selected, evals, copies, coef, last):
         key = group_key(stage, copy)
         if key is not None and group_size[key] > 1:
             prev = copies[stage - 1][copy.prev]
-            cg = coef[stage][copy.index]
-            if key not in grouped:
-                grouped[key] = (cg, [])
-            ref, members = grouped[key]
-            alpha = float((cg * ref).sum() / (ref * ref).sum())
-            if np.abs(cg - alpha * ref).max() > 1e-6 * np.abs(ref).max():
-                # Not a multiple of the group's CG block: give it its own.
-                key = (copy.src, prev.l, prev.p, j)
-                grouped[key] = (cg, [])
-                ref, members, alpha = cg, grouped[key][1], 1.0
-            fold[:, j] *= alpha
+            _, members = grouped.setdefault(key, (coef[stage][copy.index], []))
             members.append((j, prev.start))
         else:
             direct.append((j, stage, copy.start))
@@ -594,13 +656,10 @@ def _materialize(blocks, triples, copies, copy_at, last):
         ):
             key = (min(xi, yi), max(xi, yi)) if self_pair else (xi, yi)
             per_coord[zi - copy.start][key] += v
-        scale = float(np.abs(val).max())
+        # `x_a x_b` commutes: a self-pair's `(a, b)` and `(b, a)` merge
+        # exactly, whatever their coefficients.
         terms = tuple(
-            tuple(
-                (a, b, v)
-                for (a, b), v in sorted(d.items())
-                if abs(v) > _CANCELLATION_THRESHOLD * scale
-            )
+            tuple((a, b, v) for (a, b), v in sorted(d.items()) if v != 0)
             for d in per_coord
         )
         materialized.append(Materialized(stage=stage, start=copy.start, terms=terms))
