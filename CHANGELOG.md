@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 
 ### Changed
 
+### Fixed
+
+### Added
+
+### Removed
+
+## [0.1.3] — 2026-11-03
+
+### Changed
+
 - `e3j_ops` now requires Python 3.12 or later, like `e3j`; cp311 wheels are no
   longer built.
 - CUDA tensor product and convolution kernels balance coefficients across warps
@@ -25,6 +35,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   coefficients is much faster, e.g. 25s down to 0.04s for a 4-ary `Bigotimes`.
 - `Permutation.sigma`, `Permutation.sigma_1` and `ScalarMixing.mix_indices` are
   numpy arrays.
+- Mosaic TPU convolution: faster forward and backward (set-cover CG scaling,
+  double-buffered gathers, edge scalars read in XLA's layout, a scalar-sender
+  fast path), e.g. forward 6.86 -> 5.18 ms at 128 channels, `l_max=3`.
+- Mosaic TPU tensor product: faster backward, e.g. OUTER 6.61 -> 4.50 ms at 128
+  channels, `l_max=3` on TPU v4; `l_max=3` with 256 channels and `l_max=4`
+  shapes that overflowed VMEM now fit.
 
 ### Fixed
 
@@ -36,6 +52,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
   wrong results below 32 channels.
 - `Convolution` built its tensor product with the global config instead of its
   own `config`.
+- Mosaic TPU tensor product: a batch that is not a multiple of 8 gave wrong
+  results on TPU v4 with libtpu >= 0.0.42; the batch is now padded to 8-row
+  blocks.
 
 ### Added
 
@@ -46,6 +65,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com).
 - `e3j.core.SymmetricContraction` and `e3j.linen.SymmetricContraction`, the
   MACE index-wise symmetric contraction, with a `symmetric_contraction` config
   field selecting its implementation.
+- `SymmetricContraction.FUSED_MOSAIC_TPU`: one fused Mosaic TPU kernel for the
+  powers, the permutation and the index-wise linear, with a backward kernel.
+- `SymmetricContraction.FUSED_MOSAIC_GPU`: fused Mosaic GPU kernels for Hopper
+  (sm_90) and newer, with fused backward kernels (including a forces-only
+  backward) and an unfused fallback for higher derivatives.
 - `PowerExpansion` takes a `config` for its tensor products.
 - `e3j.utils.sparse.sparse_coo` builds a coalesced `SparseCOO`, and raises on
   out-of-bounds indices.
